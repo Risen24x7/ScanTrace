@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS sensors (
     network_zone    TEXT NOT NULL DEFAULT '',
     location_tag    TEXT NOT NULL DEFAULT '',
     collector_type  TEXT NOT NULL DEFAULT '',
-    version         TEXT NOT NULL DEFAULT ''
+    version         TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS events (
