@@ -2,7 +2,7 @@ package db
 
 // Schema is the complete DDL for the ScanTrace SQLite database.
 // Applied once on Open() via the migration runner.
-const Schema = `
+const DDL = `
 -- scantrace schema v1
 -- All timestamps are stored as RFC3339 strings (TEXT).
 -- Arrays and blobs are stored as JSON-serialized TEXT.
