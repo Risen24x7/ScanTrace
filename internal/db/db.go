@@ -174,42 +174,47 @@ func unmarshalStringSlice(s string) StringSlice {
 // InsertSensor inserts a new Sensor row. sensor_id must already be set (UUID v4).
 func (db *DB) InsertSensor(s *Sensor) error {
 	now := formatTime(time.Now().UTC())
+	
+	// Handle zero-value time initialization
 	if s.CreatedAt.IsZero() {
 		s.CreatedAt = time.Now().UTC()
 	}
 	if s.UpdatedAt.IsZero() {
 		s.UpdatedAt = s.CreatedAt
 	}
-	_, err := s.db.Exec(`
-    INSERT INTO sensors
-        (sensor_id, hostname, platform, role, public_ip,
-         network_zone, location_tag, collector_type, version,
-         created_at, updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(sensor_id) DO UPDATE SET
-        hostname       = excluded.hostname,
-        platform       = excluded.platform,
-        role           = excluded.role,
-        public_ip      = excluded.public_ip,
-        network_zone   = excluded.network_zone,
-        location_tag   = excluded.location_tag,
-        collector_type = excluded.collector_type,
-        version        = excluded.version,
-        updated_at     = excluded.updated_at`,
-    sen.SensorID, sen.Hostname, sen.Platform, sen.Role, sen.PublicIP,
-    sen.NetworkZone, sen.LocationTag, sen.CollectorType, sen.Version,
-    sen.CreatedAt, sen.UpdatedAt,
-)
+
+	_, err := db.conn.Exec(`
+		INSERT INTO sensors
+		  (sensor_id, hostname, platform, role, public_ip,
+		   network_zone, location_tag, collector_type, version,
+		   created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(sensor_id) DO UPDATE SET
+		  hostname=excluded.hostname,
+		  platform=excluded.platform,
+		  role=excluded.role,
+		  public_ip=excluded.public_ip,
+		  network_zone=excluded.network_zone,
+		  location_tag=excluded.location_tag,
+		  collector_type=excluded.collector_type,
+		  version=excluded.version,
+		  updated_at=?`,
+		s.SensorID, s.Hostname, s.Platform, s.Role, s.PublicIP,
+		s.NetworkZone, s.LocationTag, s.CollectorType, s.Version,
+		formatTime(s.CreatedAt), formatTime(s.UpdatedAt),
+		now,
+	)
 	return err
 }
 
 // GetSensor retrieves a Sensor by sensor_id.
 func (db *DB) GetSensor(sensorID string) (*Sensor, error) {
-	row := db.conn.QueryRow(`
-		SELECT sensor_id, hostname, platform, role, public_ip,
-		       network_zone, location_tag, collector_type, version,
-		       created_at, updated_at
-		FROM sensors WHERE sensor_id = ?`, sensorID)
+	row := s.db.QueryRow(`
+    SELECT sensor_id, hostname, platform, role, public_ip,
+           network_zone, location_tag, collector_type, version,
+           created_at, updated_at
+    FROM sensors WHERE sensor_id = ?`, id)
+
 	return scanSensor(row)
 }
 
