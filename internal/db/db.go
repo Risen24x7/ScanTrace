@@ -209,12 +209,11 @@ func (db *DB) InsertSensor(s *Sensor) error {
 
 // GetSensor retrieves a Sensor by sensor_id.
 func (db *DB) GetSensor(sensorID string) (*Sensor, error) {
-	row := s.db.QueryRow(`
-    SELECT sensor_id, hostname, platform, role, public_ip,
-           network_zone, location_tag, collector_type, version,
-           created_at, updated_at
-    FROM sensors WHERE sensor_id = ?`, id)
-
+	row := db.conn.QueryRow(`
+		SELECT sensor_id, hostname, platform, role, public_ip,
+		       network_zone, location_tag, collector_type, version,
+		       created_at, updated_at
+		FROM sensors WHERE sensor_id = ?`, sensorID)
 	return scanSensor(row)
 }
 
