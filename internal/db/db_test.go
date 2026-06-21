@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/your-org/scantrace/internal/db"
+	"github.com/Risen24x7/scantrace/internal/db"
 )
 
 func openTestDB(t *testing.T) *db.DB {
