@@ -108,7 +108,7 @@ func (db *DB) RunMigrations() error {
 func (db *DB) SchemaVersionApplied() (int, error) {
 	var v int
 	err := db.conn.QueryRow(
-		`SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key = 'schema_version'`,
+		`SELECT version FROM schema_version ORDER BY version DESC LIMIT 1`,
 	).Scan(&v)
 	if err == sql.ErrNoRows {
 		return 0, nil
