@@ -1,4 +1,4 @@
-module github.com/your-org/scantrace
+module github.com/Risen24x7/scantrace
 
 go 1.22
 
