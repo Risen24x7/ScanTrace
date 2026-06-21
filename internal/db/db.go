@@ -72,35 +72,36 @@ func (db *DB) ping() error {
 // Migrations
 // ---------------------------------------------------------------------------
 
-// RunMigrations applies the DDL if schema_meta does not record the current version.
+// RunMigrations applies the DDL if schema_version does not record the current version.
 func (db *DB) RunMigrations() error {
-	tx, err := db.conn.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+    tx, err := db.conn.Begin()
+    if err != nil {
+        return err
+    }
+    defer func() {
+        if err != nil {
+            _ = tx.Rollback()
+        }
+    }()
 
-	// Apply schema (CREATE TABLE IF NOT EXISTS is idempotent).
-	for _, stmt := range splitStatements(DDL) {
-		if _, err = tx.Exec(stmt); err != nil {
-			return fmt.Errorf("RunMigrations: %w\nStatement: %s", err, stmt)
-		}
-	}
+    // Apply schema (CREATE TABLE IF NOT EXISTS is idempotent).
+    for _, stmt := range splitStatements(DDL) {
+        if _, err = tx.Exec(stmt); err != nil {
+            return fmt.Errorf("RunMigrations: %w\nStatement: %s", err, stmt)
+        }
+    }
 
-	// Record schema version.
-	_, err = tx.Exec(
-		`INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', ?)`,
-		fmt.Sprintf("%d", SchemaVersion),
-	)
-	if err != nil {
-		return err
-	}
+    // Record schema version in the table that actually exists (schema_version).
+    // I updated the table name and the column names to match your schema.go
+    _, err = tx.Exec(
+        `INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES(?, CURRENT_TIMESTAMP)`,
+        SchemaVersion,
+    )
+    if err != nil {
+        return err
+    }
 
-	return tx.Commit()
+    return tx.Commit()
 }
 
 // SchemaVersionApplied returns the schema version stored in the DB.
