@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "start": "go run ./scantrace-agent/cmd/bot/main.go",
+    "get-hooks": "go run ./scantrace-agent/cmd/manifest/main.go"
+  }
+}

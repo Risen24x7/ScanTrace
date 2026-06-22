@@ -1,5 +1,0 @@
-{
-  "hooks": {
-    "get-hooks": "go run ./cmd/manifest/main.go"
-  }
-}
