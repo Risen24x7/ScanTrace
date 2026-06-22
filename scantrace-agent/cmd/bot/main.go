@@ -12,7 +12,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/Risen24x7/scantrace-agent/internal/handler"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/socketmode"
