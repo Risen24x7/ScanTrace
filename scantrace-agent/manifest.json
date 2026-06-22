@@ -3,7 +3,7 @@
     "name": "ScanTrace",
     "description": "Dead Reckoning — scan intelligence for your network",
     "background_color": "#1a1a2e",
-    "long_description": "ScanTrace correlates raw firewall and IDS events into actionable cases and posts them to Slack with enriched IP context."
+    "long_description": "ScanTrace is a network security intelligence agent that correlates raw firewall logs, IDS alerts, and port scan events into structured investigation cases. It enriches IP context, scores confidence levels, assigns severity, and delivers actionable case reports directly inside Slack — so your team knows exactly where threats are coming from without leaving the conversation. Built for the Slack Hackathon 2026."
   },
   "features": {
     "bot_user": {
