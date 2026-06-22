@@ -1,5 +1,7 @@
 {
   "hooks": {
-    "get-hooks": "go run ./cmd/manifest/main.go"
+    "get-hooks": "go run ./cmd/manifest/main.go",
+    "build": "go build -o ./bin/scantrace-agent ./cmd/bot/",
+    "start": "SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_APP_TOKEN=$SLACK_APP_TOKEN ./bin/scantrace-agent"
   }
 }
