@@ -1,12 +1,8 @@
 {
   "hooks": {
     "get-hooks": "go run ./cmd/manifest/main.go",
+    "get-manifest": "go run ./cmd/manifest/main.go",
     "build": "go build -o ./bin/scantrace-agent ./cmd/bot/",
-    "start": "SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_APP_TOKEN=$SLACK_APP_TOKEN ./bin/scantrace-agent",
-    "get-manifest": "cat ./manifest.json"
-  },
-  "config": {
-    "sdk-managed-connection-enabled": true
-  },
-  "runtime": "go1.22"
+    "start": "SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN SLACK_APP_TOKEN=$SLACK_APP_TOKEN ./bin/scantrace-agent"
+  }
 }
