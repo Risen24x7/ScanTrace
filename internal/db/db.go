@@ -22,6 +22,12 @@ type DB struct {
 // Open opens (or creates) the SQLite database at path, enables WAL mode,
 // sets pragmas for safe concurrent access, and runs migrations.
 func Open(path string) (*DB, error) {
+// Ensure the directory exists
+    dir := filepath.Dir(path)
+    if err := os.MkdirAll(dir, 0755); err != nil {
+        return nil, fmt.Errorf("failed to create db directory: %w", err)
+    }
+
 	// The DSN embeds pragmas that must be set before any other statement.
 	dsn := fmt.Sprintf(
 		"file:%s?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on&_synchronous=NORMAL",
