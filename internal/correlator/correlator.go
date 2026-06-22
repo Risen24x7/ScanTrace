@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	DefaultWindow    = 15 * time.Minute
+	DefaultWindow    = 72 * time.Hour
 	DefaultThreshold = 3
 	DefaultMaxEvents = 500
 )
