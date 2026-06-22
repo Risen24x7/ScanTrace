@@ -18,3 +18,6 @@ run-demo: build
 	$(BUILD_DIR)/$(BINARY) ingest --file testdata/sample_eve.json --adapter suricata
 	$(BUILD_DIR)/$(BINARY) correlate
 	$(BUILD_DIR)/$(BINARY) cases
+
+run: build
+	$(BUILD_DIR)/$(BINARY)
