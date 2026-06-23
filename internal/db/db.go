@@ -516,6 +516,16 @@ func scanEntity(r entityScanner) (*Entity, error) {
 	return &en, nil
 }
 
+// GetEntityByValue is a helper for the MCP server to find an entity by IP or ID.
+func (db *DB) GetEntityByValue(val string) (*Entity, error) {
+    // Try to find by ID first, if not found, try by IP
+    en, err := db.GetEntity(val)
+    if err != nil || en != nil {
+        return en, err
+    }
+    return db.GetEntityByIP(val)
+}
+
 // ===========================================================================
 // CASE CRUD
 // ===========================================================================
