@@ -136,7 +136,7 @@ func (h *Handler) cmdPostLatestAlert(channelID string) {
 			return
 		}
 	}
-	h.PostCaseAlert(cases[0])
+	h.PostCaseAlertToAlertChannel(cases[0])
 }
 
 func (h *Handler) PostCaseAlert(c *db.Case) {
