@@ -88,9 +88,17 @@ CREATE TABLE IF NOT EXISTS cases (
     report_exports      TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS case_entities (
+    case_id   TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+    entity_id TEXT NOT NULL REFERENCES entities(id)  ON DELETE CASCADE,
+    PRIMARY KEY (case_id, entity_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_cases_severity   ON cases(severity);
 CREATE INDEX IF NOT EXISTS idx_cases_status     ON cases(status);
 CREATE INDEX IF NOT EXISTS idx_cases_created_at ON cases(created_at);
+CREATE INDEX IF NOT EXISTS idx_case_entities_case   ON case_entities(case_id);
+CREATE INDEX IF NOT EXISTS idx_case_entities_entity ON case_entities(entity_id);
 `
 
 // SchemaVersion is incremented when the schema changes.
