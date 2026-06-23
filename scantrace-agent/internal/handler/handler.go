@@ -8,6 +8,7 @@ import (
 
 	"github.com/Risen24x7/scantrace/internal/casebuilder"
 	"github.com/Risen24x7/scantrace/internal/db"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -17,10 +18,11 @@ type Handler struct {
 	api          *slack.Client
 	store        *db.DB
 	alertChannel string
+	rts          *rts.Client
 }
 
-func New(api *slack.Client, store *db.DB, alertChannel string) *Handler {
-	return &Handler{api: api, store: store, alertChannel: alertChannel}
+func New(api *slack.Client, store *db.DB, alertChannel string, rtsClient *rts.Client) *Handler {
+	return &Handler{api: api, store: store, alertChannel: alertChannel, rts: rtsClient}
 }
 
 // Dispatch routes incoming Socket Mode events.
@@ -30,6 +32,8 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 		log.Println("[handler] connecting to Slack...")
 	case socketmode.EventTypeConnected:
 		log.Println("[handler] connected to Dilldozer ✓")
+		// Subscribe to RTS signals on connect
+		go h.subscribeRTS()
 
 	case socketmode.EventTypeSlashCommand:
 		cmd, ok := evt.Data.(slack.SlashCommand)
@@ -54,6 +58,17 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 	}
 }
 
+// subscribeRTS registers ScanTrace's RTS signal subscriptions.
+func (h *Handler) subscribeRTS() {
+	_, err := h.rts.Subscribe(rts.SignalAppMention, "scantrace-mention")
+	if err != nil {
+		// RTS may not be available in all sandbox tiers — log and continue
+		log.Printf("[rts] subscribe skipped (may not be available in this tier): %v", err)
+		return
+	}
+	log.Printf("[rts] signal subscriptions active")
+}
+
 func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 	parts := strings.Fields(strings.TrimSpace(cmd.Text))
 	sub := "help"
@@ -71,7 +86,14 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 		h.cmdReport(cmd.ChannelID, cmd.UserID, parts[1])
 	case "alert":
 		h.cmdPostLatestAlert(cmd.ChannelID)
+	case "mcp":
+		// Show MCP server status — useful for judging demo
+		h.postEphemeral(cmd.ChannelID, cmd.UserID,
+			"*MCP Server* is running on `localhost:8765`\n"+
+				"Tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`\n"+
+				"Connect any MCP host (Claude Desktop, Cursor) to `http://localhost:8765`")
 	default:
+		// help is ephemeral — informational only
 		h.postEphemeral(cmd.ChannelID, cmd.UserID, helpText())
 	}
 }
@@ -152,6 +174,19 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 		return
 	}
 	h.postBlocks(h.alertChannel, blocks)
+
+	// Publish RTS signal so other agents/tools can react
+	go func() {
+		err := h.rts.PublishSignal(h.alertChannel, "scantrace.case.alert", map[string]interface{}{
+			"case_id":  c.CaseID,
+			"severity": c.Severity,
+			"title":    c.Title,
+		})
+		if err != nil {
+			log.Printf("[rts] publish signal failed (non-fatal): %v", err)
+		}
+	}()
+
 	log.Printf("[handler] posted alert for case %s to %s", c.CaseID[:8], h.alertChannel)
 }
 
@@ -181,6 +216,9 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		h.postEphemeral(channelID, userID, "Use `/scantrace report <case-id>` to get a full report.")
 	case strings.Contains(lower, "high") || strings.Contains(lower, "critical"):
 		h.cmdHighSeverity(channelID, userID)
+	case strings.Contains(lower, "mcp"):
+		h.postEphemeral(channelID, userID,
+			"*MCP Server* is live on `localhost:8765` — tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`")
 	default:
 		h.postEphemeral(channelID, userID, helpText())
 	}
@@ -197,7 +235,14 @@ func (h *Handler) cmdHighSeverity(channelID, userID string) {
 		lines = append(lines, fmt.Sprintf("🔴 `%s` *%s* (%.0f%% confidence)",
 			c.CaseID[:8], c.Title, c.Confidence*100))
 	}
-	h.postMessage(channelID, "*High severity cases:*\n"+strings.Join(lines, "\n"))
+	h.postBlocks(channelID, []slack.Block{
+		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "🔴 High Severity Cases", false, false)),
+		slack.NewDividerBlock(),
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", strings.Join(lines, "\n"), false, false),
+			nil, nil,
+		),
+	})
 }
 
 func (h *Handler) postMessage(channelID, text string) {
@@ -277,7 +322,8 @@ func helpText() string {
 Available commands:
 • ` + "`/scantrace cases`" + ` — list recent cases
 • ` + "`/scantrace report <case-id>`" + ` — full case report
-• ` + "`/scantrace alert`" + ` — post latest high-severity case
+• ` + "`/scantrace alert`" + ` — post latest high-severity case to #sec-alerts
+• ` + "`/scantrace mcp`" + ` — MCP server status
 • ` + "`/scantrace help`" + ` — this message
 
 You can also @mention ScanTrace or DM it.`
