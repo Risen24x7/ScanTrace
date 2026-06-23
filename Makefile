@@ -21,3 +21,6 @@ run-demo: build
 
 run: build
 	$(BUILD_DIR)/$(BINARY)
+
+correlate:
+	$(BUILD_DIR)/$(BINARY) correlate
