@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS cases (
 
 CREATE TABLE IF NOT EXISTS case_entities (
     case_id   TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
-    entity_id TEXT NOT NULL REFERENCES entities(id)  ON DELETE CASCADE,
+    entity_id TEXT NOT NULL REFERENCES entities(entity_id)  ON DELETE CASCADE,
     PRIMARY KEY (case_id, entity_id)
 );
 
