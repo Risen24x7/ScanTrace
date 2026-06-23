@@ -127,16 +127,16 @@ func (h *Handler) cmdReport(channelID, userID, caseIDPrefix string) {
 	h.postBlocks(channelID, blocks)
 }
 
-func (h *Handler) cmdPostLatestAlert(channelID string) {
+func (h *Handler) cmdPostLatestAlert(cmdChannelID string) {
 	cases, err := h.store.ListCases("high", 1)
 	if err != nil || len(cases) == 0 {
 		cases, err = h.store.ListCases("", 1)
 		if err != nil || len(cases) == 0 {
-			h.postMessage(channelID, "No cases available to alert.")
+			h.postMessage(cmdChannelID, "No cases available to alert.")
 			return
 		}
 	}
-	h.PostCaseAlertToAlertChannel(cases[0])
+	h.PostCaseAlert(cases[0])
 }
 
 func (h *Handler) PostCaseAlert(c *db.Case) {
