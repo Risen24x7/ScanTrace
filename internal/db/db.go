@@ -527,6 +527,86 @@ func (db *DB) GetEntityByValue(val string) (*Entity, error) {
 }
 
 // ===========================================================================
+// CASE-ENTITY LINKING
+// ===========================================================================
+
+// LinkEntityToCase writes a row to case_entities and appends the entity_id to
+// the case's related_entity_ids JSON column. Safe to call multiple times for
+// the same pair (INSERT OR IGNORE).
+func (db *DB) LinkEntityToCase(caseID, entityID string) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Write the join row (idempotent).
+	if _, err = tx.Exec(
+		`INSERT OR IGNORE INTO case_entities(case_id, entity_id) VALUES(?,?)`,
+		caseID, entityID,
+	); err != nil {
+		return fmt.Errorf("LinkEntityToCase: join insert: %w", err)
+	}
+
+	// Pull current related_entity_ids from the case.
+	var raw string
+	if err = tx.QueryRow(
+		`SELECT related_entity_ids FROM cases WHERE case_id = ?`, caseID,
+	).Scan(&raw); err != nil {
+		return fmt.Errorf("LinkEntityToCase: read case: %w", err)
+	}
+	ids := unmarshalStringSlice(raw)
+
+	// Append only if not already present.
+	found := false
+	for _, id := range ids {
+		if id == entityID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		ids = append(ids, entityID)
+		if _, err = tx.Exec(
+			`UPDATE cases SET related_entity_ids=?, updated_at=? WHERE case_id=?`,
+			marshalStringSlice(ids), formatTime(time.Now().UTC()), caseID,
+		); err != nil {
+			return fmt.Errorf("LinkEntityToCase: update case: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetEntitiesForCase returns all entities linked to a case via case_entities.
+func (db *DB) GetEntitiesForCase(caseID string) ([]*Entity, error) {
+	rows, err := db.conn.Query(`
+		SELECT e.entity_id, e.entity_type, e.ip, e.asn, e.as_name, e.provider,
+		       e.rdns, e.abuse_contact, e.geo_country, e.reputation_labels, e.last_enriched
+		FROM entities e
+		JOIN case_entities ce ON ce.entity_id = e.entity_id
+		WHERE ce.case_id = ?`, caseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Entity
+	for rows.Next() {
+		en, err := scanEntity(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, en)
+	}
+	return out, rows.Err()
+}
+
+// ===========================================================================
 // CASE CRUD
 // ===========================================================================
 
