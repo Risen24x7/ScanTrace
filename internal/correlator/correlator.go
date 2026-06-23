@@ -144,6 +144,17 @@ func (c *Correlator) openOrUpdateCase(cl *IPCluster) (*db.Case, error) {
 	if err := c.store.InsertCase(cas); err != nil {
 		return nil, err
 	}
+
+	// Link the source IP entity to this case if it exists in the DB.
+	// The enricher runs separately and may not have populated this yet;
+	// log and continue rather than failing the whole case.
+	if entity, err := c.store.GetEntityByIP(cl.SrcIP); err == nil && entity != nil {
+		if linkErr := c.store.LinkEntityToCase(cas.CaseID, entity.EntityID); linkErr != nil {
+			log.Printf("[correlator] entity link failed for case %s / ip %s: %v",
+				cas.CaseID[:8], cl.SrcIP, linkErr)
+		}
+	}
+
 	return cas, nil
 }
 
