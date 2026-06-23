@@ -1,19 +1,23 @@
 // ScanTrace Slack Bot — Dead Reckoning Edition
 // Connects to Dilldozer sandbox via Socket Mode.
+// Runs the MCP server on a separate goroutine.
 //
 // Required env vars:
 //   SLACK_BOT_TOKEN   xoxb-...  (Bot token from OAuth)
 //   SLACK_APP_TOKEN   xapp-...  (App-level token for Socket Mode)
 //   SCANTRACE_DB      path to scantrace.db (default: ../ScanTrace/scantrace.db)
 //   ALERT_CHANNEL     channel ID to post case alerts
+//   MCP_ADDR          address for MCP HTTP server (default: :8765)
 package main
 
 import (
 	"log"
 	"os"
 
-	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
 	"github.com/Risen24x7/scantrace/internal/db"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/mcp"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/socketmode"
 )
@@ -22,13 +26,25 @@ func main() {
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
 	dbPath := envOrDefault("SCANTRACE_DB", "../ScanTrace/scantrace.db")
-	alertChannel := envOrDefault("ALERT_CHANNEL", "#scantrace-alerts")
+	alertChannel := envOrDefault("ALERT_CHANNEL", "#sec-alerts")
+	mcpAddr := envOrDefault("MCP_ADDR", ":8765")
 
 	store, err := db.Open(dbPath)
 	if err != nil {
 		log.Fatalf("[bot] failed to open db: %v", err)
 	}
 	defer store.Close()
+
+	// Start MCP server in background
+	mcpServer := mcp.New(store)
+	go func() {
+		if err := mcpServer.ListenAndServe(mcpAddr); err != nil {
+			log.Fatalf("[mcp] server error: %v", err)
+		}
+	}()
+
+	// Initialize RTS client
+	rtsClient := rts.New(botToken)
 
 	api := slack.New(
 		botToken,
@@ -43,7 +59,7 @@ func main() {
 		socketmode.OptionLog(log.New(os.Stdout, "[socketmode] ", log.LstdFlags|log.Lshortfile)),
 	)
 
-	h := handler.New(api, store, alertChannel)
+	h := handler.New(api, store, alertChannel, rtsClient)
 
 	go func() {
 		for evt := range client.Events {
@@ -51,7 +67,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("[bot] ScanTrace connecting to Dilldozer sandbox...")
+	log.Printf("[bot] ScanTrace connecting to Dilldozer sandbox (MCP on %s)...", mcpAddr)
 	if err := client.Run(); err != nil {
 		log.Fatalf("[bot] socket mode error: %v", err)
 	}
