@@ -4,11 +4,12 @@ go 1.22
 
 require (
 	github.com/Risen24x7/scantrace v0.0.0
-	github.com/google/uuid v1.6.0
-	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/slack-go/slack v0.15.0
 )
 
-require github.com/gorilla/websocket v1.4.2 // indirect
+require (
+	github.com/gorilla/websocket v1.4.2 // indirect
+	github.com/mattn/go-sqlite3 v1.14.22 // indirect
+)
 
 replace github.com/Risen24x7/scantrace => ../
