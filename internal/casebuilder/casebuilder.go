@@ -26,10 +26,10 @@ func New(store *db.DB) *Builder {
 }
 
 func (b *Builder) BuildReport(caseID string) (*CaseReport, error) {
-	cas, err := b.store.GetCase(caseID)
-	if err != nil || cas == nil {
-		return nil, fmt.Errorf("casebuilder: case not found: %s", caseID)
-	}
+    cas, err := b.store.GetCase(caseID)
+    if err != nil || cas == nil {
+        return nil, fmt.Errorf("casebuilder: case not found: %s", caseID)
+    }
 	var events []*db.Event
 	for _, eid := range cas.RelatedEventIDs {
 		evt, err := b.store.GetEvent(eid)
@@ -39,16 +39,16 @@ func (b *Builder) BuildReport(caseID string) (*CaseReport, error) {
 		events = append(events, evt)
 	}
 	entities := make(map[string]*db.Entity)
-	for _, entID := range cas.RelatedEntityIDs {
-		ent, err := b.store.GetEntity(entID)
-		if err != nil || ent == nil {
-			continue
+	linkedEntities, err := b.store.GetEntitiesForCase(caseID)
+	if err == nil {
+		for _, ent := range linkedEntities {
+			entities[ent.IP] = ent
 		}
-		entities[ent.IP] = ent
-	}
-	report := &CaseReport{Case: cas, Events: events, Entities: entities}
-	report.Markdown = renderMarkdown(report)
-	return report, nil
+    }
+
+    report := &CaseReport{Case: cas, Events: events, Entities: entities}
+    report.Markdown = renderMarkdown(report)
+    return report, nil
 }
 
 func BuildReportFromCase(cas *db.Case, events []*db.Event, entities map[string]*db.Entity) *CaseReport {
