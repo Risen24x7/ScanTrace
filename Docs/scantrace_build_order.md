@@ -3,7 +3,7 @@
 
 > **Dev Sandbox:** Dilldozer  
 > **Deadline:** July 13, 2026 @ 5:00 PM PDT  
-> **Days Remaining at Writing:** 23  
+> **Days Remaining at Writing:** 18  
 > **Primary Track:** New Slack Agent  
 
 ---
@@ -20,43 +20,54 @@ All other engineering virtue (test coverage, multi-tenancy, horizontal scale) is
 
 ---
 
+## Phase Status Legend
+
+| Symbol | Meaning |
+|--------|---------|
+| ✅ | Done — gate passed |
+| 🔄 | In progress |
+| ☐ | Not started |
+
+---
+
 ## Master Build Order
 
 The pipeline has **6 sequential layers**. Each layer has a gate check — do not advance until the gate passes.
 
 ```
-LAYER 1 → Data Foundation (schema + SQLite + CLI harness)
-LAYER 2 → Collector (Suricata EVE JSON adapter)
-LAYER 3 → Normalizer + Enricher (schema mapping + IP intel)
-LAYER 4 → Correlator + Case Builder (pattern detection + markdown output)
-LAYER 5 → Slack Agent Core (Bolt app + Block Kit case posting)
-LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
+LAYER 1 → Data Foundation (schema + SQLite + CLI harness)            ✅ COMPLETE
+LAYER 2 → Collector (Suricata EVE JSON + Asus syslog adapters)       🔄 IN PROGRESS
+LAYER 3 → Normalizer + Enricher (schema mapping + IP intel)          ☐
+LAYER 4 → Correlator + Case Builder (pattern detection + markdown)   ☐
+LAYER 5 → Slack Agent Core (Bolt app + Block Kit case posting)        ☐
+LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)                 ☐
 ```
 
 ---
 
-## Layer 1 — Data Foundation
+## Layer 1 — Data Foundation ✅ COMPLETE
 
 **Target Days:** 1–2 (June 19–20)  
+**Completed:** June 24, 2026  
 **Goal:** Schema locked, SQLite initialized, CLI wired, test event injectable  
 
 ### Tasks
 
 | # | Task | Done? |
 |---|------|-------|
-| 1.1 | Define Go structs for `Sensor`, `Event`, `Entity`, `Case` | ☐ |
-| 1.2 | Write SQLite schema DDL — create all four tables with FK relationships | ☐ |
-| 1.3 | Implement `db.go` — open/close, migration runner, CRUD for all four types | ☐ |
-| 1.4 | Write a `cmd/scantrace` CLI skeleton — `ingest`, `list-cases`, `enrich` subcommands stubbed | ☐ |
-| 1.5 | Write a `testdata/sample_eve.json` — 5 realistic Suricata EVE scan events | ☐ |
-| 1.6 | Confirm CLI can initialize DB and print schema version | ☐ |
+| 1.1 | Define Go structs for `Sensor`, `Event`, `Entity`, `Case` | ✅ |
+| 1.2 | Write SQLite schema DDL — create all four tables with FK relationships | ✅ |
+| 1.3 | Implement `db.go` — open/close, migration runner, CRUD for all four types | ✅ |
+| 1.4 | Write a `cmd/bot` CLI skeleton — `ingest`, `correlate`, `cases`, `report` subcommands | ✅ |
+| 1.5 | Write a `testdata/` — realistic Suricata EVE scan events | ✅ |
+| 1.6 | Confirm CLI can initialize DB and print schema version | ✅ |
 
-### Gate Check
-- `scantrace --version` prints cleanly  
+### Gate Check — PASSED
+- `go run ./cmd/bot/ --version` prints cleanly  
 - `sqlite3 scantrace.db .schema` shows all four tables  
-- `testdata/sample_eve.json` parses without error  
+- `testdata/` EVE JSON parses without error  
 
-### Key Design Decisions (lock these now)
+### Key Design Decisions (locked)
 - **Primary key:** UUID v4 (portable, no auto-increment collisions across sensors)  
 - **Timestamps:** RFC3339 strings in SQLite (avoids timezone hell)  
 - **Raw payload:** stored as JSON blob in `Event.raw_ref` column — never destructively normalized  
@@ -64,26 +75,60 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 
 ---
 
-## Layer 2 — Collector (Suricata EVE JSON Adapter)
+## Layer 2 — Collector 🔄 IN PROGRESS
 
-**Target Days:** 2–3 (June 20–21)  
-**Goal:** Real Suricata EVE JSON file → raw events persisted to SQLite  
+**Target Days:** 2–3 (June 20–21) — *running slightly behind; targeting June 26*  
+**Goal:** Real Suricata EVE JSON file + live Asus router syslog → raw events persisted to SQLite  
 
-### Tasks
+> **Why two adapters now (not Layer 7)?**  
+> The live Asus syslog is the primary real-network demo path for the hackathon judges. It must be solid before the Slack layer is built on top of it. Moving it from "Polish" (Layer 7) to here ensures the real-network path is tested and stable before Layer 5 Slack wiring begins.
+
+### 2A — Suricata EVE JSON Adapter
 
 | # | Task | Done? |
 |---|------|-------|
-| 2.1 | Implement `collector/suricata.go` — tail or read EVE JSON file, parse each line | ☐ |
-| 2.2 | Map EVE fields to `RawEvent` intermediate struct (preserve original field names) | ☐ |
-| 2.3 | Write `sensor.go` — auto-register sensor on first run, store sensor_id in config file | ☐ |
-| 2.4 | Persist raw events to `Event` table with `source_type = "suricata_eve"` | ☐ |
+| 2.1 | Implement `collector/suricata.go` — tail or read EVE JSON file, parse each line | ✅ |
+| 2.2 | Map EVE fields to `RawEvent` intermediate struct (preserve original field names) | ✅ |
+| 2.3 | Write `sensor.go` — auto-register sensor on first run, store sensor_id in config file | ✅ |
+| 2.4 | Persist raw events to `Event` table with `source_type = "suricata_eve"` | ✅ |
 | 2.5 | Add `--follow` flag to tail file continuously (like `tail -f`) | ☐ |
-| 2.6 | Smoke test: ingest `testdata/sample_eve.json`, confirm 5 rows in `events` table | ☐ |
+| 2.6 | Smoke test: ingest `testdata/sample_eve.json`, confirm rows in `events` table | ✅ |
 
-### Gate Check
-- `scantrace ingest --source eve --file testdata/sample_eve.json` exits 0  
-- 5 rows in `events` table with correct `src_ip`, `dst_port`, `timestamp`  
-- Raw JSON blob preserved in `raw_ref` column  
+### 2B — Asus Router Syslog Adapter (Live Home Network)
+
+| # | Task | Done? |
+|---|------|-------|
+| 2.7 | Implement `collector/asus_syslog.go` — parse syslog lines from Asus (AsusWRT format) | ☐ |
+| 2.8 | Handle key Asus syslog event types: `kernel: DROP`, `kernel: ACCEPT`, `dnsmasq-dhcp`, `hostapd`, `WAN IP`, `LAN to WAN` | ☐ |
+| 2.9 | Map parsed Asus syslog fields to `RawEvent` struct with `source_type = "asus_syslog"` | ☐ |
+| 2.10 | Support reading from stdin (for `tail -F /var/log/asus-router.log \| ingest --adapter asus-syslog`) | ☐ |
+| 2.11 | Register a named sensor for the Asus source on first ingest | ☐ |
+| 2.12 | Smoke test: tail live `/var/log/asus-router.log`, confirm Asus events appear in `events` table | ☐ |
+
+### rsyslog setup (host-side)
+
+This must be done on the ScanTrace host to receive router syslog *before* the adapter can be tested:
+
+```bash
+# 1. Enable UDP syslog in /etc/rsyslog.conf
+# Uncomment or add:
+#   $ModLoad imudp
+#   $UDPServerRun 514
+
+# 2. Create Asus-specific rule (replace IP with your router's LAN IP)
+sudo sh -c 'cat > /etc/rsyslog.d/asus-router.conf <<EOF
+if $fromhost-ip == "192.168.50.1" then /var/log/asus-router.log
+& stop
+EOF'
+
+# 3. Restart rsyslog
+sudo systemctl restart rsyslog
+
+# 4. Verify logs arriving
+sudo tail -n 20 /var/log/asus-router.log
+```
+
+See `Docs/GETTING_STARTED.md` and `Docs/TROUBLESHOOTING.md` for full detail.
 
 ### Suricata EVE Field Mapping Reference
 
@@ -99,11 +144,26 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 | `alert.signature` | `tags[]` (appended) |
 | full line JSON | `raw_ref` |
 
+### Asus Syslog Field Mapping Reference
+
+| Syslog Pattern | ScanTrace Event Field | Notes |
+|---|---|---|
+| `kernel: DROP IN=... SRC=X DST=Y PROTO=Z DPT=N` | `src_ip`, `dst_ip`, `dst_port`, `protocol` | Firewall drop — primary scan signal |
+| `kernel: ACCEPT IN=...` | same as above | Accepted connection |
+| `dnsmasq-dhcp: DHCPACK ... MAC ... IP` | `src_ip` (leased IP), `tags["dhcp"]` | Device seen on LAN |
+| `hostapd: STA ... associated` | `src_ip` (client), `tags["wifi"]` | Wireless association |
+| Raw syslog line | `raw_ref` | Always preserve full line |
+
+### Gate Check
+- `CGO_ENABLED=1 go run ./cmd/bot/ ingest --file testdata/sample_eve.json --adapter suricata` exits 0, rows in `events` table  
+- `sudo tail -F /var/log/asus-router.log | go run ./cmd/bot/ ingest --file - --adapter asus-syslog` produces events in DB  
+- Both adapters register their respective sensors on first run  
+
 ---
 
 ## Layer 3 — Normalizer + Enricher
 
-**Target Days:** 4–7 (June 22–25)  
+**Target Days:** 4–7 (June 22–25) — *adjust to June 26–30 given Layer 2 slip*  
 **Goal:** Raw events → normalized schema + IP enrichment stored in `entities` table  
 
 ### 3A — Normalizer
@@ -115,7 +175,7 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 | 3.3 | Standardize `direction` field (inbound/outbound/lateral from src/dst IP context) | ☐ |
 | 3.4 | Attach `sensor_id` from registered sensor | ☐ |
 | 3.5 | Set `confidence` default to 0.7 (known source, unverified behavior) | ☐ |
-| 3.6 | Write normalizer unit tests for each EVE event_type (alert, flow, dns, http) | ☐ |
+| 3.6 | Write normalizer unit tests for each event_type (suricata alert/flow/dns, asus DROP/ACCEPT/DHCP) | ☐ |
 
 ### 3B — Enricher
 
@@ -128,11 +188,13 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 | 3.11 | Known-scanner allowlist: hardcode initial list (Shodan `66.240.0.0/15`, Censys `192.35.168.0/23`, etc.) as `reputation_labels: ["known_scanner"]` | ☐ |
 | 3.12 | Cache enrichment results by IP in `entities` table with `last_enriched` TTL of 24h | ☐ |
 | 3.13 | Smoke test: enrich 3 IPs, confirm `asn`, `rdns`, `abuse_contact` populated | ☐ |
+| 3.14 | Skip enrichment for RFC-1918 private IPs (10.x, 192.168.x, 172.16–31.x) — tag as `internal` | ☐ |
 
 ### Gate Check
 - `scantrace enrich --ip 45.33.32.156` (Shodan IP) returns ASN, rDNS, `reputation_labels: ["known_scanner"]`  
 - Enrichment cache works — second call returns immediately from DB, no API hit  
-- 5 test events all have associated Entity records  
+- Private IPs tagged `internal`, not sent to external APIs  
+- All test events (Suricata + Asus) have associated Entity records  
 
 ### Free Enrichment API Cheat Sheet
 
@@ -148,7 +210,7 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 
 ## Layer 4 — Correlator + Case Builder
 
-**Target Days:** 8–11 (June 26–29)  
+**Target Days:** 8–11 (June 26–29) — *adjust to July 1–5*  
 **Goal:** Pattern detection → grouped cases → human-readable markdown output  
 
 ### 4A — Correlator
@@ -161,24 +223,26 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 | 4.4 | ASN-level correlation: group IPs sharing the same ASN that hit same dst_port in window | ☐ |
 | 4.5 | Tag output: `["repeated_source"]`, `["asn_cluster"]`, `["port_sweep"]` based on pattern | ☐ |
 | 4.6 | Return correlation result as `CorrelationResult{Events, Entities, Tags, Confidence}` | ☐ |
+| 4.7 | DHCP/LAN correlation: flag `internal` IPs that also appear as scan sources (possible lateral movement) | ☐ |
 
 ### 4B — Case Builder
 
 | # | Task | Done? |
 |---|------|-------|
-| 4.7 | Implement `casebuilder/builder.go` — takes `CorrelationResult`, writes `Case` to DB | ☐ |
-| 4.8 | Generate markdown case summary using Go `text/template` | ☐ |
-| 4.9 | Case template fields: title, severity, summary paragraph, IP list, ASN, timeline table, tags, abuse contact | ☐ |
-| 4.10 | JSON export paired with markdown (`case_{id}.md` + `case_{id}.json`) | ☐ |
-| 4.11 | Severity auto-assignment: `high` if repeated + no known-scanner tag; `low` if known-scanner; `medium` otherwise | ☐ |
-| 4.12 | CLI: `scantrace list-cases` prints case ID, title, severity, created_at | ☐ |
-| 4.13 | CLI: `scantrace show-case --id {id}` prints full markdown to stdout | ☐ |
+| 4.8 | Implement `casebuilder/builder.go` — takes `CorrelationResult`, writes `Case` to DB | ☐ |
+| 4.9 | Generate markdown case summary using Go `text/template` | ☐ |
+| 4.10 | Case template fields: title, severity, summary paragraph, IP list, ASN, timeline table, tags, abuse contact | ☐ |
+| 4.11 | JSON export paired with markdown (`case_{id}.md` + `case_{id}.json`) | ☐ |
+| 4.12 | Severity auto-assignment: `high` if repeated + no known-scanner tag; `low` if known-scanner; `medium` otherwise | ☐ |
+| 4.13 | CLI: `go run ./cmd/bot/ cases` prints case ID, title, severity, created_at | ☐ |
+| 4.14 | CLI: `go run ./cmd/bot/ report --case {id}` prints full markdown to stdout | ☐ |
 
 ### Gate Check
-- Feed 5 test events from same source IP over 1h window  
-- `scantrace list-cases` shows 1 case (deduplicated)  
-- `scantrace show-case --id {id}` prints complete markdown — title, ASN, timeline, tags  
+- Feed events from same source IP over 1h window  
+- `cases` command shows 1 case (deduplicated)  
+- `report --case {id}` prints complete markdown — title, ASN, timeline, tags  
 - JSON export file is valid JSON  
+- DHCP/Asus events produce `sensor_type: asus_syslog` cases where applicable  
 
 ### Markdown Case Template (Starter)
 
@@ -217,7 +281,7 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 
 ## Layer 5 — Slack Agent Core
 
-**Target Days:** 12–16 (June 30 – July 4)  
+**Target Days:** 12–16 (June 30 – July 4) — *adjust to July 6–10*  
 **Goal:** Bolt app running in Dilldozer, posting Block Kit case cards to channel on new case creation  
 
 ### 5A — Bolt App Bootstrap
@@ -240,6 +304,7 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 | 5.9 | Color accent on attachment: `#cc0000` high, `#ff9900` medium, `#00cc00` low | ☐ |
 | 5.10 | "View Full Case" button opens markdown in a Slack modal (plain_text_input display) | ☐ |
 | 5.11 | Thread reply: attach raw event count + link to JSON export | ☐ |
+| 5.12 | Include sensor source in card footer (e.g., `Source: asus_syslog @ scantrace-host`) | ☐ |
 
 ### Block Kit Card Wireframe
 
@@ -255,6 +320,8 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 │─────────────────────────────────────────────────────│
 │ Tags: `repeated_source` `asn_cluster` `port_sweep`  │
 │─────────────────────────────────────────────────────│
+│ Sensor: asus_syslog @ scantrace-host                │
+│─────────────────────────────────────────────────────│
 │ [ View Full Case ]    [ Dismiss ]                   │
 └─────────────────────────────────────────────────────┘
 ```
@@ -263,12 +330,13 @@ LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)
 - New case in SQLite → Block Kit message appears in `#scantrace-alerts` within 5 seconds  
 - All 4 severity levels render correctly  
 - Modal opens with full markdown case on "View Full Case" click  
+- Card footer shows correct sensor source (suricata vs asus_syslog)  
 
 ---
 
 ## Layer 6 — Platform Technologies (MCP + RTS + NL Q&A)
 
-**Target Days:** 17–21 (July 5–9)  
+**Target Days:** 17–21 (July 5–9) — *adjust to July 10–12*  
 **Goal:** All three required technologies active and demo-able  
 
 ### 6A — MCP Server Integration
@@ -376,8 +444,8 @@ Bot:  [Block Kit card — same as automated alert format]
 
 | # | Task | Done? |
 |---|------|-------|
-| 7.1 | Add syslog adapter (secondary input — can be minimal, even if reading from file) | ☐ |
-| 7.2 | Create architecture diagram (Mermaid or draw.io) — collector → normalizer → enricher → correlator → case builder → Slack agent | ☐ |
+| 7.1 | Create architecture diagram (Mermaid or draw.io) — collector → normalizer → enricher → correlator → case builder → Slack agent | ☐ |
+| 7.2 | Cut and tag hackathon baseline branch: `hackathon-stable-YYYYMMDD` | ☐ |
 | 7.3 | Record demo video: 3 minutes, start with the "why", show live event → case → Slack alert → Q&A | ☐ |
 | 7.4 | Invite `slackhack@salesforce.com` and `testing@devpost.com` to Dilldozer as **Members** | ☐ |
 | 7.5 | Confirm agent installed and responsive in Dilldozer | ☐ |
@@ -388,16 +456,16 @@ Bot:  [Block Kit card — same as automated alert format]
 ### Demo Video Script (3 minutes)
 
 ```
-0:00–0:20  The problem — scanners hit your perimeter constantly; teams 
+0:00–0:20  The problem — scanners hit your perimeter constantly; teams
            have no Slack-native intelligence layer. "You know what I call
            that? A waste of time." (cut to raw log dump)
 
-0:20–0:50  Live event ingested — show Suricata EVE JSON file being tailed,
+0:20–0:50  Live event ingested — show Asus router syslog being tailed,
            event appears, normalizer fires, enricher returns ASN.
 
-0:50–1:30  Correlator groups 12 events from same ASN, Case Builder generates
+0:50–1:30  Correlator groups events from same ASN, Case Builder generates
            markdown. Block Kit alert fires in #scantrace-alerts with full
-           severity, IP, ASN, port, tags.
+           severity, IP, ASN, port, tags, and sensor source.
 
 1:30–2:10  Q&A demo — @ScanTrace what hit us today? List returned.
            @ScanTrace enrich 185.220.101.45 — Entity JSON returned.
@@ -406,7 +474,7 @@ Bot:  [Block Kit card — same as automated alert format]
 2:10–2:40  RTS demo — second event from same IP triggers "Previously
            observed" context block with link to original thread.
 
-2:40–3:00  Architecture — 30-second whiteboard walk. Collector → 
+2:40–3:00  Architecture — 30-second whiteboard walk. Collector →
            Normalizer → Enricher → Correlator → Case Builder → Slack.
            "That's it. Dead simple. Defensively correct."
 ```
@@ -428,7 +496,7 @@ These are the best agents for specific ScanTrace development tasks, with exact p
 
 **Schema + CRUD:**
 ```
-I'm building a Go CLI tool called ScanTrace. Define Go structs for four 
+I'm building a Go CLI tool called ScanTrace. Define Go structs for four
 types: Sensor, Event, Entity, and Case. Use these field names exactly:
 [paste data_model.md field list]
 
@@ -451,16 +519,32 @@ Write a Go package called collector that:
 6. Use only stdlib — no external deps except go-sqlite3
 ```
 
+**Asus Syslog Collector:**
+```
+Write a Go package called collector/asus_syslog that:
+1. Reads syslog lines from stdin (or a file path) — one line per read
+2. Parses Asus AsusWRT syslog format for these message types:
+   - kernel: DROP IN=... SRC=... DST=... PROTO=... DPT=...
+   - kernel: ACCEPT IN=...
+   - dnsmasq-dhcp: DHCPACK / DHCPDISCOVER lines with MAC + IP
+   - hostapd: STA <mac> associated/disassociated
+3. Maps parsed fields to RawEvent struct with source_type = "asus_syslog"
+4. Preserves the full raw line in RawRef
+5. Returns a channel of RawEvent for the normalizer to consume
+6. Handles malformed/unknown lines gracefully (log + skip, never crash)
+```
+
 **Enricher with caching:**
 ```
 Write a Go enricher package that:
 1. Takes an IPv4 string as input
-2. Queries ipinfo.io/AS for ASN and provider (free tier, no auth)
-3. Does reverse DNS lookup with net.LookupAddr()
-4. Queries rdap.org/ip/{ip} for abuse contact
-5. Checks a hardcoded allowlist of known-scanner CIDR ranges
-6. Caches results in SQLite entities table for 24h (check last_enriched)
-7. Returns an Entity struct [paste your Entity struct]
+2. Skips enrichment for RFC-1918 private ranges — tag as internal and return
+3. Queries ipinfo.io/AS for ASN and provider (free tier, no auth)
+4. Does reverse DNS lookup with net.LookupAddr()
+5. Queries rdap.org/ip/{ip} for abuse contact
+6. Checks a hardcoded allowlist of known-scanner CIDR ranges
+7. Caches results in SQLite entities table for 24h (check last_enriched)
+8. Returns an Entity struct [paste your Entity struct]
 Include proper error handling — enrichment failures should not crash the pipeline.
 ```
 
@@ -503,6 +587,7 @@ Write a Slack Block Kit message payload for a security case alert with these sec
 3. Context block: tags as inline code (backtick format)
 4. Actions: "View Full Case" button (opens modal) and "Dismiss" button
 5. Attachment color: #cc0000 for high, #ff9900 for medium, #00cc00 for low
+6. Footer context block: sensor source name
 Return valid JSON. I will use Go struct tags to marshal this.
 ```
 
@@ -532,7 +617,7 @@ Write a Go MCP server that exposes four tools for a security intelligence pipeli
 3. enrich_ip(ip string) — calls enricher.Enrich(ip), returns Entity JSON
 4. search_related_events(src_ip string, hours int) — queries SQLite, returns []Event JSON
 
-Use the MCP Go SDK (mark3labs/mcp-go or equivalent). 
+Use the MCP Go SDK (mark3labs/mcp-go or equivalent).
 Each tool must have a JSON schema description matching the MCP tool definition format.
 The server should run as a subprocess and communicate over stdio (standard MCP pattern).
 ```
@@ -569,7 +654,7 @@ Then write a function PrependPriorObservations(blocks []slack.Block, priorMessag
 **Best Agent:** Claude Sonnet (best Go `text/template` generation)  
 
 ```
-Write a Go text/template for a security incident case report. The template 
+Write a Go text/template for a security incident case report. The template
 receives a Case struct with these fields: [paste your Case struct]
 The output should be valid GitHub-Flavored Markdown with:
 1. H1 title with case ID and severity badge
@@ -578,7 +663,8 @@ The output should be valid GitHub-Flavored Markdown with:
 4. Timeline table (sorted by timestamp ascending)
 5. Pattern tags as inline code
 6. Raw artifact reference list
-7. Footer: "Generated by ScanTrace | Case ID: {id} | {timestamp}"
+7. Sensor source and adapter name
+8. Footer: "Generated by ScanTrace | Case ID: {id} | {timestamp}"
 ```
 
 ---
@@ -587,15 +673,23 @@ The output should be valid GitHub-Flavored Markdown with:
 
 **When the EVE collector misses events:**
 ```
-My Go Suricata EVE JSON collector is dropping events. It reads the file 
-line by line but some EVE log lines span multiple JSON objects per line. 
+My Go Suricata EVE JSON collector is dropping events. It reads the file
+line by line but some EVE log lines span multiple JSON objects per line.
 Here is a sample of the actual EVE output: [paste sample]
 Fix the parser to handle this correctly.
 ```
 
+**When the Asus syslog adapter misses event types:**
+```
+My Go Asus syslog collector is not capturing DHCP or hostapd events.
+Here is a sample of the actual syslog lines it receives: [paste sample]
+The adapter currently handles kernel: DROP and kernel: ACCEPT.
+Extend the parser to handle these additional event types.
+```
+
 **When SQLite locks under concurrent access:**
 ```
-My ScanTrace Go app has a SQLite write contention error when the Slack agent 
+My ScanTrace Go app has a SQLite write contention error when the Slack agent
 and the pipeline collector both write simultaneously. I have WAL mode enabled.
 Here is the error: [paste error]
 Here is my db.go: [paste code]
@@ -604,8 +698,8 @@ Fix the connection pool configuration and transaction patterns.
 
 **When Block Kit layout breaks:**
 ```
-My Slack Block Kit message renders incorrectly — the fields section shows 
-as a single column instead of two columns. Here is my current payload: 
+My Slack Block Kit message renders incorrectly — the fields section shows
+as a single column instead of two columns. Here is my current payload:
 [paste JSON]
 The channel is #scantrace-alerts. Fix the block structure.
 ```
@@ -617,10 +711,12 @@ The channel is #scantrace-alerts. Fix the block structure.
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|-----------|
 | RTS API not available in sandbox | Medium | High | Use `conversations.search` as fallback; test in Dilldozer week 1 |
-| Suricata not available for live demo | Low | Medium | Pre-record event ingestion; use `testdata/` for live demo |
+| Suricata not available for live demo | Low | Medium | Use Asus live syslog as primary live source; Suricata testdata as backup |
 | MCP Go SDK immaturity | Medium | Medium | Fall back to REST endpoint served by ScanTrace; document as equivalent |
 | Enrichment APIs rate-limited during demo | Low | High | Pre-enrich all demo IPs; cache in SQLite before demo recording |
 | SQLite concurrent write lock | Low | Medium | WAL mode + connection pool; collector pauses enricher if locked |
+| Asus syslog adapter misses event types | Low | Medium | Log unknown lines to a debug file; fix before demo; use testdata fallback |
+| rsyslog UDP 514 blocked by host firewall | Low | High | Test and open port before demo day; document in TROUBLESHOOTING.md |
 | Dilldozer sandbox access issue | Low | High | Test judge invite (slackhack@salesforce.com) by July 8 |
 | Demo video rendering time | Low | Low | Record by July 11 — 48h buffer before deadline |
 
