@@ -1,0 +1,2 @@
+// This file is intentionally sparse for local development using replace directive.
+// Run `go mod tidy` from scantrace-agent/ after cloning to populate hashes.
