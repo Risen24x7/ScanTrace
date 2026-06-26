@@ -20,58 +20,52 @@ import (
 // SourceTypeAsus is the source_type tag written to every Event this adapter produces.
 const SourceTypeAsus = "asus_syslog"
 
-// SyslogTimeLayout is the standard BSD syslog timestamp used by AsusWRT.
-// Example: "Jun 25 20:05:01"
-const SyslogTimeLayout = "Jan  2 15:04:05"
-
 // ---------------------------------------------------------------------------
 // Compiled regexes — compiled once at package init, reused per line.
 // ---------------------------------------------------------------------------
 
 var (
-	// Jun 25 20:05:01 hostname kernel: ...
+	// BE96U / newer AsusWRT firmware emits RFC 3339 timestamps:
+	//   2026-06-25T20:38:19+00:00 hostname process[pid]: body
+	// Older firmware emits BSD syslog:
+	//   Jun 25 20:05:01 hostname process[pid]: body
+	// reHeader matches both; m[1]=timestamp m[2]=process m[3]=body
 	reHeader = regexp.MustCompile(
-		`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+(\S+):\s+(.*)$`,
+		`^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+\-]\d{2}:\d{2}|\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})` +
+			`\s+\S+\s+(\S+?)(?:\[\d+\])?:\s+(.*)$`,
 	)
 
-	// kernel: DROP / ACCEPT lines from iptables LOG target
-	// IN=eth0 OUT= MAC=... SRC=1.2.3.4 DST=5.6.7.8 ... PROTO=TCP ... DPT=22 ...
+	// iptables LOG target: DROP / ACCEPT / REJECT
+	// IN=eth0 OUT= ... SRC=1.2.3.4 DST=5.6.7.8 ... PROTO=TCP ... DPT=22
 	reNetfilter = regexp.MustCompile(
 		`(?i)(DROP|ACCEPT|REJECT)\s+IN=(\S*)\s+OUT=(\S*)\s+.*?SRC=(\S+)\s+DST=(\S+).*?PROTO=(\S+)(?:.*?DPT=(\d+))?`,
 	)
 
-	// dnsmasq-dhcp: DHCPACK / DHCPDISCOVER / DHCPOFFER / DHCPNAK
-	// DHCPACK(br0) 192.168.50.42 aa:bb:cc:dd:ee:ff hostname
+	// dnsmasq-dhcp: DHCPACK(br0) 192.168.50.42 aa:bb:cc:dd:ee:ff [hostname]
 	reDHCP = regexp.MustCompile(
-		`(DHCPACK|DHCPDISCOVER|DHCPOFFER|DHCPNAK|DHCPREQUEST)\S*\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+([0-9a-f:]{17})(?:\s+(\S+))?`,
+		`(?i)(DHCPACK|DHCPDISCOVER|DHCPOFFER|DHCPNAK|DHCPREQUEST)\S*\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+([0-9a-f:]{17})(?:\s+(\S+))?`,
 	)
 
-	// hostapd: STA aa:bb:cc:dd:ee:ff IEEE 802.11: associated
+	// hostapd: STA aa:bb:cc:dd:ee:ff ... associated / disassociated / etc.
 	reHostapd = regexp.MustCompile(
-		`STA\s+([0-9a-f:]{17})\s+.*?(associated|disassociated|deauthenticated|authenticated)`,
+		`(?i)STA\s+([0-9a-f:]{17})\s+.*?(associated|disassociated|deauthenticated|authenticated)`,
 	)
 
-	// WAN IP change: "WAN Connection: WAN_IP=1.2.3.4"  (varies by firmware)
+	// WAN IP change: "WAN Connection: WAN_IP=1.2.3.4" (varies by firmware)
 	reWANIP = regexp.MustCompile(
 		`WAN[_\s](?:Connection[:\s]+)?(?:IP|ip)[=:\s]+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`,
 	)
 )
 
 // ---------------------------------------------------------------------------
-// AsusAdapter — implements collector.Adapter via Parse(), and also exposes
-// Ingest(r io.Reader) for bulk / streaming ingestion from the CLI.
+// AsusAdapter — implements collector.Adapter via Parse().
 // ---------------------------------------------------------------------------
 
-// AsusAdapter parses AsusWRT syslog lines.
-// It implements the collector.Adapter interface so the shared Collector
-// pipeline can drive it with TailFile / IngestFile.
+// AsusAdapter parses AsusWRT syslog lines (both RFC 3339 and BSD timestamp
+// formats). Implements the collector.Adapter interface.
 type AsusAdapter struct {
-	// sensorID is stamped on every event produced by Parse().
-	// Set via NewAsusAdapter; zero value produces events without a sensor stamp
-	// (the Collector.TailFile loop overwrites SensorID anyway).
 	SensorID string
-
-	year int // inferred year — syslog BSD format omits the year
+	year     int // fallback year for BSD timestamps that omit it
 }
 
 // NewAsusAdapter returns an adapter stamped with the given sensor ID.
@@ -83,8 +77,6 @@ func NewAsusAdapter(sensorID string) *AsusAdapter {
 }
 
 // Parse implements collector.Adapter.
-// It parses a single raw syslog line and returns a *db.Event, or an error
-// (including a sentinel error) when the line should be skipped.
 func (a *AsusAdapter) Parse(line string) (*db.Event, error) {
 	if a.year == 0 {
 		a.year = time.Now().Year()
@@ -94,7 +86,6 @@ func (a *AsusAdapter) Parse(line string) (*db.Event, error) {
 		return nil, err
 	}
 	if evt == nil {
-		// parseLine returns (nil, nil) for well-formed but non-security lines.
 		return nil, fmt.Errorf("asus_syslog: non-security line, skip")
 	}
 	if evt.SensorID == "" {
@@ -104,16 +95,12 @@ func (a *AsusAdapter) Parse(line string) (*db.Event, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Bulk ingestion helpers (used by tests and direct CLI path)
+// Bulk ingestion helpers
 // ---------------------------------------------------------------------------
 
-// IngestReader reads lines from r, parses each one, and writes to database.
-// Returns count of events written. Malformed / non-security lines are
-// logged and skipped — never fatal.
 func (a *AsusAdapter) IngestReader(database *db.DB, r io.Reader) (int, error) {
 	scanner := bufio.NewScanner(r)
 	count := 0
-
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "" {
@@ -130,14 +117,12 @@ func (a *AsusAdapter) IngestReader(database *db.DB, r io.Reader) (int, error) {
 		}
 		count++
 	}
-
 	if err := scanner.Err(); err != nil {
 		return count, fmt.Errorf("asus_syslog: scanner: %w", err)
 	}
 	return count, nil
 }
 
-// IngestFile opens path and calls IngestReader.
 func (a *AsusAdapter) IngestFile(database *db.DB, path string) (int, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -151,11 +136,6 @@ func (a *AsusAdapter) IngestFile(database *db.DB, path string) (int, error) {
 // Line parser
 // ---------------------------------------------------------------------------
 
-// parseLine parses a single syslog line. Returns:
-//
-//	(event, nil) — recognized, security-relevant line
-//	(nil,   nil) — well-formed header but non-security event type
-//	(nil,   err) — malformed header; caller logs and skips
 func (a *AsusAdapter) parseLine(line string) (*db.Event, error) {
 	m := reHeader.FindStringSubmatch(line)
 	if m == nil {
@@ -182,7 +162,7 @@ func (a *AsusAdapter) parseLine(line string) (*db.Event, error) {
 		return a.parseWANIP(ts, body, line)
 	}
 
-	return nil, nil // not a tracked process
+	return nil, nil // well-formed but not a tracked process
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +174,6 @@ func (a *AsusAdapter) parseNetfilter(ts time.Time, body, raw string) (*db.Event,
 	if m == nil {
 		return nil, nil
 	}
-
 	action := strings.ToUpper(m[1])
 	srcIP := m[4]
 	dstIP := m[5]
@@ -203,12 +182,10 @@ func (a *AsusAdapter) parseNetfilter(ts time.Time, body, raw string) (*db.Event,
 	if m[7] != "" {
 		dstPort, _ = strconv.Atoi(m[7])
 	}
-
 	tags := db.StringSlice{"firewall_" + strings.ToLower(action)}
 	if action == "DROP" || action == "REJECT" {
 		tags = append(tags, "blocked")
 	}
-
 	return &db.Event{
 		EventID:      uuid.NewString(),
 		Timestamp:    ts,
@@ -219,7 +196,6 @@ func (a *AsusAdapter) parseNetfilter(ts time.Time, body, raw string) (*db.Event,
 		DetectorType: "firewall",
 		EventType:    "netfilter_" + strings.ToLower(action),
 		SrcIP:        srcIP,
-		SrcPort:      0,
 		DstIP:        dstIP,
 		DstPort:      dstPort,
 		Protocol:     proto,
@@ -236,19 +212,17 @@ func (a *AsusAdapter) parseDHCP(ts time.Time, body, raw string) (*db.Event, erro
 	if m == nil {
 		return nil, nil
 	}
-
 	msgType := m[1]
 	clientIP := m[2]
 	mac := m[3]
 	hostname := ""
 	if len(m) > 4 {
-		hostname = m[4]
+		hostname = strings.TrimSpace(m[4])
 	}
 	notes := fmt.Sprintf("mac=%s", mac)
 	if hostname != "" {
 		notes += fmt.Sprintf(" hostname=%s", hostname)
 	}
-
 	return &db.Event{
 		EventID:      uuid.NewString(),
 		Timestamp:    ts,
@@ -259,9 +233,6 @@ func (a *AsusAdapter) parseDHCP(ts time.Time, body, raw string) (*db.Event, erro
 		DetectorType: "dhcp",
 		EventType:    "dhcp_" + strings.ToLower(msgType),
 		SrcIP:        clientIP,
-		SrcPort:      0,
-		DstIP:        "",
-		DstPort:      0,
 		Protocol:     "UDP",
 		Transport:    "UDP",
 		Direction:    "internal",
@@ -277,10 +248,8 @@ func (a *AsusAdapter) parseHostapd(ts time.Time, body, raw string) (*db.Event, e
 	if m == nil {
 		return nil, nil
 	}
-
 	mac := m[1]
 	action := m[2]
-
 	return &db.Event{
 		EventID:      uuid.NewString(),
 		Timestamp:    ts,
@@ -290,12 +259,7 @@ func (a *AsusAdapter) parseHostapd(ts time.Time, body, raw string) (*db.Event, e
 		SourceType:   SourceTypeAsus,
 		DetectorType: "wifi",
 		EventType:    "wifi_" + strings.ToLower(action),
-		SrcIP:        "",
-		SrcPort:      0,
-		DstIP:        "",
-		DstPort:      0,
 		Protocol:     "802.11",
-		Transport:    "",
 		Direction:    "internal",
 		RawRef:       raw,
 		Confidence:   0.85,
@@ -309,9 +273,7 @@ func (a *AsusAdapter) parseWANIP(ts time.Time, body, raw string) (*db.Event, err
 	if m == nil {
 		return nil, nil
 	}
-
 	wanIP := m[1]
-
 	return &db.Event{
 		EventID:      uuid.NewString(),
 		Timestamp:    ts,
@@ -322,11 +284,6 @@ func (a *AsusAdapter) parseWANIP(ts time.Time, body, raw string) (*db.Event, err
 		DetectorType: "wan",
 		EventType:    "wan_ip_change",
 		SrcIP:        wanIP,
-		SrcPort:      0,
-		DstIP:        "",
-		DstPort:      0,
-		Protocol:     "",
-		Transport:    "",
 		Direction:    "outbound",
 		RawRef:       raw,
 		Confidence:   1.0,
@@ -336,20 +293,27 @@ func (a *AsusAdapter) parseWANIP(ts time.Time, body, raw string) (*db.Event, err
 }
 
 // ---------------------------------------------------------------------------
-// Timestamp parsing
+// Timestamp parsing — handles both RFC 3339 and BSD syslog formats
 // ---------------------------------------------------------------------------
 
 func (a *AsusAdapter) parseTimestamp(s string) (time.Time, error) {
-	s = strings.Join(strings.Fields(s), " ")
-	candidate := fmt.Sprintf("%s %d", s, a.year)
-	layout := "Jan 2 15:04:05 2006"
-
-	t, err := time.ParseInLocation(layout, candidate, time.Local)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("parseTimestamp %q: %w", s, err)
+	// RFC 3339 (BE96U firmware): 2026-06-25T20:38:19+00:00
+	if len(s) > 10 && s[4] == '-' {
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("RFC3339 parse %q: %w", s, err)
+		}
+		return t.UTC(), nil
 	}
 
-	// Dec→Jan rollover guard: if parsed time is >24h in the future, subtract a year.
+	// BSD syslog (older firmware): Jun 25 20:05:01
+	s = strings.Join(strings.Fields(s), " ")
+	candidate := fmt.Sprintf("%s %d", s, a.year)
+	t, err := time.ParseInLocation("Jan 2 15:04:05 2006", candidate, time.Local)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("BSD parse %q: %w", s, err)
+	}
+	// Dec→Jan rollover guard
 	if t.After(time.Now().Add(24 * time.Hour)) {
 		t = t.AddDate(-1, 0, 0)
 	}
@@ -360,14 +324,10 @@ func (a *AsusAdapter) parseTimestamp(s string) (time.Time, error) {
 // Sensor registration
 // ---------------------------------------------------------------------------
 
-// RegisterAsusSensor ensures a sensor row exists for the Asus syslog source.
-// Idempotent — reads sensor_id from stateFile on subsequent calls so the
-// same UUID is reused across restarts.
 func RegisterAsusSensor(database *db.DB, stateFile string) (string, error) {
 	if id, err := loadSensorID(stateFile); err == nil && id != "" {
 		return id, nil
 	}
-
 	hostname, _ := os.Hostname()
 	s := &db.Sensor{
 		SensorID:      uuid.NewString(),
@@ -379,15 +339,12 @@ func RegisterAsusSensor(database *db.DB, stateFile string) (string, error) {
 		CollectorType: SourceTypeAsus,
 		Version:       "1.0.0",
 	}
-
 	if err := database.InsertSensor(s); err != nil {
 		return "", fmt.Errorf("RegisterAsusSensor: InsertSensor: %w", err)
 	}
-
 	if err := saveSensorID(stateFile, s.SensorID); err != nil {
 		log.Printf("[asus_syslog] warning: could not save sensor_id to %q: %v", stateFile, err)
 	}
-
 	log.Printf("[asus_syslog] registered sensor %s", s.SensorID)
 	return s.SensorID, nil
 }
