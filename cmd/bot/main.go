@@ -1,7 +1,7 @@
 // ScanTrace CLI — Dead Reckoning Edition
 //
 // Usage:
-//   scantrace ingest    --file <path> --adapter suricata|syslog
+//   scantrace ingest    --file <path> --adapter suricata|syslog|asus-syslog
 //   scantrace correlate
 //   scantrace cases     [--severity high|medium|low]
 //   scantrace report    --case <case-id> [--format markdown|json|slack]
@@ -9,6 +9,7 @@
 // Env:
 //   SCANTRACE_DB         SQLite path (default: ./scantrace.db)
 //   SCANTRACE_SENSOR_ID  sensor UUID (auto-created if unset)
+//   SCANTRACE_ASUS_STATE path to Asus sensor-id state file (default: .asus-sensor-id)
 //   IPINFO_TOKEN         ipinfo.io token (optional)
 package main
 
@@ -67,10 +68,19 @@ func main() {
 
 func cmdIngest(store *db.DB, sensorID, ipinfoToken string) {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
-	filePath := fs.String("file", "", "path to log file (or - for stdin)")
-	adapterName := fs.String("adapter", "suricata", "suricata | syslog")
+	filePath := fs.String("file", "", "path to log file (use - for stdin)")
+	adapterName := fs.String("adapter", "suricata", "suricata | syslog | asus-syslog")
 	_ = fs.Parse(os.Args[2:])
 
+	// asus-syslog needs its own sensor registration before the shared
+	// Collector is constructed, because the sensor_id must exist in the DB
+	// before any event referencing it can be inserted (FK constraint).
+	if *adapterName == "asus-syslog" {
+		cmdIngestAsus(store, *filePath)
+		return
+	}
+
+	// --- shared Collector path for suricata / syslog ---
 	var adapter collector.Adapter
 	switch *adapterName {
 	case "suricata":
@@ -78,12 +88,12 @@ func cmdIngest(store *db.DB, sensorID, ipinfoToken string) {
 	case "syslog":
 		adapter = &collector.SyslogAdapter{}
 	default:
-		log.Fatalf("unknown adapter: %s", *adapterName)
+		log.Fatalf("unknown adapter: %s (valid: suricata, syslog, asus-syslog)", *adapterName)
 	}
 
 	col := collector.New(store, sensorID)
 	if *filePath == "" || *filePath == "-" {
-		fmt.Fprintln(os.Stderr, "Reading from stdin (Ctrl+D to stop)...")
+		fmt.Fprintln(os.Stderr, "[ingest] reading from stdin (Ctrl+D to stop)...")
 		col.TailFile(os.Stdin, adapter)
 	} else {
 		if err := col.IngestFile(*filePath, adapter); err != nil {
@@ -95,6 +105,35 @@ func cmdIngest(store *db.DB, sensorID, ipinfoToken string) {
 	events, _ := store.ListEvents(500)
 	result := enrich.EnrichEvents(events)
 	fmt.Printf("[ingest] enriched %d unique source IPs\n", len(result))
+}
+
+// cmdIngestAsus handles the asus-syslog adapter path.
+// It registers (or reuses) the Asus sensor, then drives the shared
+// Collector.TailFile loop using AsusAdapter as the Adapter.
+func cmdIngestAsus(store *db.DB, filePath string) {
+	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
+
+	asusSensorID, err := collector.RegisterAsusSensor(store, statePath)
+	if err != nil {
+		log.Fatalf("[asus-syslog] sensor registration failed: %v", err)
+	}
+	log.Printf("[asus-syslog] using sensor_id=%s", asusSensorID)
+
+	// AsusAdapter now implements collector.Adapter via Parse().
+	// The shared Collector handles scanning and DB insertion.
+	adapter := collector.NewAsusAdapter(asusSensorID)
+	col := collector.New(store, asusSensorID)
+
+	if filePath == "" || filePath == "-" {
+		fmt.Fprintln(os.Stderr, "[asus-syslog] reading from stdin — pipe with: sudo tail -F /var/log/asus-router.log")
+		col.TailFile(os.Stdin, adapter)
+	} else {
+		if err := col.IngestFile(filePath, adapter); err != nil {
+			log.Fatalf("[asus-syslog] ingest error: %v", err)
+		}
+	}
+
+	fmt.Println("[asus-syslog] done — run: sqlite3 scantrace.db \"SELECT event_type, src_ip, dst_ip, dst_port FROM events WHERE source_type='asus_syslog' LIMIT 20;\"")
 }
 
 func cmdCorrelate(store *db.DB) {
@@ -189,14 +228,15 @@ func printUsage() {
 	fmt.Fprint(os.Stderr, `ScanTrace — Dead Reckoning Edition
 
 Commands:
-  ingest     --file <path> --adapter suricata|syslog
+  ingest     --file <path> --adapter suricata|syslog|asus-syslog
   correlate
   cases      [--severity high|medium|low]
   report     --case <case-id> [--format markdown|json|slack]
 
 Env:
-  SCANTRACE_DB         SQLite path  (default: scantrace.db)
-  SCANTRACE_SENSOR_ID  sensor UUID  (auto-created if unset)
-  IPINFO_TOKEN         ipinfo.io token (optional)
+  SCANTRACE_DB         SQLite path            (default: scantrace.db)
+  SCANTRACE_SENSOR_ID  sensor UUID            (auto-created if unset)
+  SCANTRACE_ASUS_STATE Asus sensor-id file    (default: .asus-sensor-id)
+  IPINFO_TOKEN         ipinfo.io token        (optional)
 `)
 }
