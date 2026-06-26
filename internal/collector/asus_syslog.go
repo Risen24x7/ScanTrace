@@ -246,6 +246,8 @@ func (a *AsusAdapter) parseHostapd(ts time.Time, body, raw string) (*db.Event, e
 	}
 	mac := m[1]
 	action := m[2]
+	// FIX: store the MAC as SrcIP so the correlator and Slack block
+	// have a non-empty identifier for new_device cases.
 	return &db.Event{
 		EventID:      uuid.NewString(),
 		Timestamp:    ts,
@@ -255,6 +257,7 @@ func (a *AsusAdapter) parseHostapd(ts time.Time, body, raw string) (*db.Event, e
 		SourceType:   SourceTypeAsus,
 		DetectorType: "wifi",
 		EventType:    "wifi_" + strings.ToLower(action),
+		SrcIP:        mac, // MAC address used as identifier for LAN devices
 		Protocol:     "802.11",
 		Direction:    "internal",
 		RawRef:       raw,

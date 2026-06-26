@@ -5,6 +5,7 @@ package correlator
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Risen24x7/scantrace/internal/db"
@@ -15,6 +16,9 @@ const (
 	DefaultWindow    = 72 * time.Hour
 	DefaultThreshold = 3
 	DefaultMaxEvents = 500
+	// dedupWindow is how long an open case suppresses re-alerting for the same
+	// srcIP + ruleType combination.
+	dedupWindow = 24 * time.Hour
 )
 
 type Config struct {
@@ -71,7 +75,8 @@ func (c *IPCluster) Severity() string {
 	}
 }
 
-// Run clusters events in the window, evaluates rules, and opens/updates Cases.
+// Run clusters events in the window, evaluates rules, and opens Cases only
+// when no open case for the same srcIP+ruleType exists within dedupWindow.
 func (c *Correlator) Run() ([]*db.Case, error) {
 	since := time.Now().UTC().Add(-c.config.Window)
 	events, err := c.store.ListEvents(c.config.MaxEvents)
@@ -85,14 +90,21 @@ func (c *Correlator) Run() ([]*db.Case, error) {
 		}
 	}
 	clusters := c.cluster(windowed)
-	var cases []*db.Case
+
+	// Load recent cases once for dedup checks.
+	recentCases, err := c.store.ListCases("", 200)
+	if err != nil {
+		log.Printf("[correlator] could not load recent cases for dedup: %v", err)
+		recentCases = nil
+	}
+
+	var newCases []*db.Case
 	for _, cl := range clusters {
 		if len(cl.Events) < c.config.Threshold {
 			continue
 		}
 		cl.Score = cl.computeScore()
 
-		// Evaluate named rules; take the first match (highest priority first).
 		var match *RuleMatch
 		for _, rule := range c.rules {
 			if m := rule.Eval(cl); m != nil {
@@ -101,14 +113,46 @@ func (c *Correlator) Run() ([]*db.Case, error) {
 			}
 		}
 
-		cas, err := c.openOrUpdateCase(cl, match)
+		ruleType := "generic_scan"
+		if match != nil {
+			ruleType = match.RuleType
+		}
+
+		// Dedup: skip if an open case for this srcIP+ruleType was created
+		// within the last dedupWindow.
+		if isDuplicate(recentCases, cl.SrcIP, ruleType, dedupWindow) {
+			log.Printf("[correlator] dedup: skipping %s/%s (open case exists)", cl.SrcIP, ruleType)
+			continue
+		}
+
+		cas, err := c.openCase(cl, match)
 		if err != nil {
 			log.Printf("[correlator] case error for %s: %v", cl.SrcIP, err)
 			continue
 		}
-		cases = append(cases, cas)
+		newCases = append(newCases, cas)
 	}
-	return cases, nil
+	return newCases, nil
+}
+
+// isDuplicate returns true if recentCases contains an open case for the given
+// srcIP and ruleType created within the last window duration.
+func isDuplicate(cases []*db.Case, srcIP, ruleType string, window time.Duration) bool {
+	cutoff := time.Now().UTC().Add(-window)
+	needle := fmt.Sprintf("type=%s", ruleType)
+	for _, c := range cases {
+		if c.Status != "open" {
+			continue
+		}
+		if c.CreatedAt.Before(cutoff) {
+			continue
+		}
+		// analyst_notes stores "rule=X type=Y" — check both srcIP in title and ruleType in notes.
+		if strings.Contains(c.Title, srcIP) && strings.Contains(c.AnalystNotes, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Correlator) cluster(events []*db.Event) map[string]*IPCluster {
@@ -138,7 +182,7 @@ func (c *Correlator) cluster(events []*db.Event) map[string]*IPCluster {
 	return out
 }
 
-func (c *Correlator) openOrUpdateCase(cl *IPCluster, match *RuleMatch) (*db.Case, error) {
+func (c *Correlator) openCase(cl *IPCluster, match *RuleMatch) (*db.Case, error) {
 	eventIDs := make(db.StringSlice, 0, len(cl.Events))
 	for _, e := range cl.Events {
 		eventIDs = append(eventIDs, e.EventID)

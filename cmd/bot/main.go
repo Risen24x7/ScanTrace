@@ -6,6 +6,7 @@
 //   scantrace cases     [--severity high|medium|low]
 //   scantrace report    --case <case-id> [--format markdown|json|slack]
 //   scantrace serve     [--interval 5m]
+//   scantrace flush     [--source testdata]
 //
 // Env:
 //   SCANTRACE_DB         SQLite path (default: ./scantrace.db)
@@ -66,6 +67,8 @@ func main() {
 		cmdReport(store)
 	case "serve":
 		cmdServe(store, sensorID, ipinfoToken, slackWebhook)
+	case "flush":
+		cmdFlush(store)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -150,12 +153,12 @@ func cmdCorrelate(store *db.DB, slackWebhook string) {
 		log.Fatalf("correlate error: %v", err)
 	}
 	if len(cases) == 0 {
-		fmt.Println("[correlate] no new cases (threshold not reached)")
+		fmt.Println("[correlate] no new cases (threshold not reached or all deduped)")
 		return
 	}
 	fmt.Printf("[correlate] opened %d case(s)\n", len(cases))
 	for _, c := range cases {
-		fmt.Printf("  \u2022 [%s] %s  severity=%s  confidence=%.0f%%\n",
+		fmt.Printf("  • [%s] %s  severity=%s  confidence=%.0f%%\n",
 			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
 	}
 	postAlerts(store, cases, slackWebhook)
@@ -243,7 +246,6 @@ func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Run once immediately on startup.
 	runCycle(store, slackWebhook)
 
 	for range ticker.C {
@@ -268,6 +270,55 @@ func runCycle(store *db.DB, slackWebhook string) {
 }
 
 // ---------------------------------------------------------------------------
+// flush — remove test fixture data
+// ---------------------------------------------------------------------------
+
+func cmdFlush(store *db.DB) {
+	fs := flag.NewFlagSet("flush", flag.ExitOnError)
+	source := fs.String("source", "testdata", "testdata = wipe RFC5737/test events and orphaned cases")
+	_ = fs.Parse(os.Args[2:])
+
+	switch *source {
+	case "testdata":
+		// RFC 5737 documentation prefixes + common testdata IPs.
+		testPrefixes := []string{"192.0.2.", "198.51.100.", "203.0.113."}
+		events, err := store.ListEvents(2000)
+		if err != nil {
+			log.Fatalf("flush: list events: %v", err)
+		}
+		evicted := 0
+		for _, e := range events {
+			for _, pfx := range testPrefixes {
+				if strings.HasPrefix(e.SrcIP, pfx) || strings.HasPrefix(e.DstIP, pfx) {
+					if err := store.DeleteEvent(e.EventID); err != nil {
+						log.Printf("flush: delete event %s: %v", e.EventID[:8], err)
+					} else {
+						evicted++
+					}
+					break
+				}
+			}
+		}
+		// Delete cases whose titles reference test IPs.
+		cases, _ := store.ListCases("", 500)
+		casesEvicted := 0
+		for _, c := range cases {
+			for _, pfx := range testPrefixes {
+				if strings.Contains(c.Title, pfx[:len(pfx)-1]) || strings.Contains(c.Summary, pfx) {
+					if err := store.DeleteCase(c.CaseID); err == nil {
+						casesEvicted++
+					}
+					break
+				}
+			}
+		}
+		fmt.Printf("[flush] removed %d test events and %d test cases\n", evicted, casesEvicted)
+	default:
+		log.Fatalf("unknown flush source %q (valid: testdata)", *source)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Slack alert helper
 // ---------------------------------------------------------------------------
 
@@ -278,7 +329,6 @@ func postAlerts(store *db.DB, cases []*db.Case, webhookURL string) {
 	client := slack.New(webhookURL)
 	builder := casebuilder.New(store)
 	for _, cas := range cases {
-		// Only alert on medium+ severity to reduce noise.
 		if cas.Severity == "low" {
 			continue
 		}
@@ -329,6 +379,7 @@ Commands:
   cases      [--severity high|medium|low]
   report     --case <case-id> [--format markdown|json|slack]
   serve      [--interval 5m]
+  flush      [--source testdata]
 
 Env:
   SCANTRACE_DB         SQLite path            (default: scantrace.db)
