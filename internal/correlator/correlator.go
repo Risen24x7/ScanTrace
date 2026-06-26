@@ -1,4 +1,5 @@
-// Package correlator groups Events into Cases by src_ip within a rolling time window.
+// Package correlator groups Events into Cases by src_ip within a rolling time window
+// and evaluates named detection rules against each cluster.
 package correlator
 
 import (
@@ -29,10 +30,11 @@ func DefaultConfig() Config {
 type Correlator struct {
 	store  *db.DB
 	config Config
+	rules  []Rule
 }
 
 func New(store *db.DB, cfg Config) *Correlator {
-	return &Correlator{store: store, config: cfg}
+	return &Correlator{store: store, config: cfg, rules: DefaultRules()}
 }
 
 type IPCluster struct {
@@ -69,6 +71,7 @@ func (c *IPCluster) Severity() string {
 	}
 }
 
+// Run clusters events in the window, evaluates rules, and opens/updates Cases.
 func (c *Correlator) Run() ([]*db.Case, error) {
 	since := time.Now().UTC().Add(-c.config.Window)
 	events, err := c.store.ListEvents(c.config.MaxEvents)
@@ -88,7 +91,17 @@ func (c *Correlator) Run() ([]*db.Case, error) {
 			continue
 		}
 		cl.Score = cl.computeScore()
-		cas, err := c.openOrUpdateCase(cl)
+
+		// Evaluate named rules; take the first match (highest priority first).
+		var match *RuleMatch
+		for _, rule := range c.rules {
+			if m := rule.Eval(cl); m != nil {
+				match = m
+				break
+			}
+		}
+
+		cas, err := c.openOrUpdateCase(cl, match)
 		if err != nil {
 			log.Printf("[correlator] case error for %s: %v", cl.SrcIP, err)
 			continue
@@ -125,29 +138,37 @@ func (c *Correlator) cluster(events []*db.Event) map[string]*IPCluster {
 	return out
 }
 
-func (c *Correlator) openOrUpdateCase(cl *IPCluster) (*db.Case, error) {
+func (c *Correlator) openOrUpdateCase(cl *IPCluster, match *RuleMatch) (*db.Case, error) {
 	eventIDs := make(db.StringSlice, 0, len(cl.Events))
 	for _, e := range cl.Events {
 		eventIDs = append(eventIDs, e.EventID)
 	}
+
+	title := fmt.Sprintf("Scan activity from %s", cl.SrcIP)
+	ruleName := "generic_scan"
+	ruleType := "generic_scan"
+	if match != nil {
+		title = fmt.Sprintf("[%s] %s", match.RuleName, cl.SrcIP)
+		ruleName = match.RuleName
+		ruleType = match.RuleType
+	}
+
 	cas := &db.Case{
 		CaseID:          uuid.New().String(),
-		Title:           fmt.Sprintf("Scan activity from %s", cl.SrcIP),
-		Summary:         buildSummary(cl),
+		Title:           title,
+		Summary:         buildSummary(cl, match),
 		Status:          "open",
 		Severity:        cl.Severity(),
 		Confidence:      cl.Score,
 		CreatedAt:       cl.FirstSeen,
 		UpdatedAt:       time.Now().UTC(),
 		RelatedEventIDs: eventIDs,
+		AnalystNotes:    fmt.Sprintf("rule=%s type=%s", ruleName, ruleType),
 	}
 	if err := c.store.InsertCase(cas); err != nil {
 		return nil, err
 	}
 
-	// Link the source IP entity to this case if it exists in the DB.
-	// The enricher runs separately and may not have populated this yet;
-	// log and continue rather than failing the whole case.
 	if entity, err := c.store.GetEntityByIP(cl.SrcIP); err == nil && entity != nil {
 		if linkErr := c.store.LinkEntityToCase(cas.CaseID, entity.EntityID); linkErr != nil {
 			log.Printf("[correlator] entity link failed for case %s / ip %s: %v",
@@ -158,18 +179,22 @@ func (c *Correlator) openOrUpdateCase(cl *IPCluster) (*db.Case, error) {
 	return cas, nil
 }
 
-func buildSummary(cl *IPCluster) string {
+func buildSummary(cl *IPCluster, match *RuleMatch) string {
 	ports := []string{}
 	for p := range cl.Ports {
 		ports = append(ports, fmt.Sprintf("%d", p))
 	}
-	return fmt.Sprintf(
+	base := fmt.Sprintf(
 		"**Source IP:** %s\n**Observations:** %d events over %s\n**Ports touched:** %s\n**First seen:** %s\n**Last seen:** %s\n**Confidence:** %.2f\n**Severity:** %s",
 		cl.SrcIP, len(cl.Events), cl.LastSeen.Sub(cl.FirstSeen).Round(time.Second),
 		joinStrings(ports, ", "),
 		cl.FirstSeen.Format(time.RFC3339), cl.LastSeen.Format(time.RFC3339),
 		cl.Score, cl.Severity(),
 	)
+	if match != nil {
+		base += fmt.Sprintf("\n**Rule:** %s — %s", match.RuleName, match.Description)
+	}
+	return base
 }
 
 func joinStrings(ss []string, sep string) string {

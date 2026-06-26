@@ -5,12 +5,14 @@
 //   scantrace correlate
 //   scantrace cases     [--severity high|medium|low]
 //   scantrace report    --case <case-id> [--format markdown|json|slack]
+//   scantrace serve     [--interval 5m]
 //
 // Env:
 //   SCANTRACE_DB         SQLite path (default: ./scantrace.db)
 //   SCANTRACE_SENSOR_ID  sensor UUID (auto-created if unset)
 //   SCANTRACE_ASUS_STATE path to Asus sensor-id state file (default: .asus-sensor-id)
 //   IPINFO_TOKEN         ipinfo.io token (optional)
+//   SLACK_WEBHOOK_URL    Slack Incoming Webhook URL (optional — enables alert posting)
 package main
 
 import (
@@ -20,12 +22,14 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Risen24x7/scantrace/internal/casebuilder"
 	"github.com/Risen24x7/scantrace/internal/collector"
 	"github.com/Risen24x7/scantrace/internal/correlator"
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/Risen24x7/scantrace/internal/enricher"
+	"github.com/Risen24x7/scantrace/internal/slack"
 	"github.com/google/uuid"
 )
 
@@ -39,6 +43,7 @@ func main() {
 	dbPath := envOrDefault("SCANTRACE_DB", "scantrace.db")
 	sensorID := envOrDefault("SCANTRACE_SENSOR_ID", "")
 	ipinfoToken := envOrDefault("IPINFO_TOKEN", "")
+	slackWebhook := envOrDefault("SLACK_WEBHOOK_URL", "")
 
 	store, err := db.Open(dbPath)
 	if err != nil {
@@ -54,11 +59,13 @@ func main() {
 	case "ingest":
 		cmdIngest(store, sensorID, ipinfoToken)
 	case "correlate":
-		cmdCorrelate(store)
+		cmdCorrelate(store, slackWebhook)
 	case "cases":
 		cmdCases(store)
 	case "report":
 		cmdReport(store)
+	case "serve":
+		cmdServe(store, sensorID, ipinfoToken, slackWebhook)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -66,21 +73,21 @@ func main() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// ingest
+// ---------------------------------------------------------------------------
+
 func cmdIngest(store *db.DB, sensorID, ipinfoToken string) {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 	filePath := fs.String("file", "", "path to log file (use - for stdin)")
 	adapterName := fs.String("adapter", "suricata", "suricata | syslog | asus-syslog")
 	_ = fs.Parse(os.Args[2:])
 
-	// asus-syslog needs its own sensor registration before the shared
-	// Collector is constructed, because the sensor_id must exist in the DB
-	// before any event referencing it can be inserted (FK constraint).
 	if *adapterName == "asus-syslog" {
 		cmdIngestAsus(store, *filePath)
 		return
 	}
 
-	// --- shared Collector path for suricata / syslog ---
 	var adapter collector.Adapter
 	switch *adapterName {
 	case "suricata":
@@ -107,9 +114,6 @@ func cmdIngest(store *db.DB, sensorID, ipinfoToken string) {
 	fmt.Printf("[ingest] enriched %d unique source IPs\n", len(result))
 }
 
-// cmdIngestAsus handles the asus-syslog adapter path.
-// It registers (or reuses) the Asus sensor, then drives the shared
-// Collector.TailFile loop using AsusAdapter as the Adapter.
 func cmdIngestAsus(store *db.DB, filePath string) {
 	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
 
@@ -119,8 +123,6 @@ func cmdIngestAsus(store *db.DB, filePath string) {
 	}
 	log.Printf("[asus-syslog] using sensor_id=%s", asusSensorID)
 
-	// AsusAdapter now implements collector.Adapter via Parse().
-	// The shared Collector handles scanning and DB insertion.
 	adapter := collector.NewAsusAdapter(asusSensorID)
 	col := collector.New(store, asusSensorID)
 
@@ -136,7 +138,11 @@ func cmdIngestAsus(store *db.DB, filePath string) {
 	fmt.Println("[asus-syslog] done — run: sqlite3 scantrace.db \"SELECT event_type, src_ip, dst_ip, dst_port FROM events WHERE source_type='asus_syslog' LIMIT 20;\"")
 }
 
-func cmdCorrelate(store *db.DB) {
+// ---------------------------------------------------------------------------
+// correlate
+// ---------------------------------------------------------------------------
+
+func cmdCorrelate(store *db.DB, slackWebhook string) {
 	cfg := correlator.DefaultConfig()
 	corr := correlator.New(store, cfg)
 	cases, err := corr.Run()
@@ -152,7 +158,12 @@ func cmdCorrelate(store *db.DB) {
 		fmt.Printf("  \u2022 [%s] %s  severity=%s  confidence=%.0f%%\n",
 			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
 	}
+	postAlerts(store, cases, slackWebhook)
 }
+
+// ---------------------------------------------------------------------------
+// cases
+// ---------------------------------------------------------------------------
 
 func cmdCases(store *db.DB) {
 	fs := flag.NewFlagSet("cases", flag.ExitOnError)
@@ -174,6 +185,10 @@ func cmdCases(store *db.DB) {
 			c.CaseID, c.Status, c.Severity, c.Confidence*100, c.Title)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// report
+// ---------------------------------------------------------------------------
 
 func cmdReport(store *db.DB) {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)
@@ -202,6 +217,87 @@ func cmdReport(store *db.DB) {
 		fmt.Println(report.Markdown)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// serve — daemon loop
+// ---------------------------------------------------------------------------
+
+func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	intervalStr := fs.String("interval", "5m", "correlate interval (e.g. 1m, 5m, 15m)")
+	_ = fs.Parse(os.Args[2:])
+
+	interval, err := time.ParseDuration(*intervalStr)
+	if err != nil || interval < 10*time.Second {
+		log.Fatalf("invalid --interval %q (min 10s)", *intervalStr)
+	}
+
+	slackClient := slack.New(slackWebhook)
+	if slackClient.Enabled() {
+		log.Printf("[serve] Slack alerts enabled")
+	} else {
+		log.Printf("[serve] Slack alerts disabled (set SLACK_WEBHOOK_URL to enable)")
+	}
+	log.Printf("[serve] starting — correlate interval=%s", interval)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Run once immediately on startup.
+	runCycle(store, slackWebhook)
+
+	for range ticker.C {
+		runCycle(store, slackWebhook)
+	}
+}
+
+func runCycle(store *db.DB, slackWebhook string) {
+	cfg := correlator.DefaultConfig()
+	corr := correlator.New(store, cfg)
+	cases, err := corr.Run()
+	if err != nil {
+		log.Printf("[serve] correlate error: %v", err)
+		return
+	}
+	if len(cases) == 0 {
+		log.Printf("[serve] cycle complete — no new cases")
+		return
+	}
+	log.Printf("[serve] %d new case(s)", len(cases))
+	postAlerts(store, cases, slackWebhook)
+}
+
+// ---------------------------------------------------------------------------
+// Slack alert helper
+// ---------------------------------------------------------------------------
+
+func postAlerts(store *db.DB, cases []*db.Case, webhookURL string) {
+	if webhookURL == "" {
+		return
+	}
+	client := slack.New(webhookURL)
+	builder := casebuilder.New(store)
+	for _, cas := range cases {
+		// Only alert on medium+ severity to reduce noise.
+		if cas.Severity == "low" {
+			continue
+		}
+		report, err := builder.BuildReport(cas.CaseID)
+		if err != nil {
+			log.Printf("[alerts] BuildReport %s: %v", cas.CaseID[:8], err)
+			continue
+		}
+		if err := client.PostBlock(report.SlackBlock()); err != nil {
+			log.Printf("[alerts] Slack post failed for %s: %v", cas.CaseID[:8], err)
+		} else {
+			log.Printf("[alerts] posted case %s (%s) to Slack", cas.CaseID[:8], cas.Severity)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 func ensureSensor(store *db.DB) string {
 	id := uuid.New().String()
@@ -232,11 +328,13 @@ Commands:
   correlate
   cases      [--severity high|medium|low]
   report     --case <case-id> [--format markdown|json|slack]
+  serve      [--interval 5m]
 
 Env:
   SCANTRACE_DB         SQLite path            (default: scantrace.db)
   SCANTRACE_SENSOR_ID  sensor UUID            (auto-created if unset)
   SCANTRACE_ASUS_STATE Asus sensor-id file    (default: .asus-sensor-id)
   IPINFO_TOKEN         ipinfo.io token        (optional)
+  SLACK_WEBHOOK_URL    Slack Incoming Webhook (optional)
 `)
 }
