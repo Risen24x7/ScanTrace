@@ -3,6 +3,7 @@ package collector
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -102,7 +103,7 @@ func (a *AsusAdapter) IngestReader(database *db.DB, r io.Reader) (int, error) {
 		}
 		evt, err := a.Parse(line)
 		if err != nil {
-			if !isSkip(err) {
+			if !errors.Is(err, ErrSkip) {
 				log.Printf("[asus_syslog] parse error: %v", err)
 			}
 			continue
@@ -362,10 +363,6 @@ func saveSensorID(path, id string) error {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func isSkip(err error) bool {
-	return errors.Is(err, ErrSkip)
-}
-
 func inferDirection(src, dst string) string {
 	srcPriv := isPrivate(src)
 	dstPriv := isPrivate(dst)
@@ -407,5 +404,5 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "\u2026"
+	return s[:n] + "…"
 }
