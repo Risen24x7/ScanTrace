@@ -1,5 +1,5 @@
 # ScanTrace — Slack Hackathon Project Brief
-### *"The first step to fixing something is admitting it's broken."* — Idiocracy
+### *"The first step in solving any problem is recognizing there is one."* —(last heard on) Newsroom
 
 > **Dev Sandbox:** Dilldozer  
 > **Submission Deadline:** July 13, 2026 @ 5:00 PM PDT  
