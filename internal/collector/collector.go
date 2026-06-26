@@ -1,12 +1,14 @@
 // Package collector ingests raw log lines and writes normalized Events to the DB.
-// Two adapters are provided for MVP:
+// Adapters provided:
 //   - SuricataAdapter: parses Suricata EVE JSON
-//   - SyslogAdapter:   parses common firewall syslog (iptables / pf / ASA-style)
+//   - SyslogAdapter:   parses generic firewall syslog (iptables/pf/ASA)
+//   - AsusAdapter:     parses AsusWRT syslog (RFC 3339 and BSD formats)
 package collector
 
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +21,22 @@ import (
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/google/uuid"
 )
+
+// ErrSkip is returned by an Adapter.Parse implementation when the line is
+// well-formed but intentionally not tracked (e.g. a non-security process on
+// an Asus router, or a Suricata event_type we don't care about).
+// TailFile silently drops these; only unexpected errors are logged.
+var ErrSkip = errors.New("skip")
+
+// skipErr wraps ErrSkip with context without allocating on the hot path.
+type skipErr struct{ msg string }
+
+func (e *skipErr) Error() string { return e.msg }
+func (e *skipErr) Is(target error) bool { return target == ErrSkip }
+
+// Skip returns a sentinel error that causes TailFile to silently discard the
+// current line. Use it inside Adapter.Parse for expected non-events.
+func Skip(msg string) error { return &skipErr{msg: msg} }
 
 type Collector struct {
 	store    *db.DB
@@ -39,7 +57,9 @@ func (c *Collector) TailFile(r io.Reader, adapter Adapter) {
 		}
 		evt, err := adapter.Parse(line)
 		if err != nil {
-			log.Printf("[collector] parse skip: %v", err)
+			if !errors.Is(err, ErrSkip) {
+				log.Printf("[collector] parse error: %v", err)
+			}
 			continue
 		}
 		evt.SensorID = c.sensorID
@@ -95,7 +115,7 @@ func (a *SuricataAdapter) Parse(line string) (*db.Event, error) {
 	switch eve.EventType {
 	case "alert", "flow", "anomaly", "scan":
 	default:
-		return nil, fmt.Errorf("suricata: skipping event_type=%s", eve.EventType)
+		return nil, Skip(fmt.Sprintf("suricata: event_type=%s", eve.EventType))
 	}
 	ts, err := time.Parse("2006-01-02T15:04:05.999999-0700", eve.Timestamp)
 	if err != nil {
@@ -138,7 +158,7 @@ type SyslogAdapter struct{}
 func (a *SyslogAdapter) Parse(line string) (*db.Event, error) {
 	lower := strings.ToLower(line)
 	if !strings.ContainsAny(lower, "drop block deny reject") {
-		return nil, fmt.Errorf("syslog: no deny keyword, skip")
+		return nil, Skip("syslog: no deny keyword")
 	}
 	srcIP, dstIP, srcPort, dstPort, proto := extractSyslogFields(line)
 	if srcIP == "" {
