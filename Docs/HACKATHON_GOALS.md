@@ -1,88 +1,98 @@
-# ScanTrace – Dead Reckoning Edition
+# ScanTrace — Dead Reckoning Edition
+## Hackathon Goals
 
-## Hackathon primary goal
+> **Deadline:** July 13, 2026 @ 5:00 PM PDT  
+> **Track:** New Slack Agent  
+> **Days remaining:** 15
 
-Deliver a clear, demo-ready defensive scan intelligence pipeline that:
+---
 
-- Ingests real scan-related events from at least two sources (Suricata EVE JSON and a home router/firewall syslog feed).
-- Normalizes those events into a common internal event schema.
-- Enriches the source IP with basic infrastructure context (ASN, provider, reverse DNS, and abuse/geo hints where available).
-- Correlates repeated activity over short time windows to distinguish one-off noise from recurring scan behavior.
-- Produces human-readable case reports and machine-readable JSON exports summarizing scan campaigns.
-- Exposes a simple CLI (and later MCP tools) to trigger, inspect, and export cases.
+## Primary goal
 
-These capabilities must work **without any LLM dependency** for hackathon judging.
+Deliver a Slack-native, demo-ready defensive scan intelligence pipeline that:
 
-## Stable baseline for judging
+- Ingests real events from at least two sources (Suricata EVE JSON + Asus router syslog)
+- Normalizes events into a common internal schema
+- Enriches source IPs with ASN, provider, rDNS, and abuse contact
+- Correlates repeated activity to distinguish noise from recurring scan behavior
+- Produces human-readable Slack Block Kit case cards and machine-readable JSON exports
+- Exposes a Bolt app with MCP tools, Real-Time Search, and NL Q&A (`@ScanTrace what hit us today?`)
 
-The "Dead Reckoning" hackathon baseline is the minimum, stable feature set we commit to keep working end-to-end:
+---
 
-- **Inputs**
-  - Suricata EVE JSON from `testdata/`.
-  - Live syslog stream from at least one real network device (e.g., Asus router) forwarded via rsyslog.
-- **Pipeline**
-  - Collector ingests raw events and tags them with sensor metadata.
-  - Normalizer maps source-specific fields into the common event schema.
-  - Enricher attaches infrastructure context such as ASN, provider, and reverse DNS.
-  - Correlator groups repeated activity over a demo-friendly time window.
-  - Case builder generates incident-style case reports (Markdown + JSON).
-- **Storage and tooling**
-  - SQLite used as the embedded event + case store for MVP.
-  - CLI commands:
-    - `ingest` – read from file/stdin with a specified adapter.
-    - `correlate` – build/refresh correlated views from raw events.
-    - `cases` – list open/closed cases.
-    - `report` – render a specific case in Markdown/JSON.
+## Current pipeline status (as of June 28, 2026)
 
-For the contest, we will cut and document a branch or tag (e.g., `hackathon-stable-2026-06-25`) that:
+| Component | Status | Notes |
+|---|---|---|
+| Layer 1 — Data Foundation | ✅ Complete | Schema, SQLite, CLI, testdata all working |
+| Layer 2 — Collector | ✅ Complete | Suricata + Asus syslog adapters live |
+| Layer 3 — Normalizer | ✅ Functionally complete | MAC, event_type, confidence normalized; standalone normalizer.go not extracted yet |
+| Layer 3 — Enricher | ☐ Not started | ipinfo.io + rDNS + RDAP needed |
+| Layer 4 — Correlator | ✅ Complete | new_device, port_scan rules; dedup; severity; confidence working |
+| Layer 4 — Case Builder | ✅ Complete | cases, report, serve commands working; Slack webhook alerts live |
+| Layer 5 — Slack Bolt App | 🔄 Partial | Webhook alerting works; socket mode Bolt app + slash commands not built |
+| Layer 6 — MCP Tools | ☐ Not started | get_case, list_cases, enrich_ip, search_related_events |
+| Layer 6 — RTS Integration | ☐ Not started | Prior observation context block |
+| Layer 6 — NL Q&A | ☐ Not started | @ScanTrace mention handler |
+| Layer 7 — Polish/Submission | ☐ Not started | Architecture diagram, demo video, Devpost form |
 
-- Demonstrates Suricata testdata flowing end-to-end into a case report.
-- Demonstrates live home-router syslog scan activity flowing into cases.
-- Avoids schema-breaking changes to the SQLite layout.
-- Runs entirely from the CLI with no external services required.
+---
 
-## Stretch goals (nice-to-have)
+## Stable baseline for judging (already working)
 
-We will pursue these as time allows, but they are **not required** for the stable judging baseline:
+- Suricata EVE JSON testdata → ingest → correlate → cases → report ✅
+- Live Asus syslog → ingest → correlate → cases ✅
+- Slack webhook alert on new case ✅
+- Dedup: open cases not re-fired ✅
+- MAC address in `new_device` case titles ✅
+- `serve --interval` auto-correlates on schedule ✅
 
-### Detection + defense
+---
 
-- DHCP/MAC monitoring:
-  - Parse DHCP logs to maintain a baseline of known MAC addresses per network.
-  - Raise cases for "stray" or unknown MACs, especially if they participate in scans.
-- Egress / exfil detection:
-  - Detect unusual outbound volume per host or new destinations.
-  - Optionally trigger user-configured actions (scripts, firewall hooks) to temporarily stall or block suspicious flows.
+## Remaining required for submission
 
-### Scalability + robustness
+All three Slack platform technologies must be visibly active for the agent track:
 
-- Ingestion worker pool and autoscaler:
-  - Bounded queues and worker pools for parsing and correlation.
-  - Optional autoscaling of workers based on queue depth and latency.
-- Dedicated DB writer queue:
-  - Many producers, few writers to avoid SQLite lock contention.
-  - Batched inserts for higher throughput.
+1. **Bolt app in Dilldozer** — socket mode, replaces webhook
+2. **MCP server** — 4 tools: `get_case`, `list_cases`, `enrich_ip`, `search_related_events`
+3. **Real-Time Search** — prior observation context block in case card
+4. **NL Q&A** — `@ScanTrace {question}` mention handler
 
-### LLM-assisted, schema-first helpers
+Supporting:
+- IP enricher (feeds `enrich_ip` MCP tool)
+- Known-device allowlist (prevent DHCP chatter from re-firing high-severity alerts)
 
-- UnknownFormatManager + LLMIntrospector:
-  - When parse failures exceed a threshold for a source, sample a small set of lines.
-  - Send them to a **local** LLM under a strict JSON schema to classify vendor/format and suggest an adapter.
-  - Never block the main ingest loop; use bounded queues, timeouts, and circuit breakers.
-- ModelRouter / LLM switcher:
-  - Central abstraction that routes tasks (log introspection, case summarization, DB audit) to appropriate local models.
-  - Enforces per-task token limits, timeouts, and rate limits.
-- Database Auditor & Investigator LLMs (read-only):
-  - Offline analysis of aggregated statistics and case history to suggest coverage gaps or interesting patterns.
-  - All findings stored in separate, versioned tables to avoid mutating raw event data.
+---
 
-## Explicit non-goals for this hackathon
+## Stretch goals (nice-to-have, post-baseline)
 
-To keep the scope realistic, the following are explicitly **out of scope** for the hackathon timeframe:
+- Suricata `--follow` flag (continuous tail of EVE file)
+- DHCP/MAC baseline — flag stray MACs not previously seen
+- Egress/exfil detection — unusual outbound volume per host
+- Ingestion worker pool — bounded queues for high-volume ingest
+- LLM-assisted unknown format classification (local model only, never blocks ingest loop)
+- Web UI case viewer
 
-- Full-featured web UI or dashboard beyond minimal case viewing.
-- Offensive operations or automated active countermeasures beyond user-configured scripts.
-- Multi-tenant auth, RBAC, or complex user management.
-- Deep ML/LLM-based attribution of threat actors.
+---
 
-The emphasis for judging is a **reliable, explainable, CLI-first defensive pipeline** that turns noisy scans into actionable, evidence-oriented cases, with clearly documented stretch goals and a schema-first foundation for future LLM integration.
+## Explicit non-goals
+
+- Multi-tenant auth or RBAC
+- Offensive operations or automated countermeasures
+- Deep ML/LLM-based threat actor attribution
+- Full-featured dashboard beyond minimal case viewing
+
+---
+
+## Submission checklist
+
+| # | Item | Done? |
+|---|------|-------|
+| 7.1 | Architecture diagram (Mermaid/draw.io) | ☐ |
+| 7.2 | Tag `hackathon-stable-YYYYMMDD` branch | ☐ |
+| 7.3 | 3-minute demo video recorded | ☐ |
+| 7.4 | Invite `slackhack@salesforce.com` + `testing@devpost.com` to Dilldozer as Members | ☐ |
+| 7.5 | Agent installed and responsive in Dilldozer | ☐ |
+| 7.6 | Slack App ID noted from api.slack.com/apps | ☐ |
+| 7.7 | Devpost form completed | ☐ |
+| 7.8 | Submitted before July 13 @ 5:00 PM PDT | ☐ |
