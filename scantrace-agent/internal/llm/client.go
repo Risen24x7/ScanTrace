@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -32,6 +33,9 @@ When no relevant context is available, say so honestly.`
 
 	defaultTimeout = 90 * time.Second
 )
+
+// thinkRE strips Qwen3 <think>...</think> reasoning blocks from output.
+var thinkRE = regexp.MustCompile(`(?s)<think>.*?</think>`)
 
 // Message is an OpenAI-style chat message.
 type Message struct {
@@ -76,12 +80,6 @@ func (c *Client) Ask(question, context string) (string, error) {
 		"messages":   messages,
 		"stream":     false,
 		"max_tokens": 512,
-		// Qwen3 thinking mode: budget_tokens=0 disables <think> blocks so
-		// Slack output is clean prose, not reasoning chains.
-		"thinking": map[string]interface{}{
-			"type":          "disabled",
-			"budget_tokens": 0,
-		},
 	}
 	if c.model != "" {
 		body["model"] = c.model
@@ -129,5 +127,10 @@ func (c *Client) Ask(question, context string) (string, error) {
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("llm: empty choices")
 	}
-	return strings.TrimSpace(result.Choices[0].Message.Content), nil
+
+	// Strip any <think>...</think> reasoning blocks (Qwen3 extended thinking)
+	// before returning — these are internal chain-of-thought and must not appear
+	// in Slack output.
+	text := thinkRE.ReplaceAllString(result.Choices[0].Message.Content, "")
+	return strings.TrimSpace(text), nil
 }
