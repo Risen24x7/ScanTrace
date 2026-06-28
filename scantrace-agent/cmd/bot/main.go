@@ -9,14 +9,14 @@
 //   SLACK_APP_TOKEN      xapp-...  (App-level token for Socket Mode)
 //
 // Optional env vars:
-//   SCANTRACE_DB         path to scantrace.db   (default: ../ScanTrace/scantrace.db)
-//   SCANTRACE_ASUS_STATE Asus sensor-id file    (default: .asus-sensor-id)
-//   SCANTRACE_SYSLOG_PORT UDP syslog port        (default: 5140; use 514 as root)
-//   CORRELATE_INTERVAL   correlator run interval (default: 5m)
-//   ALERT_CHANNEL        Slack channel ID for case alerts
-//   MCP_ADDR             MCP HTTP listen addr   (default: :8765)
-//   LLM_BASE_URL         ik_llama.cpp endpoint  (default: http://192.168.50.250:11434)
-//   LLM_MODEL            model name             (default: "", uses server default)
+//   SCANTRACE_DB              path to scantrace.db   (default: ../ScanTrace/scantrace.db)
+//   SCANTRACE_ASUS_STATE      Asus sensor-id file    (default: .asus-sensor-id)
+//   SCANTRACE_SYSLOG_PORT     UDP syslog port        (default: 5140)
+//   CORRELATE_INTERVAL        correlator run interval (default: 5m)
+//   ALERT_CHANNEL             Slack channel ID for case alerts
+//   MCP_ADDR                  MCP HTTP listen addr   (default: :8765)
+//   LLM_BASE_URL              ik_llama.cpp endpoint  (default: http://192.168.50.250:11434)
+//   LLM_MODEL                 model name             (default: "", uses server default)
 package main
 
 import (
@@ -53,7 +53,23 @@ func main() {
 	defer store.Close()
 
 	// -----------------------------------------------------------------------
-	// UDP syslog listener — replaces `scantrace serve`
+	// Slack API client (needed by handler AND the correlator alert callback)
+	// -----------------------------------------------------------------------
+	api := slack.New(
+		botToken,
+		slack.OptionAppLevelToken(appToken),
+		slack.OptionDebug(false),
+		slack.OptionLog(log.New(os.Stdout, "[slack] ", log.LstdFlags|log.Lshortfile)),
+	)
+
+	llmClient := llm.New(llmBase, llmModel)
+	log.Printf("[bot] LLM endpoint: %s (model=%q)", llmBase, llmModel)
+
+	rtsClient := rts.New(botToken)
+	h := handler.New(api, store, alertChannel, rtsClient, llmClient)
+
+	// -----------------------------------------------------------------------
+	// UDP syslog listener
 	// -----------------------------------------------------------------------
 	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
 	asusSensorID, err := collector.RegisterAsusSensor(store, statePath)
@@ -73,15 +89,15 @@ func main() {
 	}
 
 	// -----------------------------------------------------------------------
-	// Correlator loop
+	// Correlator loop — posts Slack alert for every new case
 	// -----------------------------------------------------------------------
 	correlateInterval := correlateIntervalFromEnv()
 	go func() {
-		runCorrelate(store)
+		runCorrelate(store, h)
 		ticker := time.NewTicker(correlateInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			runCorrelate(store)
+			runCorrelate(store, h)
 		}
 	}()
 	log.Printf("[bot] correlator running every %s", correlateInterval)
@@ -99,25 +115,11 @@ func main() {
 	// -----------------------------------------------------------------------
 	// Slack socket-mode bot
 	// -----------------------------------------------------------------------
-	llmClient := llm.New(llmBase, llmModel)
-	log.Printf("[bot] LLM endpoint: %s (model=%q)", llmBase, llmModel)
-
-	rtsClient := rts.New(botToken)
-
-	api := slack.New(
-		botToken,
-		slack.OptionAppLevelToken(appToken),
-		slack.OptionDebug(false),
-		slack.OptionLog(log.New(os.Stdout, "[slack] ", log.LstdFlags|log.Lshortfile)),
-	)
-
 	client := socketmode.New(
 		api,
 		socketmode.OptionDebug(false),
 		socketmode.OptionLog(log.New(os.Stdout, "[socketmode] ", log.LstdFlags|log.Lshortfile)),
 	)
-
-	h := handler.New(api, store, alertChannel, rtsClient, llmClient)
 
 	go func() {
 		for evt := range client.Events {
@@ -132,10 +134,10 @@ func main() {
 }
 
 // ---------------------------------------------------------------------------
-// Correlator helper
+// Correlator helper — posts a Slack alert for each new case produced
 // ---------------------------------------------------------------------------
 
-func runCorrelate(store *db.DB) {
+func runCorrelate(store *db.DB, h *handler.Handler) {
 	cfg := correlator.DefaultConfig()
 	corr := correlator.New(store, cfg)
 	cases, err := corr.Run()
@@ -151,6 +153,7 @@ func runCorrelate(store *db.DB) {
 	for _, c := range cases {
 		log.Printf("[correlator]   • [%s] %s severity=%s confidence=%.0f%%",
 			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
+		h.PostCaseAlert(c)
 	}
 }
 
