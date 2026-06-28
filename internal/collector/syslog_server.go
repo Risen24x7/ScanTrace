@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,6 +30,10 @@ const (
 	// RFC 5424 recommends at least 480 bytes; 64KB covers iptables verbose output.
 	maxSyslogPacket = 65536
 )
+
+// syslogPriorityRE matches an optional RFC5424 priority prefix, e.g. "<12>" or "<134>".
+// The BE96U prepends this before the BSD timestamp, so we strip it before parsing.
+var syslogPriorityRE = regexp.MustCompile(`^<\d{1,3}>`)
 
 // privateRanges holds RFC1918 + loopback + link-local prefixes.
 // isExternal returns false for any IP that falls within these.
@@ -148,6 +153,11 @@ func (s *SyslogServer) Listen() error {
 			if line == "" {
 				continue
 			}
+			// Strip RFC5424 priority prefix (e.g. "<12>") that the BE96U
+			// prepends before the BSD timestamp. Without this, the parser's
+			// ^ anchored regexes never match and every packet is silently
+			// dropped into LinesSkipped.
+			line = syslogPriorityRE.ReplaceAllString(line, "")
 			s.processLine(line, remote.IP.String())
 		}
 	}
