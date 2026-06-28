@@ -16,7 +16,10 @@ import (
 
 const (
 	// systemPrompt is injected as the first message on every request.
-	systemPrompt = `You are ScanTrace, a network security analyst assistant.
+	// /no_think is a Qwen3 soft-prompt token that disables chain-of-thought
+	// reasoning, cutting GPU load and latency significantly.
+	systemPrompt = `/no_think
+You are ScanTrace, a network security analyst assistant.
 You have access to real-time data from a home network intrusion-detection system
 that ingests Suricata IDS alerts and Asus router syslog events.
 
@@ -24,14 +27,15 @@ Your job:
 - Triage alerts and explain what they mean in plain language
 - Identify patterns across cases (repeated IPs, MAC addresses, port scans)
 - Recommend concrete next steps (block IP, investigate device, watch port)
-- Be concise — your answers appear in Slack, so keep responses under 400 words
+- Be concise — your answers appear in Slack, keep responses under 300 words
 - Format important values (IPs, case IDs, ports) in backticks
 - Never fabricate case IDs or IP addresses; only reference data provided in context
+- Do NOT use markdown headers (###) — use bold (*text*) and bullet points only
 
 When context is provided, prioritise it over general knowledge.
 When no relevant context is available, say so honestly.`
 
-	defaultTimeout = 90 * time.Second
+	defaultTimeout = 120 * time.Second
 )
 
 // thinkRE strips Qwen3 <think>...</think> reasoning blocks from output.
@@ -79,7 +83,7 @@ func (c *Client) Ask(question, context string) (string, error) {
 	body := map[string]interface{}{
 		"messages":   messages,
 		"stream":     false,
-		"max_tokens": 512,
+		"max_tokens": 800,
 	}
 	if c.model != "" {
 		body["model"] = c.model
@@ -128,9 +132,7 @@ func (c *Client) Ask(question, context string) (string, error) {
 		return "", fmt.Errorf("llm: empty choices")
 	}
 
-	// Strip any <think>...</think> reasoning blocks (Qwen3 extended thinking)
-	// before returning — these are internal chain-of-thought and must not appear
-	// in Slack output.
+	// Strip any residual <think>...</think> reasoning blocks.
 	text := thinkRE.ReplaceAllString(result.Choices[0].Message.Content, "")
 	return strings.TrimSpace(text), nil
 }
