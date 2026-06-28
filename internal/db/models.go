@@ -29,7 +29,7 @@ func (s *StringSlice) Scan(src any) error {
 }
 
 // ---------------------------------------------------------------------------
-// Sensor — source of observation
+// Sensor
 // ---------------------------------------------------------------------------
 
 // Sensor represents a registered sensor that produces events.
@@ -48,10 +48,10 @@ type Sensor struct {
 }
 
 // ---------------------------------------------------------------------------
-// Event — one normalized observation record
+// Event
 // ---------------------------------------------------------------------------
 
-// Event represents a single activity record after normalization.
+// Event represents a single normalized observation record.
 // RawRef preserves the original payload so adapters remain reversible.
 type Event struct {
 	EventID      string      `json:"event_id"      db:"event_id"`
@@ -69,18 +69,18 @@ type Event struct {
 	Protocol     string      `json:"protocol"      db:"protocol"`
 	Transport    string      `json:"transport"     db:"transport"`
 	Direction    string      `json:"direction"     db:"direction"`
-	RawRef       string      `json:"raw_ref"       db:"raw_ref"`   // original payload JSON blob
-	PcapRef      string      `json:"pcap_ref"      db:"pcap_ref"`  // optional pcap path/URI
+	RawRef       string      `json:"raw_ref"       db:"raw_ref"`
+	PcapRef      string      `json:"pcap_ref"      db:"pcap_ref"`
 	Confidence   float64     `json:"confidence"    db:"confidence"`
-	Tags         StringSlice `json:"tags"          db:"tags"`      // stored as JSON TEXT
+	Tags         StringSlice `json:"tags"          db:"tags"`
 	Notes        string      `json:"notes"         db:"notes"`
 }
 
 // ---------------------------------------------------------------------------
-// Entity — enriched infrastructure object derived from enrichment
+// Entity
 // ---------------------------------------------------------------------------
 
-// Entity represents a known external actor enriched from their source IP.
+// Entity represents an enriched external actor derived from their source IP.
 type Entity struct {
 	EntityID         string      `json:"entity_id"         db:"entity_id"`
 	EntityType       string      `json:"entity_type"       db:"entity_type"`
@@ -91,29 +91,59 @@ type Entity struct {
 	RDNS             string      `json:"rdns"              db:"rdns"`
 	AbuseContact     string      `json:"abuse_contact"     db:"abuse_contact"`
 	GeoCountry       string      `json:"geo_country"       db:"geo_country"`
-	ReputationLabels StringSlice `json:"reputation_labels" db:"reputation_labels"` // JSON TEXT
+	ReputationLabels StringSlice `json:"reputation_labels" db:"reputation_labels"`
 	LastEnriched     time.Time   `json:"last_enriched"     db:"last_enriched"`
 }
 
 // ---------------------------------------------------------------------------
-// Case — grouped investigation object
+// KnownDevice
 // ---------------------------------------------------------------------------
 
-// Case represents a correlated investigation record that groups related
+// KnownDevice is an analyst-maintained registry entry for a device on a
+// monitored network. Keyed on IP or MAC (at least one must be non-empty).
+//
+// TrustLabel values:
+//
+//	"trusted"    — known-good device; auto_suppress may silence low-severity cases
+//	"unknown"    — seen on network but not yet classified (default)
+//	"suspicious" — flagged for elevated scrutiny
+type KnownDevice struct {
+	DeviceID     string    `json:"device_id"     db:"device_id"`
+	IP           string    `json:"ip"            db:"ip"`
+	MAC          string    `json:"mac"           db:"mac"`
+	Hostname     string    `json:"hostname"      db:"hostname"`
+	Label        string    `json:"label"         db:"label"`        // human-readable name, e.g. "Corp Laptop — Alice"
+	TrustLabel   string    `json:"trust_label"   db:"trust_label"` // trusted | unknown | suspicious
+	NetworkZone  string    `json:"network_zone"  db:"network_zone"`
+	OrgUnit      string    `json:"org_unit"      db:"org_unit"`
+	Owner        string    `json:"owner"         db:"owner"`
+	AutoSuppress bool      `json:"auto_suppress" db:"auto_suppress"`
+	FirstSeen    time.Time `json:"first_seen"    db:"first_seen"`
+	LastSeen     time.Time `json:"last_seen"     db:"last_seen"`
+	Notes        string    `json:"notes"         db:"notes"`
+	CreatedAt    time.Time `json:"created_at"    db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"    db:"updated_at"`
+}
+
+// ---------------------------------------------------------------------------
+// Case
+// ---------------------------------------------------------------------------
+
+// Case represents a correlated investigation record grouping related
 // events and entities into a reportable incident.
 type Case struct {
 	CaseID           string      `json:"case_id"            db:"case_id"`
 	Title            string      `json:"title"              db:"title"`
 	Summary          string      `json:"summary"            db:"summary"`
-	Status           string      `json:"status"             db:"status"`    // open, closed, escalated
-	Severity         string      `json:"severity"           db:"severity"`  // high, medium, low
+	Status           string      `json:"status"             db:"status"`
+	Severity         string      `json:"severity"           db:"severity"`
 	Confidence       float64     `json:"confidence"         db:"confidence"`
 	CreatedAt        time.Time   `json:"created_at"         db:"created_at"`
 	UpdatedAt        time.Time   `json:"updated_at"         db:"updated_at"`
-	RelatedEventIDs  StringSlice `json:"related_event_ids"  db:"related_event_ids"`  // JSON TEXT
-	RelatedEntityIDs StringSlice `json:"related_entity_ids" db:"related_entity_ids"` // JSON TEXT
-	Timeline         string      `json:"timeline"           db:"timeline"`   // markdown or JSON blob
-	Artifacts        string      `json:"artifacts"          db:"artifacts"`  // JSON blob — file paths/URIs
+	RelatedEventIDs  StringSlice `json:"related_event_ids"  db:"related_event_ids"`
+	RelatedEntityIDs StringSlice `json:"related_entity_ids" db:"related_entity_ids"`
+	Timeline         string      `json:"timeline"           db:"timeline"`
+	Artifacts        string      `json:"artifacts"          db:"artifacts"`
 	AnalystNotes     string      `json:"analyst_notes"      db:"analyst_notes"`
-	ReportExports    StringSlice `json:"report_exports"     db:"report_exports"` // file paths
+	ReportExports    StringSlice `json:"report_exports"     db:"report_exports"`
 }

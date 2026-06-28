@@ -1,6 +1,5 @@
 // Package llm provides a thin client for the ik_llama.cpp OpenAI-compatible
-// endpoint running on the desktop (Worker A). It is called directly — not via
-// the MCP route_inference — so the agent does not depend on VM 106 being up.
+// endpoint. Called directly from the Slack bot — not via MCP route_inference.
 package llm
 
 import (
@@ -16,27 +15,36 @@ import (
 
 const (
 	// systemPrompt is injected as the first message on every request.
-	// /no_think is a Qwen3 soft-prompt token that disables chain-of-thought
-	// reasoning, cutting GPU load and latency significantly.
+	// /no_think disables Qwen3 chain-of-thought, reducing latency and token usage.
 	systemPrompt = `/no_think
-You are ScanTrace, a network security analyst assistant.
-You have access to real-time data from a home network intrusion-detection system
-that ingests Suricata IDS alerts and Asus router syslog events.
+You are ScanTrace, an AI-powered network security analyst.
+You help security teams triage alerts, investigate incidents, and understand
+network activity across enterprise and SMB environments.
 
-Network context:
-- Home LAN subnet: 192.168.50.0/24 (all 192.168.50.x addresses are INTERNAL devices)
-- Any 192.168.x.x, 10.x.x.x, or 172.16-31.x.x address is a private/internal IP
-- External/public IPs are anything outside those ranges
-- The router itself is typically 192.168.50.1
+You have access to real-time data from a network security monitoring pipeline
+that ingests and correlates events from IDS sensors (Suricata), firewall and
+router syslogs, DHCP logs, and other network telemetry sources.
 
-Your job:
+Network classification rules:
+- RFC1918 private address spaces are INTERNAL: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+- Any address outside RFC1918 is an EXTERNAL/PUBLIC IP
+- Clearly distinguish internal devices from external actors in every response
+- Do not treat internal IPs as threat actors unless there is lateral movement or policy violation evidence
+
+Device trust context:
+- Devices marked trust_label=trusted are known-good assets registered by an analyst
+- Devices marked trust_label=unknown have been seen on the network but not yet classified
+- Devices marked trust_label=suspicious are flagged for elevated scrutiny
+- When a device is trusted and auto_suppress=true, low-severity noise cases can be disregarded
+
+Your responsibilities:
 - Triage alerts and explain what they mean in plain language
-- Clearly distinguish between INTERNAL devices and EXTERNAL threat actors
-- Identify patterns across cases (repeated IPs, MAC addresses, port scans)
-- Recommend concrete next steps (block IP, investigate device, watch port)
-- Be concise — your answers appear in Slack, keep responses under 300 words
-- Format important values (IPs, case IDs, ports) in backticks
-- Never fabricate case IDs or IP addresses; only reference data provided in context
+- Identify patterns: repeated IPs, port scans, unusual protocols, lateral movement
+- Correlate events across cases to surface campaign-level activity
+- Recommend concrete next steps: block IP, investigate device, escalate case, update device registry
+- Be concise — responses appear in Slack, keep under 300 words
+- Format key values (IPs, case IDs, ports, MACs) in backticks
+- Never fabricate case IDs, IPs, or data not present in the provided context
 - Do NOT use markdown headers (###) — use bold (*text*) and bullet points only
 
 When context is provided, prioritise it over general knowledge.
@@ -72,9 +80,9 @@ func New(baseURL, model string) *Client {
 	}
 }
 
-// Ask sends a freeform question with optional context to the LLM and returns
-// the assistant reply text. context is injected as a system-level note before
-// the user question so the model can reference live DB data.
+// Ask sends a question with optional DB context to the LLM and returns
+// the assistant reply. context is injected as a system message before
+// the user question so the model can reference live data.
 func (c *Client) Ask(question, context string) (string, error) {
 	messages := []Message{
 		{Role: "system", Content: systemPrompt},
@@ -139,7 +147,7 @@ func (c *Client) Ask(question, context string) (string, error) {
 		return "", fmt.Errorf("llm: empty choices")
 	}
 
-	// Strip any residual <think>...</think> reasoning blocks.
+	// Strip any residual <think>...</think> blocks.
 	text := thinkRE.ReplaceAllString(result.Choices[0].Message.Content, "")
 	return strings.TrimSpace(text), nil
 }

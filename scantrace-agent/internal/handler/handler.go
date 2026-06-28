@@ -59,11 +59,10 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 	}
 }
 
-// subscribeRTS registers ScanTrace's RTS signal subscriptions.
 func (h *Handler) subscribeRTS() {
 	_, err := h.rts.Subscribe(rts.SignalAppMention, "scantrace-mention")
 	if err != nil {
-		log.Printf("[rts] subscribe skipped (may not be available in this tier): %v", err)
+		log.Printf("[rts] subscribe skipped: %v", err)
 		return
 	}
 	log.Printf("[rts] signal subscriptions active")
@@ -86,10 +85,12 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 		h.cmdReport(cmd.ChannelID, cmd.UserID, parts[1])
 	case "alert":
 		h.cmdPostLatestAlert(cmd.ChannelID)
+	case "devices":
+		h.cmdDevices(cmd.ChannelID, cmd.UserID)
 	case "mcp":
 		h.postEphemeral(cmd.ChannelID, cmd.UserID,
 			"*MCP Server* is running on `localhost:8765`\n"+
-				"Tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`\n"+
+				"Tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`, `list_known_devices`\n"+
 				"Connect any MCP host (Claude Desktop, Cursor) to `http://localhost:8765`")
 	default:
 		h.postEphemeral(cmd.ChannelID, cmd.UserID, helpText())
@@ -110,6 +111,41 @@ func (h *Handler) cmdCases(channelID, userID string) {
 	}
 	blocks := []slack.Block{
 		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "🔍 ScanTrace Cases", false, false)),
+		slack.NewDividerBlock(),
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", strings.Join(lines, "\n"), false, false),
+			nil, nil,
+		),
+	}
+	h.postBlocks(channelID, blocks)
+}
+
+func (h *Handler) cmdDevices(channelID, userID string) {
+	devices, err := h.store.ListKnownDevices("", 20)
+	if err != nil || len(devices) == 0 {
+		h.postEphemeral(channelID, userID, "No devices in registry. Use the API or MCP tool to register devices.")
+		return
+	}
+	var lines []string
+	for _, d := range devices {
+		emoji := trustEmoji(d.TrustLabel)
+		identifier := d.IP
+		if identifier == "" {
+			identifier = d.MAC
+		}
+		label := d.Label
+		if label == "" {
+			label = "(unlabeled)"
+		}
+		suppress := ""
+		if d.AutoSuppress {
+			suppress = " — _suppressed_"
+		}
+		lines = append(lines, fmt.Sprintf("%s `%s` *%s* [%s]%s",
+			emoji, identifier, label, d.TrustLabel, suppress))
+	}
+	blocks := []slack.Block{
+		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "🖥️ Known Device Registry", false, false)),
 		slack.NewDividerBlock(),
 		slack.NewSectionBlock(
 			slack.NewTextBlockObject("mrkdwn", strings.Join(lines, "\n"), false, false),
@@ -204,9 +240,6 @@ func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 	}
 }
 
-// handleMention routes app-mention and DM messages.
-// Fast-path keywords are handled directly; everything else goes to the LLM
-// with live case context injected into the prompt.
 func (h *Handler) handleMention(channelID, userID, text string) {
 	clean := strings.TrimSpace(mentionRE(text))
 	lower := strings.ToLower(clean)
@@ -218,9 +251,12 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 	case strings.Contains(lower, "high") || strings.Contains(lower, "critical"):
 		h.cmdHighSeverity(channelID, userID)
 		return
+	case strings.Contains(lower, "device") && strings.Contains(lower, "registry"):
+		h.cmdDevices(channelID, userID)
+		return
 	case strings.Contains(lower, "mcp"):
 		h.postEphemeral(channelID, userID,
-			"*MCP Server* is live on `localhost:8765` — tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`")
+			"*MCP Server* is live on `localhost:8765` — tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`, `list_known_devices`")
 		return
 	case lower == "help" || lower == "" || strings.Contains(lower, "help"):
 		h.postEphemeral(channelID, userID, helpText())
@@ -246,52 +282,69 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 	h.postMessage(channelID, answer)
 }
 
-// buildLLMContext assembles a rich text summary of recent DB state for the LLM.
-// For each case it fetches the linked events so the model sees real IPs,
-// MACs, event types and source types — not just case metadata.
+// buildLLMContext assembles a rich text summary of recent DB state.
+// Hydrates linked events (IPs, MACs, event types) and cross-references
+// the known_devices registry so the model knows device trust status.
 func (h *Handler) buildLLMContext() string {
 	var sb strings.Builder
 
+	// --- known device registry snapshot (top 50) ---
+	devices, _ := h.store.ListKnownDevices("", 50)
+	if len(devices) > 0 {
+		sb.WriteString(fmt.Sprintf("Known device registry (%d entries):\n", len(devices)))
+		for _, d := range devices {
+			identifier := d.IP
+			if identifier == "" {
+				identifier = d.MAC
+			}
+			sb.WriteString(fmt.Sprintf(
+				"  %s trust=%s label=%q zone=%s suppress=%v last_seen=%s\n",
+				identifier, d.TrustLabel, d.Label, d.NetworkZone,
+				d.AutoSuppress, d.LastSeen.Format("2006-01-02 15:04"),
+			))
+		}
+		sb.WriteString("\n")
+	}
+
+	// --- cases with hydrated events ---
 	cases, err := h.store.ListCases("", 20)
 	if err != nil || len(cases) == 0 {
-		return "No cases in database."
+		sb.WriteString("No cases in database.\n")
+		return sb.String()
 	}
-	sb.WriteString(fmt.Sprintf("Total cases loaded: %d\n\n", len(cases)))
-	sb.WriteString("Recent cases (newest first):\n")
+	sb.WriteString(fmt.Sprintf("Total cases: %d\n\nRecent cases (newest first):\n", len(cases)))
 
 	for _, c := range cases {
 		sb.WriteString(fmt.Sprintf(
 			"\nCase id=%s severity=%s confidence=%.0f%% status=%s title=%q\n",
-			c.CaseID[:8],
-			c.Severity,
-			c.Confidence*100,
-			c.Status,
-			c.Title,
+			c.CaseID[:8], c.Severity, c.Confidence*100, c.Status, c.Title,
 		))
 		if c.Summary != "" {
 			sb.WriteString(fmt.Sprintf("  summary: %s\n", c.Summary))
 		}
 
-		// Hydrate linked events so the LLM can see real IPs and event types.
-		// Cap at 10 events per case to keep the context window manageable.
-		maxEvents := 10
+		// Hydrate linked events (cap at 10 per case).
+		const maxEvents = 10
 		if len(c.RelatedEventIDs) > 0 {
 			sb.WriteString("  events:\n")
 			for i, evtID := range c.RelatedEventIDs {
 				if i >= maxEvents {
-					sb.WriteString(fmt.Sprintf("    … and %d more events\n", len(c.RelatedEventIDs)-maxEvents))
+					sb.WriteString(fmt.Sprintf("    … and %d more\n", len(c.RelatedEventIDs)-maxEvents))
 					break
 				}
 				evt, err := h.store.GetEvent(evtID)
 				if err != nil || evt == nil {
 					continue
 				}
-				// Build a compact one-liner: only include non-empty fields.
 				var parts []string
 				parts = append(parts, fmt.Sprintf("type=%s", evt.EventType))
 				parts = append(parts, fmt.Sprintf("source=%s", evt.SourceType))
 				if evt.SrcIP != "" {
 					parts = append(parts, fmt.Sprintf("src=%s", evt.SrcIP))
+					// Cross-reference device registry.
+					if dev, _ := h.store.GetKnownDeviceByIP(evt.SrcIP); dev != nil {
+						parts = append(parts, fmt.Sprintf("[trust=%s label=%q]", dev.TrustLabel, dev.Label))
+					}
 				}
 				if evt.DstIP != "" {
 					parts = append(parts, fmt.Sprintf("dst=%s", evt.DstIP))
@@ -313,7 +366,7 @@ func (h *Handler) buildLLMContext() string {
 			}
 		}
 
-		// Also surface any linked entity enrichment (external IPs, ASN, geo, reputation).
+		// Linked entity enrichment (external IPs, ASN, reputation).
 		if len(c.RelatedEntityIDs) > 0 {
 			entities, err := h.store.GetEntitiesForCase(c.CaseID)
 			if err == nil && len(entities) > 0 {
@@ -331,7 +384,6 @@ func (h *Handler) buildLLMContext() string {
 	return sb.String()
 }
 
-// mentionRE strips a leading Slack user-mention token from text.
 func mentionRE(text string) string {
 	if len(text) > 0 && text[0] == '<' {
 		if idx := strings.Index(text, ">"); idx != -1 {
@@ -433,16 +485,28 @@ func severityEmoji(s string) string {
 	}
 }
 
+func trustEmoji(t string) string {
+	switch strings.ToLower(t) {
+	case "trusted":
+		return "✅"
+	case "suspicious":
+		return "🚨"
+	default:
+		return "❔"
+	}
+}
+
 func helpText() string {
-	return `*ScanTrace — Dead Reckoning Edition*
+	return `*ScanTrace — Network Security Intelligence*
 
 Available commands:
 • ` + "`/scantrace cases`" + ` — list recent cases
 • ` + "`/scantrace report <case-id>`" + ` — full case report
 • ` + "`/scantrace alert`" + ` — post latest high-severity case to #sec-alerts
+• ` + "`/scantrace devices`" + ` — show known device registry
 • ` + "`/scantrace mcp`" + ` — MCP server status
 • ` + "`/scantrace help`" + ` — this message
 
 You can also @mention ScanTrace or DM it with any security question.
-Example: _@ScanTrace what IPs have been scanning my network?_`
+Example: _@ScanTrace are there any unclassified devices on the network?_`
 }
