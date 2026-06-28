@@ -5,7 +5,9 @@
 //
 //	• DHCP (dnsmasq-dhcp)  — dhcp_dhcprequest, dhcp_dhcpack, dhcp_dhcpnak
 //	• Wi-Fi (wlceventd)    — wifi_associated, wifi_disassociated, wifi_deauthenticated
-//	• Netfilter / iptables — netfilter_drop, netfilter_reject (⚠ primary inbound scan source)
+//	• Netfilter / iptables — netfilter_drop, netfilter_reject (legacy DROP prefix)
+//	• WAN new connections  — wan_new_connection (WAN_NEW_ACCEPT prefix, eth0 NEW)
+//	• WAN port-forwards    — wan_forward (WAN_FWD prefix, eth0→br0 NEW)
 //	• Connection tracking  — conn_attempt, conn_established (when enabled)
 //	• Firewall block       — firewall_drop, firewall_block
 package collector
@@ -40,10 +42,28 @@ var (
 		`wlceventd[^:]*:\s+(\S+)\s+(Associated|Disassociated|Authenticated|Deauthenticated|Disconnected)`,
 	)
 
-	// Netfilter DROP/REJECT — iptables LOG target
+	// Netfilter DROP/REJECT — legacy iptables LOG target with bare DROP/REJECT prefix
 	// Example: "Jun 28 15:01:22 kernel: DROP IN=eth0 OUT= SRC=24.20.77.75 DST=192.168.50.1 ... PROTO=TCP SPT=54321 DPT=22"
 	netfilterRE = regexp.MustCompile(
 		`kernel:\s+(DROP|REJECT|BLOCK)\s+IN=\S*\s+OUT=\S*\s+SRC=(\S+)\s+DST=(\S+)` +
+			`.*?PROTO=(\S+)(?:.*?SPT=(\d+))?(?:.*?DPT=(\d+))?`,
+	)
+
+	// WAN new connection — iptables LOG with WAN_NEW_ACCEPT prefix (eth0, state NEW)
+	// These are inbound WAN connections that reached an open port on the router.
+	// Example: "Jun 28 16:01:14 kernel: WAN_NEW_ACCEPT IN=eth0 OUT= MAC=... SRC=198.235.24.117 DST=24.20.77.75 LEN=44 ... PROTO=TCP SPT=52336 DPT=7777 ..."
+	wanAcceptRE = regexp.MustCompile(
+		`kernel:\s+WAN_NEW_ACCEPT\s+IN=(\S+)\s+OUT=\S*\s+` +
+			`(?:MAC=\S+\s+)?SRC=(\S+)\s+DST=(\S+)` +
+			`.*?PROTO=(\S+)(?:.*?SPT=(\d+))?(?:.*?DPT=(\d+))?`,
+	)
+
+	// WAN forward — iptables LOG with WAN_FWD prefix (eth0→br0, state NEW)
+	// These are inbound WAN connections forwarded to an internal host via port-forward rules.
+	// Example: "Jun 28 16:01:20 kernel: WAN_FWD IN=eth0 OUT=br0 MAC=... SRC=134.122.125.153 DST=192.168.50.10 LEN=60 ... PROTO=TCP SPT=34028 DPT=25565 ..."
+	wanFwdRE = regexp.MustCompile(
+		`kernel:\s+WAN_FWD\s+IN=(\S+)\s+OUT=(\S+)\s+` +
+			`(?:MAC=\S+\s+)?SRC=(\S+)\s+DST=(\S+)` +
 			`.*?PROTO=(\S+)(?:.*?SPT=(\d+))?(?:.*?DPT=(\d+))?`,
 	)
 
@@ -84,6 +104,10 @@ func (p *AsusParser) Parse(line string) (*db.Event, error) {
 		return p.parseDHCP(line, ts)
 	case wifiRE.MatchString(line):
 		return p.parseWifi(line, ts)
+	case wanAcceptRE.MatchString(line):
+		return p.parseWANAccept(line, ts)
+	case wanFwdRE.MatchString(line):
+		return p.parseWANFwd(line, ts)
 	case netfilterRE.MatchString(line):
 		return p.parseNetfilter(line, ts)
 	case firewallRE.MatchString(line):
@@ -160,7 +184,85 @@ func (p *AsusParser) parseWifi(line string, ts time.Time) (*db.Event, error) {
 	return evt, nil
 }
 
-// parseNetfilter handles iptables LOG target lines.
+// parseWANAccept handles WAN_NEW_ACCEPT iptables LOG lines.
+// These are inbound WAN connections that reached an open port on the router itself.
+// Highest severity — something on the router answered.
+func (p *AsusParser) parseWANAccept(line string, ts time.Time) (*db.Event, error) {
+	m := wanAcceptRE.FindStringSubmatch(line)
+	if m == nil {
+		return nil, nil
+	}
+	// m[1]=iface m[2]=srcIP m[3]=dstIP m[4]=proto m[5]=spt m[6]=dpt
+	srcIP := m[2]
+	dstIP := m[3]
+	proto := strings.ToUpper(m[4])
+	srcPort := 0
+	if m[5] != "" {
+		srcPort, _ = strconv.Atoi(m[5])
+	}
+	dstPort := 0
+	if m[6] != "" {
+		dstPort, _ = strconv.Atoi(m[6])
+	}
+	return &db.Event{
+		EventID:      uuid.New().String(),
+		Timestamp:    ts,
+		FirstSeen:    ts,
+		LastSeen:     ts,
+		SensorID:     p.SensorID,
+		SourceType:   "asus_syslog",
+		DetectorType: "netfilter",
+		EventType:    "wan_new_connection",
+		SrcIP:        srcIP,
+		SrcPort:      srcPort,
+		DstIP:        dstIP,
+		DstPort:      dstPort,
+		Protocol:     proto,
+		Direction:    "inbound",
+		RawRef:       line,
+	}, nil
+}
+
+// parseWANFwd handles WAN_FWD iptables LOG lines.
+// These are inbound WAN connections forwarded to an internal host via port-forward rules.
+// SrcIP is the external scanner, DstIP is the internal host being hit.
+func (p *AsusParser) parseWANFwd(line string, ts time.Time) (*db.Event, error) {
+	m := wanFwdRE.FindStringSubmatch(line)
+	if m == nil {
+		return nil, nil
+	}
+	// m[1]=inIface m[2]=outIface m[3]=srcIP m[4]=dstIP m[5]=proto m[6]=spt m[7]=dpt
+	srcIP := m[3]
+	dstIP := m[4]
+	proto := strings.ToUpper(m[5])
+	srcPort := 0
+	if m[6] != "" {
+		srcPort, _ = strconv.Atoi(m[6])
+	}
+	dstPort := 0
+	if m[7] != "" {
+		dstPort, _ = strconv.Atoi(m[7])
+	}
+	return &db.Event{
+		EventID:      uuid.New().String(),
+		Timestamp:    ts,
+		FirstSeen:    ts,
+		LastSeen:     ts,
+		SensorID:     p.SensorID,
+		SourceType:   "asus_syslog",
+		DetectorType: "netfilter",
+		EventType:    "wan_forward",
+		SrcIP:        srcIP,
+		SrcPort:      srcPort,
+		DstIP:        dstIP,
+		DstPort:      dstPort,
+		Protocol:     proto,
+		Direction:    "inbound",
+		RawRef:       line,
+	}, nil
+}
+
+// parseNetfilter handles legacy iptables LOG target lines with bare DROP/REJECT prefix.
 // These are the MOST IMPORTANT events for detecting external port scans —
 // every dropped inbound packet from an external IP lands here.
 func (p *AsusParser) parseNetfilter(line string, ts time.Time) (*db.Event, error) {
@@ -260,6 +362,5 @@ func (p *AsusParser) parseConn(line string, ts time.Time) (*db.Event, error) {
 		Protocol:     proto,
 		Direction:    "inbound",
 		RawRef:       line,
-	}
-	return evt, nil
+	}, nil
 }
