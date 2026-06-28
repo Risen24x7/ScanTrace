@@ -1,6 +1,7 @@
 // ScanTrace Slack Bot — Dead Reckoning Edition
 // Connects to Dilldozer sandbox via Socket Mode.
 // Runs the MCP server on a separate goroutine.
+// Routes freeform @mentions to Qwen3-30B on the desktop via ik_llama.cpp.
 //
 // Required env vars:
 //   SLACK_BOT_TOKEN   xoxb-...  (Bot token from OAuth)
@@ -8,6 +9,8 @@
 //   SCANTRACE_DB      path to scantrace.db (default: ../ScanTrace/scantrace.db)
 //   ALERT_CHANNEL     channel ID to post case alerts
 //   MCP_ADDR          address for MCP HTTP server (default: :8765)
+//   LLM_BASE_URL      ik_llama.cpp endpoint (default: http://192.168.50.250:11434)
+//   LLM_MODEL         model name to request (default: "", uses server default)
 package main
 
 import (
@@ -16,6 +19,7 @@ import (
 
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/mcp"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/slack-go/slack"
@@ -28,6 +32,8 @@ func main() {
 	dbPath := envOrDefault("SCANTRACE_DB", "../ScanTrace/scantrace.db")
 	alertChannel := envOrDefault("ALERT_CHANNEL", "#sec-alerts")
 	mcpAddr := envOrDefault("MCP_ADDR", ":8765")
+	llmBase := envOrDefault("LLM_BASE_URL", "http://192.168.50.250:11434")
+	llmModel := envOrDefault("LLM_MODEL", "")
 
 	store, err := db.Open(dbPath)
 	if err != nil {
@@ -43,7 +49,11 @@ func main() {
 		}
 	}()
 
-	// Initialize RTS client
+	// LLM client — calls ik_llama.cpp on the desktop directly
+	llmClient := llm.New(llmBase, llmModel)
+	log.Printf("[bot] LLM endpoint: %s (model=%q)", llmBase, llmModel)
+
+	// RTS client
 	rtsClient := rts.New(botToken)
 
 	api := slack.New(
@@ -59,7 +69,7 @@ func main() {
 		socketmode.OptionLog(log.New(os.Stdout, "[socketmode] ", log.LstdFlags|log.Lshortfile)),
 	)
 
-	h := handler.New(api, store, alertChannel, rtsClient)
+	h := handler.New(api, store, alertChannel, rtsClient, llmClient)
 
 	go func() {
 		for evt := range client.Events {

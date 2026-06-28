@@ -8,6 +8,7 @@ import (
 
 	"github.com/Risen24x7/scantrace/internal/casebuilder"
 	"github.com/Risen24x7/scantrace/internal/db"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -19,10 +20,11 @@ type Handler struct {
 	store        *db.DB
 	alertChannel string
 	rts          *rts.Client
+	llm          *llm.Client
 }
 
-func New(api *slack.Client, store *db.DB, alertChannel string, rtsClient *rts.Client) *Handler {
-	return &Handler{api: api, store: store, alertChannel: alertChannel, rts: rtsClient}
+func New(api *slack.Client, store *db.DB, alertChannel string, rtsClient *rts.Client, llmClient *llm.Client) *Handler {
+	return &Handler{api: api, store: store, alertChannel: alertChannel, rts: rtsClient, llm: llmClient}
 }
 
 // Dispatch routes incoming Socket Mode events.
@@ -32,7 +34,6 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 		log.Println("[handler] connecting to Slack...")
 	case socketmode.EventTypeConnected:
 		log.Println("[handler] connected to Dilldozer ✓")
-		// Subscribe to RTS signals on connect
 		go h.subscribeRTS()
 
 	case socketmode.EventTypeSlashCommand:
@@ -62,7 +63,6 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 func (h *Handler) subscribeRTS() {
 	_, err := h.rts.Subscribe(rts.SignalAppMention, "scantrace-mention")
 	if err != nil {
-		// RTS may not be available in all sandbox tiers — log and continue
 		log.Printf("[rts] subscribe skipped (may not be available in this tier): %v", err)
 		return
 	}
@@ -87,13 +87,11 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 	case "alert":
 		h.cmdPostLatestAlert(cmd.ChannelID)
 	case "mcp":
-		// Show MCP server status — useful for judging demo
 		h.postEphemeral(cmd.ChannelID, cmd.UserID,
 			"*MCP Server* is running on `localhost:8765`\n"+
 				"Tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`\n"+
 				"Connect any MCP host (Claude Desktop, Cursor) to `http://localhost:8765`")
 	default:
-		// help is ephemeral — informational only
 		h.postEphemeral(cmd.ChannelID, cmd.UserID, helpText())
 	}
 }
@@ -175,7 +173,6 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 	}
 	h.postBlocks(h.alertChannel, blocks)
 
-	// Publish RTS signal so other agents/tools can react
 	go func() {
 		err := h.rts.PublishSignal(h.alertChannel, "scantrace.case.alert", map[string]interface{}{
 			"case_id":  c.CaseID,
@@ -207,21 +204,94 @@ func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 	}
 }
 
+// handleMention routes app-mention and DM messages.
+// Fast-path keywords are handled directly; everything else goes to the LLM
+// with live case context injected into the prompt.
 func (h *Handler) handleMention(channelID, userID, text string) {
-	lower := strings.ToLower(text)
+	// Strip bot mention prefix (<@UXXXXXXX> ...)
+	clean := strings.TrimSpace(mentionRE(text))
+	lower := strings.ToLower(clean)
+
+	// Fast-path: structured commands that don't need LLM
 	switch {
 	case strings.Contains(lower, "cases") || strings.Contains(lower, "list"):
 		h.cmdCases(channelID, userID)
-	case strings.Contains(lower, "report") || strings.Contains(lower, "detail"):
-		h.postEphemeral(channelID, userID, "Use `/scantrace report <case-id>` to get a full report.")
+		return
 	case strings.Contains(lower, "high") || strings.Contains(lower, "critical"):
 		h.cmdHighSeverity(channelID, userID)
+		return
 	case strings.Contains(lower, "mcp"):
 		h.postEphemeral(channelID, userID,
 			"*MCP Server* is live on `localhost:8765` — tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`")
-	default:
+		return
+	case lower == "help" || lower == "" || strings.Contains(lower, "help"):
 		h.postEphemeral(channelID, userID, helpText())
+		return
 	}
+
+	// LLM path: anything else — inject recent cases as context then ask Qwen3
+	if h.llm == nil {
+		h.postEphemeral(channelID, userID, "LLM not configured. Use `/scantrace help` for available commands.")
+		return
+	}
+
+	// Show a typing indicator (best-effort — not all Slack plans support it)
+	h.postMessage(channelID, "_Thinking…_")
+
+	ctx := h.buildLLMContext()
+	answer, err := h.llm.Ask(clean, ctx)
+	if err != nil {
+		log.Printf("[handler] llm error: %v", err)
+		h.postMessage(channelID,
+			"⚠️ Could not reach the inference worker. Is the desktop running?\n"+
+				"Use `/scantrace cases` or `/scantrace report <id>` in the meantime.")
+		return
+	}
+	h.postMessage(channelID, answer)
+}
+
+// buildLLMContext assembles a compact text summary of recent DB state to inject
+// into the LLM prompt so it can answer questions about real cases.
+func (h *Handler) buildLLMContext() string {
+	var sb strings.Builder
+
+	cases, err := h.store.ListCases("", 20)
+	if err != nil || len(cases) == 0 {
+		return "No cases in database."
+	}
+	sb.WriteString(fmt.Sprintf("Total cases loaded: %d\n\n", len(cases)))
+	sb.WriteString("Recent cases (newest first):\n")
+	for _, c := range cases {
+		sb.WriteString(fmt.Sprintf(
+			"- [%s] id=%s severity=%s confidence=%.0f%% src=%s title=%q first=%s last=%s\n",
+			strings.ToUpper(c.Severity),
+			c.CaseID[:8],
+			c.Severity,
+			c.Confidence*100,
+			stringOrDash(c.SrcIP),
+			c.Title,
+			c.FirstSeen.Format("2006-01-02 15:04"),
+			c.LastSeen.Format("2006-01-02 15:04"),
+		))
+	}
+	return sb.String()
+}
+
+// mentionRE strips a leading Slack user-mention token from text.
+func mentionRE(text string) string {
+	if len(text) > 0 && text[0] == '<' {
+		if idx := strings.Index(text, ">"); idx != -1 {
+			return strings.TrimSpace(text[idx+1:])
+		}
+	}
+	return text
+}
+
+func stringOrDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func (h *Handler) cmdHighSeverity(channelID, userID string) {
@@ -326,5 +396,6 @@ Available commands:
 • ` + "`/scantrace mcp`" + ` — MCP server status
 • ` + "`/scantrace help`" + ` — this message
 
-You can also @mention ScanTrace or DM it.`
+You can also @mention ScanTrace or DM it with any security question.
+Example: _@ScanTrace what IPs have been scanning my network?_`
 }
