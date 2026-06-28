@@ -5,13 +5,14 @@
 //   scantrace correlate
 //   scantrace cases     [--severity high|medium|low]
 //   scantrace report    --case <case-id> [--format markdown|json|slack]
-//   scantrace serve     [--interval 5m]
+//   scantrace serve     [--interval 5m] [--syslog-port 5140]
 //   scantrace flush     [--source testdata]
 //
 // Env:
 //   SCANTRACE_DB         SQLite path (default: ./scantrace.db)
 //   SCANTRACE_SENSOR_ID  sensor UUID (auto-created if unset)
 //   SCANTRACE_ASUS_STATE path to Asus sensor-id state file (default: .asus-sensor-id)
+//   SCANTRACE_SYSLOG_PORT UDP port to receive router syslog (default: 5140, use 514 as root)
 //   IPINFO_TOKEN         ipinfo.io token (optional)
 //   SLACK_WEBHOOK_URL    Slack Incoming Webhook URL (optional — enables alert posting)
 package main
@@ -22,6 +23,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -222,12 +224,13 @@ func cmdReport(store *db.DB) {
 }
 
 // ---------------------------------------------------------------------------
-// serve — daemon loop
+// serve — daemon loop with live UDP syslog receiver
 // ---------------------------------------------------------------------------
 
 func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	intervalStr := fs.String("interval", "5m", "correlate interval (e.g. 1m, 5m, 15m)")
+	syslogPort := fs.Int("syslog-port", syslogPortFromEnv(), "UDP port to receive router syslog (514 requires root, default 5140)")
 	_ = fs.Parse(os.Args[2:])
 
 	interval, err := time.ParseDuration(*intervalStr)
@@ -243,6 +246,26 @@ func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 	}
 	log.Printf("[serve] starting — correlate interval=%s", interval)
 
+	// --- Start the UDP syslog listener ---
+	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
+	asusSensorID, err := collector.RegisterAsusSensor(store, statePath)
+	if err != nil {
+		log.Printf("[serve] asus sensor registration failed: %v — continuing without syslog listener", err)
+	} else {
+		adapter := collector.NewAsusAdapter(asusSensorID)
+		syslogSrv := collector.NewSyslogServer(*syslogPort, store, adapter)
+		go func() {
+			if err := syslogSrv.Listen(); err != nil {
+				log.Printf("[syslog_server] fatal: %v", err)
+				log.Printf("[syslog_server] TIP: run with sudo, or set SCANTRACE_SYSLOG_PORT=5140 and")
+				log.Printf("[syslog_server] on your router set syslog port to 5140 instead of 514")
+			}
+		}()
+		log.Printf("[serve] UDP syslog listener started on :%d", *syslogPort)
+		log.Printf("[serve] point your router's syslog at %s:%d", getLocalIP(), *syslogPort)
+	}
+
+	// --- Correlator loop ---
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -280,7 +303,6 @@ func cmdFlush(store *db.DB) {
 
 	switch *source {
 	case "testdata":
-		// RFC 5737 documentation prefixes + common testdata IPs.
 		testPrefixes := []string{"192.0.2.", "198.51.100.", "203.0.113."}
 		events, err := store.ListEvents(2000)
 		if err != nil {
@@ -299,7 +321,6 @@ func cmdFlush(store *db.DB) {
 				}
 			}
 		}
-		// Delete cases whose titles reference test IPs.
 		cases, _ := store.ListCases("", 500)
 		casesEvicted := 0
 		for _, c := range cases {
@@ -370,6 +391,24 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
+func syslogPortFromEnv() int {
+	if v := os.Getenv("SCANTRACE_SYSLOG_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			return p
+		}
+	}
+	return 5140 // default: unprivileged port; use 514 as root
+}
+
+func getLocalIP() string {
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 80})
+	if err != nil {
+		return "<this-host>"
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
 func printUsage() {
 	fmt.Fprint(os.Stderr, `ScanTrace — Dead Reckoning Edition
 
@@ -378,14 +417,15 @@ Commands:
   correlate
   cases      [--severity high|medium|low]
   report     --case <case-id> [--format markdown|json|slack]
-  serve      [--interval 5m]
+  serve      [--interval 5m] [--syslog-port 5140]
   flush      [--source testdata]
 
 Env:
-  SCANTRACE_DB         SQLite path            (default: scantrace.db)
-  SCANTRACE_SENSOR_ID  sensor UUID            (auto-created if unset)
-  SCANTRACE_ASUS_STATE Asus sensor-id file    (default: .asus-sensor-id)
-  IPINFO_TOKEN         ipinfo.io token        (optional)
-  SLACK_WEBHOOK_URL    Slack Incoming Webhook (optional)
+  SCANTRACE_DB          SQLite path             (default: scantrace.db)
+  SCANTRACE_SENSOR_ID   sensor UUID             (auto-created if unset)
+  SCANTRACE_ASUS_STATE  Asus sensor-id file     (default: .asus-sensor-id)
+  SCANTRACE_SYSLOG_PORT UDP syslog listen port  (default: 5140, use 514 as root)
+  IPINFO_TOKEN          ipinfo.io token         (optional)
+  SLACK_WEBHOOK_URL     Slack Incoming Webhook  (optional)
 `)
 }
