@@ -208,11 +208,9 @@ func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 // Fast-path keywords are handled directly; everything else goes to the LLM
 // with live case context injected into the prompt.
 func (h *Handler) handleMention(channelID, userID, text string) {
-	// Strip bot mention prefix (<@UXXXXXXX> ...)
 	clean := strings.TrimSpace(mentionRE(text))
 	lower := strings.ToLower(clean)
 
-	// Fast-path: structured commands that don't need LLM
 	switch {
 	case strings.Contains(lower, "cases") || strings.Contains(lower, "list"):
 		h.cmdCases(channelID, userID)
@@ -229,13 +227,11 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		return
 	}
 
-	// LLM path: anything else — inject recent cases as context then ask Qwen3
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured. Use `/scantrace help` for available commands.")
 		return
 	}
 
-	// Show a typing indicator (best-effort — not all Slack plans support it)
 	h.postMessage(channelID, "_Thinking…_")
 
 	ctx := h.buildLLMContext()
@@ -263,15 +259,14 @@ func (h *Handler) buildLLMContext() string {
 	sb.WriteString("Recent cases (newest first):\n")
 	for _, c := range cases {
 		sb.WriteString(fmt.Sprintf(
-			"- [%s] id=%s severity=%s confidence=%.0f%% src=%s title=%q first=%s last=%s\n",
+			"- [%s] id=%s severity=%s confidence=%.0f%% title=%q created=%s updated=%s\n",
 			strings.ToUpper(c.Severity),
 			c.CaseID[:8],
 			c.Severity,
 			c.Confidence*100,
-			stringOrDash(c.SrcIP),
 			c.Title,
-			c.FirstSeen.Format("2006-01-02 15:04"),
-			c.LastSeen.Format("2006-01-02 15:04"),
+			c.CreatedAt.Format("2006-01-02 15:04"),
+			c.UpdatedAt.Format("2006-01-02 15:04"),
 		))
 	}
 	return sb.String()
@@ -285,13 +280,6 @@ func mentionRE(text string) string {
 		}
 	}
 	return text
-}
-
-func stringOrDash(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
 }
 
 func (h *Handler) cmdHighSeverity(channelID, userID string) {
