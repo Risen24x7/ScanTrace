@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -246,7 +247,6 @@ func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 	}
 	log.Printf("[serve] starting — correlate interval=%s", interval)
 
-	// --- Start the UDP syslog listener ---
 	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
 	asusSensorID, err := collector.RegisterAsusSensor(store, statePath)
 	if err != nil {
@@ -265,12 +265,10 @@ func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 		log.Printf("[serve] point your router's syslog at %s:%d", getLocalIP(), *syslogPort)
 	}
 
-	// --- Correlator loop ---
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	runCycle(store, slackWebhook)
-
 	for range ticker.C {
 		runCycle(store, slackWebhook)
 	}
@@ -293,7 +291,7 @@ func runCycle(store *db.DB, slackWebhook string) {
 }
 
 // ---------------------------------------------------------------------------
-// flush — remove test fixture data
+// flush
 // ---------------------------------------------------------------------------
 
 func cmdFlush(store *db.DB) {
@@ -397,7 +395,7 @@ func syslogPortFromEnv() int {
 			return p
 		}
 	}
-	return 5140 // default: unprivileged port; use 514 as root
+	return 5140
 }
 
 func getLocalIP() string {
