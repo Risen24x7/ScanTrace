@@ -1,22 +1,32 @@
 // ScanTrace Slack Bot — Dead Reckoning Edition
-// Connects to Dilldozer sandbox via Socket Mode.
-// Runs the MCP server on a separate goroutine.
-// Routes freeform @mentions to Qwen3-30B on the desktop via ik_llama.cpp.
+//
+// Single-process daemon: runs the Slack socket-mode bot, MCP server, live
+// UDP syslog listener, and periodic correlator loop in one binary.
+// The separate `scantrace serve` command is no longer needed.
 //
 // Required env vars:
-//   SLACK_BOT_TOKEN   xoxb-...  (Bot token from OAuth)
-//   SLACK_APP_TOKEN   xapp-...  (App-level token for Socket Mode)
-//   SCANTRACE_DB      path to scantrace.db (default: ../ScanTrace/scantrace.db)
-//   ALERT_CHANNEL     channel ID to post case alerts
-//   MCP_ADDR          address for MCP HTTP server (default: :8765)
-//   LLM_BASE_URL      ik_llama.cpp endpoint (default: http://192.168.50.250:11434)
-//   LLM_MODEL         model name to request (default: "", uses server default)
+//   SLACK_BOT_TOKEN      xoxb-...  (Bot token from OAuth)
+//   SLACK_APP_TOKEN      xapp-...  (App-level token for Socket Mode)
+//
+// Optional env vars:
+//   SCANTRACE_DB         path to scantrace.db   (default: ../ScanTrace/scantrace.db)
+//   SCANTRACE_ASUS_STATE Asus sensor-id file    (default: .asus-sensor-id)
+//   SCANTRACE_SYSLOG_PORT UDP syslog port        (default: 5140; use 514 as root)
+//   CORRELATE_INTERVAL   correlator run interval (default: 5m)
+//   ALERT_CHANNEL        Slack channel ID for case alerts
+//   MCP_ADDR             MCP HTTP listen addr   (default: :8765)
+//   LLM_BASE_URL         ik_llama.cpp endpoint  (default: http://192.168.50.250:11434)
+//   LLM_MODEL            model name             (default: "", uses server default)
 package main
 
 import (
 	"log"
 	"os"
+	"strconv"
+	"time"
 
+	"github.com/Risen24x7/scantrace/internal/collector"
+	"github.com/Risen24x7/scantrace/internal/correlator"
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
@@ -29,6 +39,7 @@ import (
 func main() {
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
+
 	dbPath := envOrDefault("SCANTRACE_DB", "../ScanTrace/scantrace.db")
 	alertChannel := envOrDefault("ALERT_CHANNEL", "#sec-alerts")
 	mcpAddr := envOrDefault("MCP_ADDR", ":8765")
@@ -41,7 +52,43 @@ func main() {
 	}
 	defer store.Close()
 
-	// Start MCP server in background
+	// -----------------------------------------------------------------------
+	// UDP syslog listener — replaces `scantrace serve`
+	// -----------------------------------------------------------------------
+	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
+	asusSensorID, err := collector.RegisterAsusSensor(store, statePath)
+	if err != nil {
+		log.Printf("[bot] asus sensor registration failed: %v — syslog listener disabled", err)
+	} else {
+		port := syslogPortFromEnv()
+		adapter := collector.NewAsusAdapter(asusSensorID)
+		syslogSrv := collector.NewSyslogServer(port, store, adapter)
+		go func() {
+			if err := syslogSrv.Listen(); err != nil {
+				log.Printf("[syslog] fatal: %v", err)
+				log.Printf("[syslog] TIP: run with sudo, or set SCANTRACE_SYSLOG_PORT=5140")
+			}
+		}()
+		log.Printf("[bot] syslog listener on UDP :%d (sensor=%s)", port, asusSensorID[:8])
+	}
+
+	// -----------------------------------------------------------------------
+	// Correlator loop
+	// -----------------------------------------------------------------------
+	correlateInterval := correlateIntervalFromEnv()
+	go func() {
+		runCorrelate(store)
+		ticker := time.NewTicker(correlateInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			runCorrelate(store)
+		}
+	}()
+	log.Printf("[bot] correlator running every %s", correlateInterval)
+
+	// -----------------------------------------------------------------------
+	// MCP server
+	// -----------------------------------------------------------------------
 	mcpServer := mcp.New(store)
 	go func() {
 		if err := mcpServer.ListenAndServe(mcpAddr); err != nil {
@@ -49,11 +96,12 @@ func main() {
 		}
 	}()
 
-	// LLM client — calls ik_llama.cpp on the desktop directly
+	// -----------------------------------------------------------------------
+	// Slack socket-mode bot
+	// -----------------------------------------------------------------------
 	llmClient := llm.New(llmBase, llmModel)
 	log.Printf("[bot] LLM endpoint: %s (model=%q)", llmBase, llmModel)
 
-	// RTS client
 	rtsClient := rts.New(botToken)
 
 	api := slack.New(
@@ -81,6 +129,51 @@ func main() {
 	if err := client.Run(); err != nil {
 		log.Fatalf("[bot] socket mode error: %v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Correlator helper
+// ---------------------------------------------------------------------------
+
+func runCorrelate(store *db.DB) {
+	cfg := correlator.DefaultConfig()
+	corr := correlator.New(store, cfg)
+	cases, err := corr.Run()
+	if err != nil {
+		log.Printf("[correlator] error: %v", err)
+		return
+	}
+	if len(cases) == 0 {
+		log.Printf("[correlator] cycle complete — no new cases")
+		return
+	}
+	log.Printf("[correlator] %d new case(s)", len(cases))
+	for _, c := range cases {
+		log.Printf("[correlator]   • [%s] %s severity=%s confidence=%.0f%%",
+			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func syslogPortFromEnv() int {
+	if v := os.Getenv("SCANTRACE_SYSLOG_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			return p
+		}
+	}
+	return 5140
+}
+
+func correlateIntervalFromEnv() time.Duration {
+	if v := os.Getenv("CORRELATE_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 10*time.Second {
+			return d
+		}
+	}
+	return 5 * time.Minute
 }
 
 func mustEnv(key string) string {
