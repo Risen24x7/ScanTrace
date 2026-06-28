@@ -9,9 +9,9 @@
 //   scantrace flush     [--source testdata]
 //
 // Env:
-//   SCANTRACE_DB         SQLite path (default: ./scantrace.db)
+//   SCANTRACE_DB         SQLite path (default: <exe-dir>/scantrace.db)
 //   SCANTRACE_SENSOR_ID  sensor UUID (auto-created if unset)
-//   SCANTRACE_ASUS_STATE path to Asus sensor-id state file (default: .asus-sensor-id)
+//   SCANTRACE_ASUS_STATE path to Asus sensor-id state file (default: <exe-dir>/.asus-sensor-id)
 //   SCANTRACE_SYSLOG_PORT UDP port to receive router syslog (default: 5140, use 514 as root)
 //   IPINFO_TOKEN         ipinfo.io token (optional)
 //   SLACK_WEBHOOK_URL    Slack Incoming Webhook URL (optional — enables alert posting)
@@ -24,6 +24,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,19 @@ import (
 	"github.com/google/uuid"
 )
 
+// exeDir returns the directory containing the running executable.
+// Falls back to the current working directory if os.Executable fails.
+func exeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		cwd, _ := os.Getwd()
+		return cwd
+	}
+	// Resolve symlinks so `go run` temp binaries still land somewhere sane.
+	exe, _ = filepath.EvalSymlinks(exe)
+	return filepath.Dir(exe)
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	if len(os.Args) < 2 {
@@ -44,7 +58,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	dbPath := envOrDefault("SCANTRACE_DB", "scantrace.db")
+	base := exeDir()
+	dbPath := envOrDefault("SCANTRACE_DB", filepath.Join(base, "scantrace.db"))
 	sensorID := envOrDefault("SCANTRACE_SENSOR_ID", "")
 	ipinfoToken := envOrDefault("IPINFO_TOKEN", "")
 	slackWebhook := envOrDefault("SLACK_WEBHOOK_URL", "")
@@ -121,7 +136,7 @@ func cmdIngest(store *db.DB, sensorID, ipinfoToken string) {
 }
 
 func cmdIngestAsus(store *db.DB, filePath string) {
-	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
+	statePath := envOrDefault("SCANTRACE_ASUS_STATE", filepath.Join(exeDir(), ".asus-sensor-id"))
 
 	asusSensorID, err := collector.RegisterAsusSensor(store, statePath)
 	if err != nil {
@@ -247,7 +262,7 @@ func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 	}
 	log.Printf("[serve] starting — correlate interval=%s", interval)
 
-	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
+	statePath := envOrDefault("SCANTRACE_ASUS_STATE", filepath.Join(exeDir(), ".asus-sensor-id"))
 	asusSensorID, err := collector.RegisterAsusSensor(store, statePath)
 	if err != nil {
 		log.Printf("[serve] asus sensor registration failed: %v — continuing without syslog listener", err)
@@ -261,7 +276,7 @@ func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 				log.Printf("[syslog_server] on your router set syslog port to 5140 instead of 514")
 			}
 		}()
-		log.Printf("[serve] UDP syslog listener started on :%d", *syslogPort)
+		log.Printf("[bot] syslog listener on UDP :%d (sensor=%s)", *syslogPort, asusSensorID[:8])
 		log.Printf("[serve] point your router's syslog at %s:%d", getLocalIP(), *syslogPort)
 	}
 
@@ -419,9 +434,9 @@ Commands:
   flush      [--source testdata]
 
 Env:
-  SCANTRACE_DB          SQLite path             (default: scantrace.db)
+  SCANTRACE_DB          SQLite path             (default: <exe-dir>/scantrace.db)
   SCANTRACE_SENSOR_ID   sensor UUID             (auto-created if unset)
-  SCANTRACE_ASUS_STATE  Asus sensor-id file     (default: .asus-sensor-id)
+  SCANTRACE_ASUS_STATE  Asus sensor-id file     (default: <exe-dir>/.asus-sensor-id)
   SCANTRACE_SYSLOG_PORT UDP syslog listen port  (default: 5140, use 514 as root)
   IPINFO_TOKEN          ipinfo.io token         (optional)
   SLACK_WEBHOOK_URL     Slack Incoming Webhook  (optional)
