@@ -16,8 +16,8 @@ const (
 	DefaultWindow    = 72 * time.Hour
 	DefaultThreshold = 3
 	DefaultMaxEvents = 500
-	// dedupWindow is how long an open case suppresses re-alerting for the same
-	// srcIP + ruleType combination.
+	// dedupWindow: an open case suppresses a NEW case for the same caseID only.
+	// We track by caseID so closing a case allows re-alerting.
 	dedupWindow = 24 * time.Hour
 )
 
@@ -51,11 +51,31 @@ type IPCluster struct {
 	Score     float64
 }
 
+// computeScore scores a cluster.
+// For pure DHCP/Wi-Fi clusters (no dst ports) we score purely on event count
+// so new_device and similar rules still get a non-zero confidence.
+// For clusters with real port data (netfilter) we use port diversity.
 func (c *IPCluster) computeScore() float64 {
 	if len(c.Events) == 0 {
 		return 0
 	}
-	portDiversity := float64(len(c.Ports))
+	// Count ports excluding 0 (DHCP/hostapd events have no port).
+	realPorts := 0
+	for p := range c.Ports {
+		if p != 0 {
+			realPorts++
+		}
+	}
+	if realPorts == 0 {
+		// No port data — score by event count alone, capped at 0.80.
+		s := float64(len(c.Events)) / float64(len(c.Events)+5)
+		if s > 0.80 {
+			s = 0.80
+		}
+		return s
+	}
+	// Port diversity score.
+	portDiversity := float64(realPorts)
 	base := float64(len(c.Events))
 	raw := (base * portDiversity) / (base + portDiversity + 1)
 	if raw > 1.0 {
@@ -118,10 +138,11 @@ func (c *Correlator) Run() ([]*db.Case, error) {
 			ruleType = match.RuleType
 		}
 
-		// Dedup: skip if an open case for this srcIP+ruleType was created
-		// within the last dedupWindow.
+		// Dedup: skip if an open case for this srcIP+ruleType was seen
+		// within dedupWindow AND it is still open.
 		if isDuplicate(recentCases, cl.SrcIP, ruleType, dedupWindow) {
-			log.Printf("[correlator] dedup: skipping %s/%s (open case exists)", cl.SrcIP, ruleType)
+			log.Printf("[correlator] dedup: skipping %s/%s (open case exists within %s)",
+				cl.SrcIP, ruleType, dedupWindow)
 			continue
 		}
 
@@ -135,7 +156,7 @@ func (c *Correlator) Run() ([]*db.Case, error) {
 	return newCases, nil
 }
 
-// isDuplicate returns true if recentCases contains an open case for the given
+// isDuplicate returns true if recentCases has an open case for the given
 // srcIP and ruleType created within the last window duration.
 func isDuplicate(cases []*db.Case, srcIP, ruleType string, window time.Duration) bool {
 	cutoff := time.Now().UTC().Add(-window)
@@ -147,7 +168,6 @@ func isDuplicate(cases []*db.Case, srcIP, ruleType string, window time.Duration)
 		if c.CreatedAt.Before(cutoff) {
 			continue
 		}
-		// analyst_notes stores "rule=X type=Y" — check both srcIP in title and ruleType in notes.
 		if strings.Contains(c.Title, srcIP) && strings.Contains(c.AnalystNotes, needle) {
 			return true
 		}
@@ -226,17 +246,27 @@ func (c *Correlator) openCase(cl *IPCluster, match *RuleMatch) (*db.Case, error)
 func buildSummary(cl *IPCluster, match *RuleMatch) string {
 	ports := []string{}
 	for p := range cl.Ports {
-		ports = append(ports, fmt.Sprintf("%d", p))
+		if p != 0 {
+			ports = append(ports, fmt.Sprintf("%d", p))
+		}
+	}
+	portStr := joinStrings(ports, ", ")
+	if len(ports) == 0 {
+		portStr = "none (DHCP/Wi-Fi events)"
 	}
 	base := fmt.Sprintf(
-		"**Source IP:** %s\n**Observations:** %d events over %s\n**Ports touched:** %s\n**First seen:** %s\n**Last seen:** %s\n**Confidence:** %.2f\n**Severity:** %s",
-		cl.SrcIP, len(cl.Events), cl.LastSeen.Sub(cl.FirstSeen).Round(time.Second),
-		joinStrings(ports, ", "),
-		cl.FirstSeen.Format(time.RFC3339), cl.LastSeen.Format(time.RFC3339),
-		cl.Score, cl.Severity(),
+		"Source: %s | Events: %d over %s | Ports: %s | First: %s | Last: %s | Confidence: %.0f%% | Severity: %s",
+		cl.SrcIP,
+		len(cl.Events),
+		cl.LastSeen.Sub(cl.FirstSeen).Round(time.Second),
+		portStr,
+		cl.FirstSeen.Format("2006-01-02 15:04 UTC"),
+		cl.LastSeen.Format("2006-01-02 15:04 UTC"),
+		cl.Score*100,
+		cl.Severity(),
 	)
 	if match != nil {
-		base += fmt.Sprintf("\n**Rule:** %s — %s", match.RuleName, match.Description)
+		base += fmt.Sprintf(" | Rule: %s — %s", match.RuleName, match.Description)
 	}
 	return base
 }
