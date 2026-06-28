@@ -30,6 +30,41 @@ const (
 	maxSyslogPacket = 65536
 )
 
+// privateRanges holds RFC1918 + loopback + link-local prefixes.
+// isExternal returns false for any IP that falls within these.
+var privateRanges []*net.IPNet
+
+func init() {
+	for _, cidr := range []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"::1/128",
+		"fc00::/7",
+		"fe80::/10",
+	} {
+		_, block, _ := net.ParseCIDR(cidr)
+		privateRanges = append(privateRanges, block)
+	}
+}
+
+// isExternal reports whether ip is a publicly routable address.
+// Returns false for RFC1918, loopback, and link-local addresses.
+func isExternal(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, block := range privateRanges {
+		if block.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
 // SyslogServer listens on UDP and feeds received lines to an Adapter.
 type SyslogServer struct {
 	port    int
@@ -52,10 +87,10 @@ func NewSyslogServer(port int, store *db.DB, adapter Adapter) *SyslogServer {
 		port = DefaultSyslogPort
 	}
 	return &SyslogServer{
-		port:    port,
-		store:   store,
-		adapter: adapter,
-		done:    make(chan struct{}),
+		port:      port,
+		store:     store,
+		adapter:   adapter,
+		done:      make(chan struct{}),
 		StartedAt: time.Now().UTC(),
 	}
 }
@@ -66,7 +101,6 @@ func (s *SyslogServer) Listen() error {
 	addr := &net.UDPAddr{Port: s.port, IP: net.ParseIP("0.0.0.0")}
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		// Port 514 requires root. If binding fails, log a clear message.
 		if s.port < 1024 {
 			return fmt.Errorf(
 				"syslog_server: cannot bind :%d (requires root or CAP_NET_BIND_SERVICE). "+
@@ -87,12 +121,11 @@ func (s *SyslogServer) Listen() error {
 		default:
 		}
 
-		// Short read deadline so we can check s.done frequently.
 		_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, remote, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue // normal — check done channel and loop
+				continue
 			}
 			select {
 			case <-s.done:
@@ -110,8 +143,6 @@ func (s *SyslogServer) Listen() error {
 		}
 		s.LinesReceived++
 
-		// A single UDP datagram may contain multiple newline-separated syslog lines
-		// (some router firmware batches them). Split and process each line.
 		for _, line := range strings.Split(raw, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -125,8 +156,6 @@ func (s *SyslogServer) Listen() error {
 func (s *SyslogServer) processLine(line, remoteIP string) {
 	evt, err := s.adapter.Parse(line)
 	if err != nil {
-		// ErrSkip is expected for non-security lines (DHCP on trusted devices,
-		// NTP, etc.) — count but don't log.
 		s.LinesSkipped++
 		return
 	}
@@ -135,9 +164,6 @@ func (s *SyslogServer) processLine(line, remoteIP string) {
 		return
 	}
 
-	// If the event has no SrcIP and the syslog source is external, use
-	// the sender's IP as a hint. (Useful for routers that omit SRC= in some
-	// log formats but whose external WAN IP is known.)
 	if evt.SrcIP == "" {
 		evt.SrcIP = remoteIP
 	}
@@ -149,7 +175,6 @@ func (s *SyslogServer) processLine(line, remoteIP string) {
 	}
 	s.LinesParsed++
 
-	// Log external scan events immediately so the operator can see them.
 	if evt.Direction == "inbound" && isExternal(evt.SrcIP) {
 		log.Printf("[syslog_server] INBOUND %s src=%s dst=%s dport=%d proto=%s",
 			evt.EventType, evt.SrcIP, evt.DstIP, evt.DstPort, evt.Protocol)

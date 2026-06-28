@@ -94,6 +94,12 @@ type AsusParser struct {
 	Year     int // injected so tests are deterministic; 0 = time.Now().Year()
 }
 
+// NewAsusAdapter returns an AsusParser as an Adapter, ready for use with
+// SyslogServer or Collector.TailFile.
+func NewAsusAdapter(sensorID string) *AsusParser {
+	return &AsusParser{SensorID: sensorID}
+}
+
 // Parse converts a single syslog line into an Event.
 // Returns (nil, nil) for lines that don't match any known pattern.
 func (p *AsusParser) Parse(line string) (*db.Event, error) {
@@ -263,18 +269,15 @@ func (p *AsusParser) parseWANFwd(line string, ts time.Time) (*db.Event, error) {
 }
 
 // parseNetfilter handles legacy iptables LOG target lines with bare DROP/REJECT prefix.
-// These are the MOST IMPORTANT events for detecting external port scans —
-// every dropped inbound packet from an external IP lands here.
 func (p *AsusParser) parseNetfilter(line string, ts time.Time) (*db.Event, error) {
 	m := netfilterRE.FindStringSubmatch(line)
 	if m == nil {
 		return nil, nil
 	}
-	action := strings.ToLower(m[1]) // drop | reject | block
+	action := strings.ToLower(m[1])
 	srcIP := m[2]
 	dstIP := m[3]
 	proto := strings.ToUpper(m[4])
-
 	srcPort := 0
 	if len(m) > 5 && m[5] != "" {
 		srcPort, _ = strconv.Atoi(m[5])
@@ -283,9 +286,6 @@ func (p *AsusParser) parseNetfilter(line string, ts time.Time) (*db.Event, error
 	if len(m) > 6 && m[6] != "" {
 		dstPort, _ = strconv.Atoi(m[6])
 	}
-
-	evtType := "netfilter_" + action
-
 	evt := &db.Event{
 		EventID:      uuid.New().String(),
 		Timestamp:    ts,
@@ -294,7 +294,7 @@ func (p *AsusParser) parseNetfilter(line string, ts time.Time) (*db.Event, error
 		SensorID:     p.SensorID,
 		SourceType:   "asus_syslog",
 		DetectorType: "netfilter",
-		EventType:    evtType,
+		EventType:    "netfilter_" + action,
 		SrcIP:        srcIP,
 		SrcPort:      srcPort,
 		DstIP:        dstIP,
@@ -362,5 +362,6 @@ func (p *AsusParser) parseConn(line string, ts time.Time) (*db.Event, error) {
 		Protocol:     proto,
 		Direction:    "inbound",
 		RawRef:       line,
-	}, nil
+	}
+	return evt, nil
 }
