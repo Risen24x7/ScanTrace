@@ -246,8 +246,9 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 	h.postMessage(channelID, answer)
 }
 
-// buildLLMContext assembles a compact text summary of recent DB state to inject
-// into the LLM prompt so it can answer questions about real cases.
+// buildLLMContext assembles a rich text summary of recent DB state for the LLM.
+// For each case it fetches the linked events so the model sees real IPs,
+// MACs, event types and source types — not just case metadata.
 func (h *Handler) buildLLMContext() string {
 	var sb strings.Builder
 
@@ -257,18 +258,76 @@ func (h *Handler) buildLLMContext() string {
 	}
 	sb.WriteString(fmt.Sprintf("Total cases loaded: %d\n\n", len(cases)))
 	sb.WriteString("Recent cases (newest first):\n")
+
 	for _, c := range cases {
 		sb.WriteString(fmt.Sprintf(
-			"- [%s] id=%s severity=%s confidence=%.0f%% title=%q created=%s updated=%s\n",
-			strings.ToUpper(c.Severity),
+			"\nCase id=%s severity=%s confidence=%.0f%% status=%s title=%q\n",
 			c.CaseID[:8],
 			c.Severity,
 			c.Confidence*100,
+			c.Status,
 			c.Title,
-			c.CreatedAt.Format("2006-01-02 15:04"),
-			c.UpdatedAt.Format("2006-01-02 15:04"),
 		))
+		if c.Summary != "" {
+			sb.WriteString(fmt.Sprintf("  summary: %s\n", c.Summary))
+		}
+
+		// Hydrate linked events so the LLM can see real IPs and event types.
+		// Cap at 10 events per case to keep the context window manageable.
+		maxEvents := 10
+		if len(c.RelatedEventIDs) > 0 {
+			sb.WriteString("  events:\n")
+			for i, evtID := range c.RelatedEventIDs {
+				if i >= maxEvents {
+					sb.WriteString(fmt.Sprintf("    … and %d more events\n", len(c.RelatedEventIDs)-maxEvents))
+					break
+				}
+				evt, err := h.store.GetEvent(evtID)
+				if err != nil || evt == nil {
+					continue
+				}
+				// Build a compact one-liner: only include non-empty fields.
+				var parts []string
+				parts = append(parts, fmt.Sprintf("type=%s", evt.EventType))
+				parts = append(parts, fmt.Sprintf("source=%s", evt.SourceType))
+				if evt.SrcIP != "" {
+					parts = append(parts, fmt.Sprintf("src=%s", evt.SrcIP))
+				}
+				if evt.DstIP != "" {
+					parts = append(parts, fmt.Sprintf("dst=%s", evt.DstIP))
+				}
+				if evt.SrcPort > 0 {
+					parts = append(parts, fmt.Sprintf("sport=%d", evt.SrcPort))
+				}
+				if evt.DstPort > 0 {
+					parts = append(parts, fmt.Sprintf("dport=%d", evt.DstPort))
+				}
+				if evt.Protocol != "" {
+					parts = append(parts, fmt.Sprintf("proto=%s", evt.Protocol))
+				}
+				if len(evt.Tags) > 0 {
+					parts = append(parts, fmt.Sprintf("tags=%s", strings.Join(evt.Tags, ",")))
+				}
+				parts = append(parts, fmt.Sprintf("ts=%s", evt.Timestamp.Format("2006-01-02 15:04")))
+				sb.WriteString(fmt.Sprintf("    - %s\n", strings.Join(parts, " ")))
+			}
+		}
+
+		// Also surface any linked entity enrichment (external IPs, ASN, geo, reputation).
+		if len(c.RelatedEntityIDs) > 0 {
+			entities, err := h.store.GetEntitiesForCase(c.CaseID)
+			if err == nil && len(entities) > 0 {
+				sb.WriteString("  entities:\n")
+				for _, en := range entities {
+					sb.WriteString(fmt.Sprintf(
+						"    - ip=%s type=%s asn=%s provider=%s country=%s rdns=%s\n",
+						en.IP, en.EntityType, en.ASN, en.Provider, en.GeoCountry, en.RDNS,
+					))
+				}
+			}
+		}
 	}
+
 	return sb.String()
 }
 
