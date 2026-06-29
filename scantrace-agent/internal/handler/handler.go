@@ -353,8 +353,51 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	return sb.String(), ts
 }
 
+// caseSrcIPs collects the unique external source IPs for a case without
+// performing any LLM or full context build — used by cmdCases for fast badge lookup.
+func (h *Handler) caseSrcIPs(c *db.Case) []string {
+	seen := make(map[string]struct{})
+	for _, evtID := range c.RelatedEventIDs {
+		evt, err := h.store.GetEvent(evtID)
+		if err != nil || evt == nil || evt.SrcIP == "" {
+			continue
+		}
+		seen[evt.SrcIP] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for ip := range seen {
+		out = append(out, ip)
+	}
+	return out
+}
+
+// ipClassificationBadges runs ipinfo.Enrich on the given IPs and returns
+// a deduplicated, sorted slice of unique badge strings (e.g. "🚨 *KNOWN BAD*…").
+// Only non-empty badges are included; unknown/internal IPs are silently skipped.
+func ipClassificationBadges(ips []string) []string {
+	if len(ips) == 0 {
+		return nil
+	}
+	enriched := ipinfo.Enrich(ips)
+	seen := make(map[string]struct{})
+	var badges []string
+	for _, info := range enriched {
+		b := info.ClassBadge()
+		if b == "" {
+			continue
+		}
+		if _, ok := seen[b]; ok {
+			continue
+		}
+		seen[b] = struct{}{}
+		badges = append(badges, b)
+	}
+	return badges
+}
+
 // cmdCases posts a rich Block Kit card per case — severity colour, ID, title,
-// confidence pill, event count, and a Report button. Fully deterministic.
+// confidence pill, event count, IP classification badges, and a Report button.
+// Fully deterministic — no LLM involved.
 func (h *Handler) cmdCases(channelID, userID string) {
 	cases, err := h.store.ListCases("", 10)
 	if err != nil || len(cases) == 0 {
@@ -399,9 +442,17 @@ func (h *Handler) cmdCases(channelID, userID string) {
 		bar := strings.Repeat("█", filled) + strings.Repeat("░", 5-filled)
 		confPill := fmt.Sprintf("`%s` %d%%", bar, conf)
 
+		// IP classification badges — enrich source IPs for this case.
+		srcIPs := h.caseSrcIPs(c)
+		badges := ipClassificationBadges(srcIPs)
+		badgeLine := ""
+		if len(badges) > 0 {
+			badgeLine = "\n>" + strings.Join(badges, "  ·  ")
+		}
+
 		caseText := fmt.Sprintf(
-			"%s  *[%s]* `%s`\n>%s\n>Confidence: %s   Events: *%d*",
-			emoji, sev, shortID, c.Title, confPill, evtCount,
+			"%s  *[%s]* `%s`\n>%s\n>Confidence: %s   Events: *%d*%s",
+			emoji, sev, shortID, c.Title, confPill, evtCount, badgeLine,
 		)
 
 		reportBtn := slack.NewButtonBlockElement(
