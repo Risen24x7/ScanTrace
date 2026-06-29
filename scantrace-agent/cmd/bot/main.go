@@ -38,10 +38,12 @@ func main() {
 	rtsURL := os.Getenv("RTS_BASE_URL")
 	rtsClient := rts.New(rtsURL)
 
-	var llmClient *llm.Client
-	if llmURL := os.Getenv("LLM_BASE_URL"); llmURL != "" {
-		llmClient = llm.New(llmURL, os.Getenv("LLM_MODEL"))
-	}
+	// Default to the desktop inference endpoint so the agent works without
+	// explicitly setting LLM_BASE_URL in the environment.
+	llmBase := envOrDefault("LLM_BASE_URL", "http://192.168.50.250:11434")
+	llmModel := os.Getenv("LLM_MODEL")
+	llmClient := llm.New(llmBase, llmModel)
+	log.Printf("[main] LLM endpoint: %s (model=%q)", llmBase, llmModel)
 
 	api := slack.New(
 		botToken,
@@ -69,4 +71,11 @@ func mustEnv(key string) string {
 		log.Fatalf("[main] required env var %q is not set", key)
 	}
 	return v
+}
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
