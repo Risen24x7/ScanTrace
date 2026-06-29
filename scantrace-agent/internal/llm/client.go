@@ -116,9 +116,15 @@ One sentence verdict: what is happening and whether it is LIKELY BENIGN, NEEDS I
 Reasoning tied directly to the triage answers. If Plausible legitimate explanation is not NONE, explain why you still consider it a threat (or don't). Do not repeat generic scanner warnings for cloud provider IPs.
 
 *Recommended Actions*
-Specific steps only. For wan_forward cases, the FIRST action must always be:
-"Check app/proxy logs on [dst IP] for requests matching these timestamps."
-Only recommend firewall changes AFTER that step, and only if logs confirm malicious intent.
+Priority rules — apply the FIRST matching rule, then continue with the rest:
+1. If "Dst host in registry" is NO: the absolute first action is "Identify the
+   device at [dst IP] — run arp-scan or check DHCP leases to determine what
+   machine this is before any other step."
+2. If "Dst host in registry" is YES and event type is wan_forward: the first
+   action is "Check app/proxy logs on [dst IP] for requests matching these
+   timestamps."
+3. Only recommend firewall changes after the above identification/log steps,
+   and only if findings confirm malicious intent.
 ---
 
 Prioritise provided context. If a triage field cannot be answered from context, write UNKNOWN.`
