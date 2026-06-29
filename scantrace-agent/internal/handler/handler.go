@@ -112,8 +112,7 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 }
 
 // cmdReviewAll queues every open case and posts one LLM briefing per case to
-// sec-intel-external, with a 3-second gap between each post so the inference
-// worker isn't flooded and Slack doesn't rate-limit.
+// sec-intel-external, with a 3-second gap between each post.
 func (h *Handler) cmdReviewAll(channelID, userID string) {
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured.")
@@ -156,8 +155,7 @@ func (h *Handler) cmdReviewAll(channelID, userID string) {
 	}()
 }
 
-// cmdNext pops the highest-priority open case (high → medium → low) and posts
-// a single full LLM briefing immediately.
+// cmdNext pops the highest-priority open case and posts a single full briefing.
 func (h *Handler) cmdNext(channelID, userID string) {
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured.")
@@ -200,11 +198,9 @@ func (h *Handler) cmdNext(channelID, userID string) {
 }
 
 // buildSingleCaseContext builds a focused context for one case only.
-// No event cap — passes all events and IP intel for this case alone.
 func (h *Handler) buildSingleCaseContext(c *db.Case) string {
 	var sb strings.Builder
 
-	// Known device context for IPs in this case.
 	devices, _ := h.store.ListKnownDevices("", 30)
 	if len(devices) > 0 {
 		sb.WriteString("Known devices:\n")
@@ -359,7 +355,6 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 	h.mu.Unlock()
 
 	if existingThread != "" {
-		// Compact thread reply — no full briefing, no backtick case IDs.
 		port := extractFirstPort(report)
 		eventCount := len(c.RelatedEventIDs)
 		var update string
@@ -375,7 +370,6 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 		return
 	}
 
-	// First occurrence — full alert block.
 	blocks, err := blocksFromRaw(report.SlackBlock())
 	var ts string
 	if err != nil {
@@ -414,8 +408,7 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 	log.Printf("[handler] posted alert for case %s to %s (ts=%s)", c.CaseID[:8], h.alertChannel, ts)
 }
 
-// extractFirstPort pulls the first destination port from a report's related events.
-func extractFirstPort(report *casebuilder.Report) string {
+func extractFirstPort(report *casebuilder.CaseReport) string {
 	if report == nil {
 		return ""
 	}
@@ -476,8 +469,6 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 	h.postMessage(destChannel, "", answer)
 }
 
-// buildLLMContext assembles a compact snapshot for general @mention queries.
-// Limits: 10 cases, 5 events/case, 20 IPs for enrichment.
 func (h *Handler) buildLLMContext() string {
 	var sb strings.Builder
 
