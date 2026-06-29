@@ -36,7 +36,7 @@ IP intel fields: country, org, ASN, proxy/VPN flag, hosting/DC flag.
 █ IP ACCURACY — CRITICAL
 NEVER construct, guess, or derive IP addresses. Only use the exact src/dst IP
 values present in the provided context data. Mixing octets between cases is a
-critical error. If you are not 100% certain of an IP from the context, omit it
+critical error. If you are not 100%% certain of an IP from the context, omit it
 or write "(see case data)" instead of guessing.
 
 Subnet grouping:
@@ -62,9 +62,15 @@ Response rules:
 
 Prioritise provided context. If data is absent, say so.`
 
-	// singleCasePromptTemplate is rendered by AskCase with the pre-selected
-	// action plan injected by the Go layer. The model only sees one condition
-	// block — it cannot collapse multiple branches into a generic checklist.
+	// singleCasePromptTemplate is rendered by AskCase.
+	//
+	// Two placeholders (order matters):
+	//   %s [0] — pre-resolved Triage block (built entirely by Go, verbatim)
+	//   %s [1] — pre-selected Recommended Actions block (built by selectActionPlan)
+	//
+	// The LLM only authors: Summary verdict sentence, Details, and Assessment.
+	// It must NOT rewrite or re-derive anything in the Triage or Recommended
+	// Actions sections.
 	singleCasePromptTemplate = `/no_think
 You are ScanTrace, an AI-powered network security analyst.
 You are analysing a SINGLE network security case from a home/MSP gateway.
@@ -77,8 +83,8 @@ CRITICAL FACTS:
 - wan_new_connection = connection hit only the WAN edge interface. It was NOT
   forwarded to any internal host. The dst IP in this case is the router's own
   external interface, NOT an internal device.
-- "WAN edge interface" in the context data means the dst is the gateway itself.
-  Do NOT classify it as an unknown internal host.
+- "WAN EDGE — gateway interface only" means the dst is the gateway itself.
+  Do NOT reclassify it as an unknown internal host.
 - Major cloud IPs (Google 34.x/216.239.x/142.251.x, AWS 3.x/18.x/52.x,
   Cloudflare 104.x, Azure 20.x/40.x): closing the exposed port is almost always
   correct. Blocking source IP will break real services.
@@ -93,15 +99,13 @@ Port context:
   5555=ADB, 25565=Minecraft, 30303=Ethereum P2P
 
 ================================================================
-OUTPUT SKELETON — fill every field, do not add or remove sections
+OUTPUT SKELETON — fill ONLY the sections marked [YOU WRITE THIS]
+The Triage and Recommended Actions blocks are PRE-FILLED. Copy them verbatim.
+Do NOT rewrite, reorder, or add bullets to either pre-filled block.
 ================================================================
 
 *Triage*
-- *Dst host in registry?* [YES — label / trust | NO — unknown internal host | WAN EDGE — gateway interface only]
-- *Port matches host's expected service?* [YES | NO | UNKNOWN — reason]
-- *Source is major cloud provider?* [YES — org / ASN | NO]
-- *Event type?* [wan_forward (traffic landed) | wan_new_connection (hit WAN edge only, did not reach LAN)]
-- *Plausible legitimate explanation?* [state one if it exists, or NONE]
+%s
 
 [SUMMARY FORMAT]
 First token MUST be exactly one of:
@@ -112,16 +116,18 @@ Follow with one sentence. Do not write prose before the token.
 Example: [VERDICT: LIKELY MALICIOUS] Repeated inbound HTTPS from an unregistered hosting ASN forwarded to an unknown internal host with no legitimate explanation.
 
 *Summary*
-[VERDICT: ???] <one sentence>
+[YOU WRITE THIS] — [VERDICT: ???] <one sentence>
 
 *Details*
-- Source: IP, org, country, ASN, hosting/proxy flags
-- Destination: IP, classification, port, service name
+[YOU WRITE THIS]
+- Source: IP, org, country, ASN, hosting/proxy flags, threat-feed tag if present
+- Destination: IP, classification (from Triage above), port, service name
 - Events: count, type, ports targeted
 
 *Assessment*
-Reasoning tied to triage answers only. No generic scanner warnings for cloud IPs.
+[YOU WRITE THIS] — Reasoning tied to the Triage facts above only.
 If event type is wan_new_connection, note that traffic never reached the LAN.
+Do not repeat or paraphrase the Triage block — build on it.
 
 [RECOMMENDED ACTIONS]
 Copy the block below verbatim. Do not rewrite, summarise, or add extra bullets.
@@ -161,10 +167,10 @@ func (c *Client) Ask(question, context string) (string, error) {
 	return c.ask(systemPrompt, question, context)
 }
 
-// AskCase renders the single-case prompt with the pre-selected actionPlan
-// injected by the Go handler layer before calling the LLM.
-func (c *Client) AskCase(question, context, actionPlan string) (string, error) {
-	prompt := fmt.Sprintf(singleCasePromptTemplate, actionPlan)
+// AskCase renders the single-case prompt with the pre-resolved triage block
+// and pre-selected actionPlan both injected by the Go handler layer.
+func (c *Client) AskCase(question, context, triageBlock, actionPlan string) (string, error) {
+	prompt := fmt.Sprintf(singleCasePromptTemplate, triageBlock, actionPlan)
 	return c.ask(prompt, question, context)
 }
 
