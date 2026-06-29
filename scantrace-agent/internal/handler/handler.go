@@ -24,6 +24,7 @@ type Handler struct {
 	store                 *db.DB
 	alertChannel          string // sec-alerts — raw case alerts
 	externalThreatChannel string // sec-intel-external — LLM mention responses
+	wanIP                 string // public WAN IP of the gateway
 	rts                   *rts.Client
 	llm                   *llm.Client
 
@@ -31,12 +32,13 @@ type Handler struct {
 	caseThreads map[string]string
 }
 
-func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel string, rtsClient *rts.Client, llmClient *llm.Client) *Handler {
+func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, wanIP string, rtsClient *rts.Client, llmClient *llm.Client) *Handler {
 	return &Handler{
 		api:                   api,
 		store:                 store,
 		alertChannel:          alertChannel,
 		externalThreatChannel: externalThreatChannel,
+		wanIP:                 wanIP,
 		rts:                   rtsClient,
 		llm:                   llmClient,
 		caseThreads:           make(map[string]string),
@@ -197,17 +199,37 @@ func (h *Handler) cmdNext(channelID, userID string) {
 	}()
 }
 
+// classifyDst determines the triage label for a destination IP.
+// wan_new_connection events hit only the WAN edge — the dst is the gateway
+// itself, not an internal host. We must not pass it to the LLM as an
+// "unknown internal host" or it will hallucinate a rogue device on the LAN.
+func (h *Handler) classifyDst(dstIP, eventType string) string {
+	// Public WAN IP: the connection hit the router's external interface.
+	if h.wanIP != "" && dstIP == h.wanIP {
+		return "WAN edge interface (gateway external IP — not an internal host)"
+	}
+	// wan_new_connection without a matching port-forward rule never reaches LAN.
+	if strings.EqualFold(eventType, "wan_new_connection") {
+		return "WAN edge interface (connection hit gateway only — no port-forward rule matched)"
+	}
+	return "" // caller will check device registry
+}
+
 // buildSingleCaseContext builds a focused context for one case only.
 func (h *Handler) buildSingleCaseContext(c *db.Case) string {
 	var sb strings.Builder
 
 	devices, _ := h.store.ListKnownDevices("", 30)
+	deviceMap := make(map[string]*db.KnownDevice)
 	if len(devices) > 0 {
 		sb.WriteString("Known devices:\n")
-		for _, d := range devices {
+		for i, d := range devices {
 			identifier := d.IP
 			if identifier == "" {
 				identifier = d.MAC
+			}
+			if d.IP != "" {
+				deviceMap[d.IP] = devices[i]
 			}
 			sb.WriteString(fmt.Sprintf("  %s trust=%s label=%q suppress=%v\n",
 				identifier, d.TrustLabel, d.Label, d.AutoSuppress))
@@ -224,8 +246,22 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) string {
 		if err != nil || evt == nil {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("  evt type=%s src=%s dst=%s dport=%d proto=%s\n",
-			evt.EventType, evt.SrcIP, evt.DstIP, evt.DstPort, evt.Protocol))
+
+		// Resolve dst label before writing the event line so the LLM gets
+		// accurate triage state rather than seeing a public IP presented as
+		// an unmapped internal host.
+		dstLabel := h.classifyDst(evt.DstIP, evt.EventType)
+		if dstLabel == "" {
+			// Check device registry.
+			if dev, ok := deviceMap[evt.DstIP]; ok {
+				dstLabel = fmt.Sprintf("registry: label=%q trust=%s", dev.Label, dev.TrustLabel)
+			} else {
+				dstLabel = "unknown internal host"
+			}
+		}
+
+		sb.WriteString(fmt.Sprintf("  evt type=%s src=%s dst=%s [%s] dport=%d proto=%s\n",
+			evt.EventType, evt.SrcIP, evt.DstIP, dstLabel, evt.DstPort, evt.Protocol))
 		if evt.SrcIP != "" {
 			ipSet[evt.SrcIP] = struct{}{}
 		}
@@ -543,27 +579,6 @@ func mentionRE(text string) string {
 		}
 	}
 	return text
-}
-
-func (h *Handler) cmdHighSeverity(channelID, userID string) {
-	cases, err := h.store.ListCases("high", 5)
-	if err != nil || len(cases) == 0 {
-		h.postEphemeral(channelID, userID, "No high severity cases found.")
-		return
-	}
-	var lines []string
-	for _, c := range cases {
-		lines = append(lines, fmt.Sprintf("🔴 %s *%s* (%.0f%% confidence)",
-			c.CaseID[:8], c.Title, c.Confidence*100))
-	}
-	h.postBlocks(channelID, "", []slack.Block{
-		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "🔴 High Severity Cases", false, false)),
-		slack.NewDividerBlock(),
-		slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", strings.Join(lines, "\n"), false, false),
-			nil, nil,
-		),
-	})
 }
 
 func (h *Handler) postMessage(channelID, threadTS, text string) {
