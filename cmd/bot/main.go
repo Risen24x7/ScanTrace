@@ -46,7 +46,6 @@ func exeDir() string {
 		cwd, _ := os.Getwd()
 		return cwd
 	}
-	// Resolve symlinks so `go run` temp binaries still land somewhere sane.
 	exe, _ = filepath.EvalSymlinks(exe)
 	return filepath.Dir(exe)
 }
@@ -272,8 +271,7 @@ func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 		go func() {
 			if err := syslogSrv.Listen(); err != nil {
 				log.Printf("[syslog_server] fatal: %v", err)
-				log.Printf("[syslog_server] TIP: run with sudo, or set SCANTRACE_SYSLOG_PORT=5140 and")
-				log.Printf("[syslog_server] on your router set syslog port to 5140 instead of 514")
+				log.Printf("[syslog_server] TIP: run with sudo, or set SCANTRACE_SYSLOG_PORT=5140")
 			}
 		}()
 		log.Printf("[bot] syslog listener on UDP :%d (sensor=%s)", *syslogPort, asusSensorID[:8])
@@ -353,7 +351,7 @@ func cmdFlush(store *db.DB) {
 }
 
 // ---------------------------------------------------------------------------
-// Slack alert helper
+// Slack alert helper — posts medium AND low severity cases
 // ---------------------------------------------------------------------------
 
 func postAlerts(store *db.DB, cases []*db.Case, webhookURL string) {
@@ -363,9 +361,6 @@ func postAlerts(store *db.DB, cases []*db.Case, webhookURL string) {
 	client := slack.New(webhookURL)
 	builder := casebuilder.New(store)
 	for _, cas := range cases {
-		if cas.Severity == "low" {
-			continue
-		}
 		report, err := builder.BuildReport(cas.CaseID)
 		if err != nil {
 			log.Printf("[alerts] BuildReport %s: %v", cas.CaseID[:8], err)

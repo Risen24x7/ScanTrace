@@ -25,20 +25,9 @@ type Rule interface {
 
 // ---------------------------------------------------------------------------
 // ExternalScanRule — an EXTERNAL IP (non-RFC1918) touches N+ distinct
-// destination ports on internal hosts. This is the PRIMARY rule for detecting
-// external port scans against the monitored network.
-//
-// Event types that contribute:
-//   - netfilter_drop / netfilter_reject  (router/firewall DROP logs)
-//   - ids_alert / suricata_alert         (IDS detections)
-//   - blocked                            (generic firewall block)
-//   - conn_attempt / tcp_syn             (any observed connection attempt)
-//
-// The rule intentionally fires on DROP events — an external scanner probing
-// closed ports will be logged as drops, not successful connections.
+// destination ports on internal hosts.
 // ---------------------------------------------------------------------------
 
-// isExternal returns true if ip is outside RFC1918 private space.
 func isExternal(ip string) bool {
 	if ip == "" {
 		return false
@@ -52,6 +41,7 @@ func isExternal(ip string) bool {
 		"192.168.",
 		"127.",
 		"169.254.",
+		"0.0.0.0",
 		"::1",
 	} {
 		if strings.HasPrefix(ip, prefix) {
@@ -61,8 +51,8 @@ func isExternal(ip string) bool {
 	return true
 }
 
-// scanEventTypes is the set of event types that indicate an inbound connection
-// attempt or block — the raw material for external scan detection.
+// scanEventTypes is the set of event types that count as inbound connection
+// attempts for external scan detection. Includes WAN router event types.
 var scanEventTypes = map[string]bool{
 	"netfilter_drop":    true,
 	"netfilter_reject":  true,
@@ -74,12 +64,14 @@ var scanEventTypes = map[string]bool{
 	"firewall_drop":     true,
 	"firewall_block":    true,
 	"portscan_detected": true,
+	// ASUS BE96U WAN events
+	"wan_new_connection": true,
+	"wan_forward":        true,
 }
 
 type ExternalScanRule struct {
-	// MinPorts is the minimum number of distinct destination ports an external
-	// IP must probe before the rule fires. Default: 3.
-	// Lower than PortScanRule because external scans are always suspicious.
+	// MinPorts is the minimum number of distinct destination ports before the
+	// rule fires. Set to 1 so every unique external inbound hit generates a case.
 	MinPorts int
 }
 
@@ -89,10 +81,9 @@ func (r *ExternalScanRule) Eval(cl *IPCluster) *RuleMatch {
 	}
 	min := r.MinPorts
 	if min == 0 {
-		min = 3
+		min = 1
 	}
 
-	// Count scan-type events and distinct destination ports from scan events.
 	scanEvents := 0
 	scanPorts := make(map[int]bool)
 	for _, e := range cl.Events {
@@ -104,17 +95,22 @@ func (r *ExternalScanRule) Eval(cl *IPCluster) *RuleMatch {
 		}
 	}
 
-	// Also count any event with a non-zero DstPort from an external IP —
-	// even if the event type isn't explicitly a block/drop, an external IP
-	// touching multiple ports is anomalous.
+	// Any external IP touching any port is anomalous.
 	for _, e := range cl.Events {
 		if e.DstPort > 0 {
 			scanPorts[e.DstPort] = true
 		}
 	}
 
-	if len(scanPorts) < min {
+	if scanEvents == 0 {
 		return nil
+	}
+
+	if len(scanPorts) < min {
+		// Still fire if we have scan events but no port info (e.g. IGMP)
+		if scanEvents == 0 {
+			return nil
+		}
 	}
 
 	portList := make([]string, 0, len(scanPorts))
@@ -127,24 +123,21 @@ func (r *ExternalScanRule) Eval(cl *IPCluster) *RuleMatch {
 		RuleType: "inbound_scan",
 		Description: fmt.Sprintf(
 			"External IP %s probed %d ports [%s] (%d events)",
-			cl.SrcIP, len(scanPorts), strings.Join(portList, ", "), len(cl.Events),
+			cl.SrcIP, len(scanPorts), strings.Join(portList, ", "), scanEvents,
 		),
 	}
 }
 
 // ---------------------------------------------------------------------------
 // PortScanRule — N distinct destination ports from the same src IP.
-// Fires on internal lateral movement scans. ExternalScanRule handles
-// inbound scans from the internet.
 // ---------------------------------------------------------------------------
 
 type PortScanRule struct {
-	MinPorts int // default 5
+	MinPorts int
 	Window   time.Duration
 }
 
 func (r *PortScanRule) Eval(cl *IPCluster) *RuleMatch {
-	// Skip external IPs — ExternalScanRule is more specific.
 	if isExternal(cl.SrcIP) {
 		return nil
 	}
@@ -167,7 +160,7 @@ func (r *PortScanRule) Eval(cl *IPCluster) *RuleMatch {
 // ---------------------------------------------------------------------------
 
 type RepeatedDropRule struct {
-	MinDrops int // default 3
+	MinDrops int
 }
 
 func (r *RepeatedDropRule) Eval(cl *IPCluster) *RuleMatch {
@@ -194,9 +187,7 @@ func (r *RepeatedDropRule) Eval(cl *IPCluster) *RuleMatch {
 }
 
 // ---------------------------------------------------------------------------
-// NewDeviceRule — fires once when a cluster contains a first-ever DHCP or
-// WiFi association event (new MAC on the network).
-// Only applies to internal/RFC1918 addresses.
+// NewDeviceRule — fires when a new MAC appears on the network.
 // ---------------------------------------------------------------------------
 
 type NewDeviceRule struct{}
@@ -219,15 +210,12 @@ func (r *NewDeviceRule) Eval(cl *IPCluster) *RuleMatch {
 }
 
 // ---------------------------------------------------------------------------
-// DefaultRules returns the standard rule set used by the correlator.
-// Order matters: ExternalScanRule is evaluated first so external IPs always
-// get the inbound_scan label before PortScanRule or RepeatedDropRule can
-// consume them with a less specific match.
+// DefaultRules returns the standard rule set.
 // ---------------------------------------------------------------------------
 
 func DefaultRules() []Rule {
 	return []Rule{
-		&ExternalScanRule{MinPorts: 3},
+		&ExternalScanRule{MinPorts: 1},
 		&PortScanRule{MinPorts: 5},
 		&RepeatedDropRule{MinDrops: 3},
 		&NewDeviceRule{},
