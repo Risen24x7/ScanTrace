@@ -30,7 +30,169 @@ type Info struct {
 	Err     error
 }
 
+// Classification is the high-level verdict for an IP based on org/ASN data.
+type Classification int
+
+const (
+	ClassUnknown    Classification = iota
+	ClassFeds                      // US government / military / federal agency
+	ClassKnownGood                 // major CDN, cloud infra, well-known benign network
+	ClassKnownBad                  // hosting DC, anonymous proxy, flagged infrastructure
+	ClassSuspicious                // proxy/VPN without DC hosting
+)
+
+// govOrgKeywords are substrings matched (case-insensitive) against Org or ISP
+// to identify US federal / military networks.
+var govOrgKeywords = []string{
+	"department of defense",
+	"dod network",
+	"disa ",
+	"disa,",
+	"defense information systems",
+	"us army",
+	"u.s. army",
+	"us navy",
+	"u.s. navy",
+	"us air force",
+	"u.s. air force",
+	"us marine",
+	"u.s. marine",
+	"pentagon",
+	"national security agency",
+	"nsa ",
+	"central intelligence",
+	"cia ",
+	"federal bureau",
+	"fbi ",
+	"department of homeland",
+	"dhs ",
+	"nasa ",
+	"national aeronautics",
+	"us postal service",
+	"usps ",
+	"internal revenue service",
+	"irs ",
+	"veterans affairs",
+	".mil",
+	".gov",
+	"us government",
+	"united states government",
+	"executive office",
+	"white house",
+	"senate.gov",
+	"house.gov",
+}
+
+// govASNs are well-known US government / military AS numbers.
+var govASNs = []string{
+	"AS749",   // DoD Network Information Center
+	"AS721",   // DoD NIC
+	"AS8003",  // DISA
+	"AS6325",  // DISA
+	"AS12148", // US Treasury
+	"AS2742",  // NASA
+	"AS297",   // NASA
+	"AS690",   // NSFNET / NSF
+	"AS26008", // DHS
+	"AS32934", // reserved DoD
+	"AS27065", // DoJ
+	"AS11557", // FBI
+	"AS4323",  // CIA
+}
+
+// knownGoodKeywords identify well-known benign infrastructure operators.
+var knownGoodKeywords = []string{
+	"cloudflare",
+	"akamai",
+	"fastly",
+	"amazon",
+	"google",
+	"microsoft",
+	"apple",
+	"cdn77",
+	"limelight",
+	"edgecast",
+	"level 3",
+	"lumen",
+	"comcast",
+	"att ",
+	"at&t",
+	"verizon",
+	"spectrum",
+	"charter",
+	"cox communications",
+	"centurylink",
+	"lumen technologies",
+	"twc ",
+	"time warner",
+}
+
 var client = &http.Client{Timeout: timeout}
+
+// Classify returns the high-level verdict for this IP based on org/ASN data.
+func (i *Info) Classify() Classification {
+	if i.Err != nil {
+		return ClassUnknown
+	}
+	orgLower := strings.ToLower(i.Org + " " + i.ISP)
+	asUpper := strings.ToUpper(strings.Fields(i.AS)[0]) // e.g. "AS749"
+	if len(strings.Fields(i.AS)) == 0 {
+		asUpper = ""
+	}
+
+	// US Government / Military — checked first, takes precedence over everything.
+	for _, kw := range govOrgKeywords {
+		if strings.Contains(orgLower, kw) {
+			return ClassFeds
+		}
+	}
+	for _, asn := range govASNs {
+		if asUpper == asn {
+			return ClassFeds
+		}
+	}
+
+	// Hosting DC + Proxy together — usually bulletproof / C2 infra.
+	if i.Hosting && i.Proxy {
+		return ClassKnownBad
+	}
+
+	// Proxy/VPN without hosting — anonymised source.
+	if i.Proxy {
+		return ClassSuspicious
+	}
+
+	// Hosting DC only — could be scanner, could be legit cloud.
+	if i.Hosting {
+		return ClassKnownBad
+	}
+
+	// Major CDN / carrier / big-tech — almost certainly benign.
+	for _, kw := range knownGoodKeywords {
+		if strings.Contains(orgLower, kw) {
+			return ClassKnownGood
+		}
+	}
+
+	return ClassUnknown
+}
+
+// ClassBadge returns the Slack-formatted badge for the classification.
+// Designed to be embedded inline in the IP intel section of a briefing.
+func (i *Info) ClassBadge() string {
+	switch i.Classify() {
+	case ClassFeds:
+		return "🇺🇸 *THE FEDS* — US Government / Federal Agency"
+	case ClassKnownGood:
+		return "✅ *KNOWN GOOD* — Major CDN / carrier infrastructure"
+	case ClassKnownBad:
+		return "🚨 *KNOWN BAD* — Hosting datacenter / anonymous proxy"
+	case ClassSuspicious:
+		return "⚠️ *SUSPICIOUS* — Proxy / VPN detected"
+	default:
+		return ""
+	}
+}
 
 // Enrich fetches enrichment for up to 100 external IPs in a single batch call.
 // Private/reserved IPs are skipped and returned with Org="internal".
@@ -121,11 +283,15 @@ func batchQuery(ips []string) ([]*Info, error) {
 	return result, nil
 }
 
-// Summary returns a single-line human-readable description.
+// Summary returns a single-line human-readable description including
+// the classification badge when one applies.
 func (i *Info) Summary() string {
 	if i.Err != nil {
 		return "(lookup failed)"
 	}
+
+	badge := i.ClassBadge()
+
 	var flags []string
 	if i.Proxy {
 		flags = append(flags, "proxy/VPN")
@@ -137,7 +303,12 @@ func (i *Info) Summary() string {
 	if len(flags) > 0 {
 		flagStr = " [" + strings.Join(flags, ",") + "]"
 	}
-	return fmt.Sprintf("%s | %s | %s%s", i.Country, i.Org, i.AS, flagStr)
+
+	base := fmt.Sprintf("%s | %s | %s%s", i.Country, i.Org, i.AS, flagStr)
+	if badge != "" {
+		return base + " — " + badge
+	}
+	return base
 }
 
 func isPrivate(ipStr string) bool {
