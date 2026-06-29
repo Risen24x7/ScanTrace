@@ -44,8 +44,8 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 		wanIP:                 wanIP,
 		rts:                   rtsClient,
 		llm:                   llmClient,
-		threat:                threat.New("", ""),             // uses default /opt/scantrace paths
-		benignScanners:        threat.NewBenignScanners(""),   // uses default /opt/scantrace/benign-scanners.txt
+		threat:                threat.New("", ""),
+		benignScanners:        threat.NewBenignScanners(""),
 		caseThreads:           make(map[string]string),
 	}
 }
@@ -53,19 +53,22 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 // triageState captures the facts Go already knows so we can pre-select the
 // correct action plan before the LLM prompt is assembled.
 type triageState struct {
-	isWANEdgeOnly        bool // all events are wan_new_connection
-	dstInRegistry        bool // at least one dst IP found in device registry
+	isWANEdgeOnly        bool // ALL events are wan_new_connection (no wan_forward present)
+	hasWANForward        bool // at least one wan_forward event exists
+	dstInRegistry        bool // at least one wan_forward dst IP found in device registry
 	logsConfirmMalicious bool // set by threat-feed lookup (IPSum >= threshold or Tor exit)
-	isBenignScanner      bool // source matched known research scanner list (Shodan, Censys, etc.)
-	ipsumTier            int  // highest IPSum tier across all case IPs (0=clean, 1=noise, 2=scanner, 3=blacklisted)
+	isBenignScanner      bool // source matched known research scanner list
+	ipsumTier            int  // highest IPSum tier across all case IPs
+	// Triage summary strings — injected directly into LLM context.
+	dstLabel  string // e.g. "WAN EDGE — gateway interface only" or "unknown internal host" or "registry: label=..."
+	evtSummary string // e.g. "wan_forward (2), wan_new_connection (2)"
 }
 
 // selectActionPlan converts the pre-evaluated triage state into a single
-// ready-to-inject action block. The model receives only this block — no
-// alternative conditions to collapse into a checklist.
+// ready-to-inject action block.
 func selectActionPlan(ts triageState) string {
 	switch {
-	// F — universally blacklisted: auto-escalate regardless of topology.
+	// F — universally blacklisted.
 	case ts.ipsumTier >= threat.TierBlacklisted:
 		return "*Recommended Actions*\nCondition Matched: F — source universally blacklisted (IPSum score ≥6, majority of feeds agree)\n" +
 			"- [VERDICT: LIKELY MALICIOUS] Source is blacklisted across the majority of independent threat-feed sources.\n" +
@@ -73,7 +76,7 @@ func selectActionPlan(ts triageState) string {
 			"- Close or restrict the targeted port if no external access is required.\n" +
 			"- Escalate to a human analyst if the internal host shows any signs of compromise."
 
-	// E — benign research scanner: demote to LOW, no action required.
+	// E — benign research scanner.
 	case ts.isBenignScanner:
 		return "*Recommended Actions*\nCondition Matched: E — source is a known benign research scanner (Shodan / Censys / Shadowserver / similar)\n" +
 			"- [VERDICT: LIKELY BENIGN] This traffic originates from a well-known, opt-outable internet scanning service.\n" +
@@ -81,7 +84,7 @@ func selectActionPlan(ts triageState) string {
 			"- If you wish to suppress future alerts from this source, add the IP/CIDR to /opt/scantrace/benign-scanners.txt.\n" +
 			"- Review only if the scan volume is unusually high (>50 events/hour from the same IP)."
 
-	// D — threat feed confirms malicious activity.
+	// D — threat feed confirms malicious.
 	case ts.logsConfirmMalicious:
 		return "*Recommended Actions*\nCondition Matched: D — host verified, logs confirm malicious activity\n" +
 			"- Block the source IP or subnet at the gateway firewall.\n" +
@@ -179,8 +182,6 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 	}
 }
 
-// cmdReviewAll queues every open case and posts one LLM briefing per case to
-// sec-intel-external, with a 3-second gap between each post.
 func (h *Handler) cmdReviewAll(channelID, userID string) {
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured.")
@@ -224,7 +225,6 @@ func (h *Handler) cmdReviewAll(channelID, userID string) {
 	}()
 }
 
-// cmdNext pops the highest-priority open case and posts a single full briefing.
 func (h *Handler) cmdNext(channelID, userID string) {
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured.")
@@ -267,25 +267,44 @@ func (h *Handler) cmdNext(channelID, userID string) {
 	}()
 }
 
-// classifyDst determines the triage label for a destination IP.
-func (h *Handler) classifyDst(dstIP, eventType string) string {
-	if h.wanIP != "" && dstIP == h.wanIP {
-		return "WAN edge interface (gateway external IP — not an internal host)"
+// classifyDst resolves the destination label for a single event.
+//
+// Rules (in priority order):
+//  1. wan_new_connection → traffic never left the WAN interface, so the
+//     "destination" is always the gateway itself regardless of the dst IP field.
+//  2. wan_forward + dst == wanIP → same gateway IP but traffic was forwarded;
+//     label it as gateway-forwarded rather than a plain WAN-edge hit.
+//  3. wan_forward → look up dst in device registry; fall through to
+//     "unknown internal host" if not found.
+func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge bool) {
+	switch strings.ToLower(eventType) {
+	case "wan_new_connection":
+		// Packet was dropped at the WAN interface — never reached LAN.
+		return "WAN EDGE — gateway interface only", true
+	case "wan_forward":
+		if h.wanIP != "" && dstIP == h.wanIP {
+			// Forwarded but dst happens to be the gateway's own IP (hairpin/NAT).
+			return "WAN gateway IP (forwarded — check NAT rules)", false
+		}
+		// Fall through: registry and unknown-host logic handled in caller.
+		return "", false
+	default:
+		if h.wanIP != "" && dstIP == h.wanIP {
+			return "WAN EDGE — gateway interface only", true
+		}
+		return "", false
 	}
-	if strings.EqualFold(eventType, "wan_new_connection") {
-		return "WAN edge interface (connection hit gateway only — no port-forward rule matched)"
-	}
-	return ""
 }
 
 // buildSingleCaseContext builds the LLM context string and simultaneously
-// evaluates the triageState so the caller can pre-select the action plan
-// without asking the model to perform conditional logic.
+// evaluates the triageState so the caller can pre-select the action plan.
 func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	var sb strings.Builder
 	var ts triageState
 
-	evtTypesSeen := make(map[string]int)
+	evtTypeCount := make(map[string]int) // "wan_new_connection" → n, "wan_forward" → n
+	var portsSeen []string
+	portSet := make(map[int]struct{})
 
 	devices, _ := h.store.ListKnownDevices("", 30)
 	deviceMap := make(map[string]*db.KnownDevice)
@@ -308,39 +327,102 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	sb.WriteString(fmt.Sprintf("Case: id=%s title=%q sev=%s conf=%.0f%% status=%s events=%d\n",
 		c.CaseID[:8], c.Title, c.Severity, c.Confidence*100, c.Status, len(c.RelatedEventIDs)))
 
+	// ── Pass 1: collect per-event data ───────────────────────────────────────
 	ipSet := make(map[string]struct{})
+	type evtRow struct {
+		evtType  string
+		srcIP    string
+		dstIP    string
+		dstPort  int
+		proto    string
+		dstLabel string
+	}
+	var rows []evtRow
+
 	for _, evtID := range c.RelatedEventIDs {
 		evt, err := h.store.GetEvent(evtID)
 		if err != nil || evt == nil {
 			continue
 		}
 
-		evtTypesSeen[strings.ToLower(evt.EventType)]++
+		key := strings.ToLower(evt.EventType)
+		evtTypeCount[key]++
 
-		dstLabel := h.classifyDst(evt.DstIP, evt.EventType)
-		if dstLabel == "" {
+		// Classify destination.
+		dstLabel, isEdge := h.classifyDst(evt.DstIP, evt.EventType)
+		if !isEdge {
+			// wan_forward: check registry.
 			if dev, ok := deviceMap[evt.DstIP]; ok {
 				dstLabel = fmt.Sprintf("registry: label=%q trust=%s", dev.Label, dev.TrustLabel)
 				ts.dstInRegistry = true
-			} else {
+			} else if dstLabel == "" {
 				dstLabel = "unknown internal host"
+			}
+			ts.hasWANForward = true
+		}
+
+		if evt.DstPort > 0 {
+			if _, seen := portSet[evt.DstPort]; !seen {
+				portSet[evt.DstPort] = struct{}{}
+				portsSeen = append(portsSeen, fmt.Sprintf("%d", evt.DstPort))
 			}
 		}
 
-		sb.WriteString(fmt.Sprintf("  evt type=%s src=%s dst=%s [%s] dport=%d proto=%s\n",
-			evt.EventType, evt.SrcIP, evt.DstIP, dstLabel, evt.DstPort, evt.Protocol))
+		rows = append(rows, evtRow{
+			evtType:  evt.EventType,
+			srcIP:    evt.SrcIP,
+			dstIP:    evt.DstIP,
+			dstPort:  evt.DstPort,
+			proto:    evt.Protocol,
+			dstLabel: dstLabel,
+		})
 		if evt.SrcIP != "" {
 			ipSet[evt.SrcIP] = struct{}{}
 		}
 	}
 
-	// Determine dominant event type.
+	// ── Compute triage flags ─────────────────────────────────────────────────
 	total := 0
-	for _, n := range evtTypesSeen {
+	for _, n := range evtTypeCount {
 		total += n
 	}
-	if total > 0 && evtTypesSeen["wan_new_connection"] == total {
+	// isWANEdgeOnly only if every single event was wan_new_connection.
+	if total > 0 && evtTypeCount["wan_new_connection"] == total {
 		ts.isWANEdgeOnly = true
+	}
+
+	// Build human-readable triage summary strings.
+	var evtParts []string
+	for typ, n := range evtTypeCount {
+		evtParts = append(evtParts, fmt.Sprintf("%s (%d)", typ, n))
+	}
+	ts.evtSummary = strings.Join(evtParts, ", ")
+
+	if ts.isWANEdgeOnly {
+		ts.dstLabel = "WAN EDGE — gateway interface only"
+	} else if ts.hasWANForward && ts.dstInRegistry {
+		ts.dstLabel = "YES — registered internal device"
+	} else if ts.hasWANForward {
+		ts.dstLabel = "NO — unknown internal host"
+	} else {
+		ts.dstLabel = "MIXED — see event list below"
+	}
+
+	// ── Triage block (injected before event list so LLM sees it first) ───────
+	sb.WriteString(fmt.Sprintf(
+		"\nTriage:\n"+
+			"- Dst host in registry? [%s]\n"+
+			"- Event type(s)? [%s]\n"+
+			"- Ports targeted? [%s]\n",
+		ts.dstLabel,
+		ts.evtSummary,
+		strings.Join(portsSeen, ", "),
+	))
+
+	// ── Pass 2: write per-event lines ────────────────────────────────────────
+	for _, r := range rows {
+		sb.WriteString(fmt.Sprintf("  evt type=%s src=%s dst=%s [%s] dport=%d proto=%s\n",
+			r.evtType, r.srcIP, r.dstIP, r.dstLabel, r.dstPort, r.proto))
 	}
 
 	ips := make([]string, 0, len(ipSet))
@@ -348,13 +430,13 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		ips = append(ips, ip)
 	}
 
-	// ── Benign scanner check (before threat feed) ────────────────────────────
+	// ── Benign scanner check ─────────────────────────────────────────────────
 	if h.benignScanners != nil {
 		for _, ip := range ips {
 			if h.benignScanners.IsBenignScanner(ip) {
 				ts.isBenignScanner = true
 				sb.WriteString(fmt.Sprintf("\nBenign scanner detected: %s → known research scanner (Shodan/Censys/Shadowserver/similar)\n", ip))
-				break // one match is enough to demote the case
+				break
 			}
 		}
 	}
@@ -365,8 +447,7 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		if len(scores) > 0 {
 			sb.WriteString("\nThreat feed verdicts:\n")
 			for ip, s := range scores {
-				tag := s.Tag()
-				if tag != "" {
+				if tag := s.Tag(); tag != "" {
 					sb.WriteString(fmt.Sprintf("  %s → %s\n", ip, tag))
 				}
 				if s.IsConfirmedMalicious() || s.IsTorExit {
@@ -391,8 +472,7 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	return sb.String(), ts
 }
 
-// caseSrcIPs collects the unique external source IPs for a case without
-// performing any LLM or full context build — used by cmdCases for fast badge lookup.
+// caseSrcIPs collects unique source IPs for a case (fast, no LLM).
 func (h *Handler) caseSrcIPs(c *db.Case) []string {
 	seen := make(map[string]struct{})
 	for _, evtID := range c.RelatedEventIDs {
@@ -409,9 +489,6 @@ func (h *Handler) caseSrcIPs(c *db.Case) []string {
 	return out
 }
 
-// ipClassificationBadges runs ipinfo.Enrich on the given IPs and returns
-// a deduplicated, sorted slice of unique badge strings (e.g. "🚨 *KNOWN BAD*…").
-// Only non-empty badges are included; unknown/internal IPs are silently skipped.
 func ipClassificationBadges(ips []string) []string {
 	if len(ips) == 0 {
 		return nil
@@ -433,9 +510,6 @@ func ipClassificationBadges(ips []string) []string {
 	return badges
 }
 
-// cmdCases posts a rich Block Kit card per case — severity colour, ID, title,
-// confidence pill, event count, IP classification badges, and a Report button.
-// Fully deterministic — no LLM involved.
 func (h *Handler) cmdCases(channelID, userID string) {
 	cases, err := h.store.ListCases("", 10)
 	if err != nil || len(cases) == 0 {
@@ -443,7 +517,6 @@ func (h *Handler) cmdCases(channelID, userID string) {
 		return
 	}
 
-	// Count by severity for the header summary line.
 	counts := map[string]int{"high": 0, "medium": 0, "low": 0}
 	for _, c := range cases {
 		counts[strings.ToLower(c.Severity)]++
@@ -472,7 +545,6 @@ func (h *Handler) cmdCases(channelID, userID string) {
 		conf := int(c.Confidence * 100)
 		evtCount := len(c.RelatedEventIDs)
 
-		// Confidence pill: filled squares as a visual bar (max 5 squares).
 		filled := conf / 20
 		if filled > 5 {
 			filled = 5
@@ -480,7 +552,6 @@ func (h *Handler) cmdCases(channelID, userID string) {
 		bar := strings.Repeat("█", filled) + strings.Repeat("░", 5-filled)
 		confPill := fmt.Sprintf("`%s` %d%%", bar, conf)
 
-		// IP classification badges — enrich source IPs for this case.
 		srcIPs := h.caseSrcIPs(c)
 		badges := ipClassificationBadges(srcIPs)
 		badgeLine := ""
@@ -509,7 +580,6 @@ func (h *Handler) cmdCases(channelID, userID string) {
 		)
 	}
 
-	// Footer hint.
 	blocks = append(blocks,
 		slack.NewContextBlock("",
 			slack.NewTextBlockObject("mrkdwn",
@@ -702,12 +772,12 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		return
 	}
 
-	// Fast path: deterministic case-specific commands — no LLM involved.
+	// Fast path: deterministic case-specific commands.
 	if h.handleMentionCaseCommand(channelID, userID, clean) {
 		return
 	}
 
-	// Fast path: @ScanTrace cases — same rich card as /scantrace cases.
+	// Fast path: @ScanTrace cases.
 	if lower == "cases" {
 		h.cmdCases(channelID, userID)
 		return
@@ -733,13 +803,11 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 	h.postMessage(destChannel, "", answer)
 }
 
-// handleMentionCaseCommand handles mention patterns that target a specific case:
+// handleMentionCaseCommand handles:
 //
 //	@ScanTrace case <id>
 //	@ScanTrace report <id>
 //	@ScanTrace review case <id>
-//
-// Returns true if the command was recognised and handled (caller should return).
 func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool {
 	parts := strings.Fields(strings.ToLower(clean))
 	if len(parts) < 2 {
