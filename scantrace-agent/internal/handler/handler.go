@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Risen24x7/scantrace/internal/casebuilder"
 	"github.com/Risen24x7/scantrace/internal/db"
@@ -19,12 +20,12 @@ import (
 )
 
 type Handler struct {
-	api                  *slack.Client
-	store                *db.DB
-	alertChannel         string // sec-alerts — raw case alerts
+	api                   *slack.Client
+	store                 *db.DB
+	alertChannel          string // sec-alerts — raw case alerts
 	externalThreatChannel string // sec-intel-external — LLM mention responses
-	rts                  *rts.Client
-	llm                  *llm.Client
+	rts                   *rts.Client
+	llm                   *llm.Client
 
 	mu          sync.Mutex
 	caseThreads map[string]string
@@ -32,13 +33,13 @@ type Handler struct {
 
 func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel string, rtsClient *rts.Client, llmClient *llm.Client) *Handler {
 	return &Handler{
-		api:                  api,
-		store:                store,
-		alertChannel:         alertChannel,
+		api:                   api,
+		store:                 store,
+		alertChannel:          alertChannel,
 		externalThreatChannel: externalThreatChannel,
-		rts:                  rtsClient,
-		llm:                  llmClient,
-		caseThreads:          make(map[string]string),
+		rts:                   rtsClient,
+		llm:                   llmClient,
+		caseThreads:           make(map[string]string),
 	}
 }
 
@@ -96,6 +97,10 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 		h.cmdPostLatestAlert(cmd.ChannelID)
 	case "devices":
 		h.cmdDevices(cmd.ChannelID, cmd.UserID)
+	case "review-all":
+		h.cmdReviewAll(cmd.ChannelID, cmd.UserID)
+	case "next":
+		h.cmdNext(cmd.ChannelID, cmd.UserID)
 	case "mcp":
 		h.postEphemeral(cmd.ChannelID, cmd.UserID,
 			"*MCP Server* is running on `localhost:8765`\n"+
@@ -104,6 +109,145 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 	default:
 		h.postEphemeral(cmd.ChannelID, cmd.UserID, helpText())
 	}
+}
+
+// cmdReviewAll queues every open case and posts one LLM briefing per case to
+// sec-intel-external, with a 3-second gap between each post so the inference
+// worker isn't flooded and Slack doesn't rate-limit.
+func (h *Handler) cmdReviewAll(channelID, userID string) {
+	if h.llm == nil {
+		h.postEphemeral(channelID, userID, "LLM not configured.")
+		return
+	}
+	cases, err := h.store.ListCases("", 50)
+	if err != nil || len(cases) == 0 {
+		h.postEphemeral(channelID, userID, "No open cases found.")
+		return
+	}
+
+	dest := h.externalThreatChannel
+	h.postMessage(dest, "", fmt.Sprintf(
+		"_Queuing %d cases for review — posting one at a time…_", len(cases),
+	))
+
+	go func() {
+		for i, c := range cases {
+			ctx := h.buildSingleCaseContext(c)
+			prompt := fmt.Sprintf(
+				"Analyse this single case and provide a full briefing with recommended actions.\n\nCase ID: %s",
+				c.CaseID[:8],
+			)
+			answer, err := h.llm.AskCase(prompt, ctx)
+			if err != nil {
+				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
+				h.postMessage(dest, "", fmt.Sprintf(
+					"⚠️ Case %s — inference error: %v", c.CaseID[:8], err,
+				))
+			} else {
+				h.postMessage(dest, "", fmt.Sprintf(
+					"*Case %d/%d — %s*\n%s", i+1, len(cases), c.CaseID[:8], answer,
+				))
+			}
+			if i < len(cases)-1 {
+				time.Sleep(3 * time.Second)
+			}
+		}
+		h.postMessage(dest, "", fmt.Sprintf("_Review complete — %d cases processed._", len(cases)))
+	}()
+}
+
+// cmdNext pops the highest-priority open case (high → medium → low) and posts
+// a single full LLM briefing immediately.
+func (h *Handler) cmdNext(channelID, userID string) {
+	if h.llm == nil {
+		h.postEphemeral(channelID, userID, "LLM not configured.")
+		return
+	}
+
+	var target *db.Case
+	for _, sev := range []string{"high", "medium", "low"} {
+		cases, err := h.store.ListCases(sev, 1)
+		if err == nil && len(cases) > 0 {
+			target = cases[0]
+			break
+		}
+	}
+	if target == nil {
+		h.postEphemeral(channelID, userID, "No open cases found.")
+		return
+	}
+
+	dest := h.externalThreatChannel
+	h.postMessage(dest, "", fmt.Sprintf("_Briefing next case: %s %s…_",
+		severityEmoji(target.Severity), target.CaseID[:8]))
+
+	go func() {
+		ctx := h.buildSingleCaseContext(target)
+		prompt := fmt.Sprintf(
+			"Analyse this case and provide a full briefing with recommended actions.\n\nCase ID: %s",
+			target.CaseID[:8],
+		)
+		answer, err := h.llm.AskCase(prompt, ctx)
+		if err != nil {
+			log.Printf("[handler] next llm error case %s: %v", target.CaseID[:8], err)
+			h.postMessage(dest, "", fmt.Sprintf(
+				"⚠️ Case %s — inference error: %v", target.CaseID[:8], err,
+			))
+			return
+		}
+		h.postMessage(dest, "", fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
+	}()
+}
+
+// buildSingleCaseContext builds a focused context for one case only.
+// No event cap — passes all events and IP intel for this case alone.
+func (h *Handler) buildSingleCaseContext(c *db.Case) string {
+	var sb strings.Builder
+
+	// Known device context for IPs in this case.
+	devices, _ := h.store.ListKnownDevices("", 30)
+	if len(devices) > 0 {
+		sb.WriteString("Known devices:\n")
+		for _, d := range devices {
+			identifier := d.IP
+			if identifier == "" {
+				identifier = d.MAC
+			}
+			sb.WriteString(fmt.Sprintf("  %s trust=%s label=%q suppress=%v\n",
+				identifier, d.TrustLabel, d.Label, d.AutoSuppress))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString(fmt.Sprintf("Case: id=%s title=%q sev=%s conf=%.0f%% status=%s events=%d\n",
+		c.CaseID[:8], c.Title, c.Severity, c.Confidence*100, c.Status, len(c.RelatedEventIDs)))
+
+	ipSet := make(map[string]struct{})
+	for _, evtID := range c.RelatedEventIDs {
+		evt, err := h.store.GetEvent(evtID)
+		if err != nil || evt == nil {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("  evt type=%s src=%s dst=%s dport=%d proto=%s\n",
+			evt.EventType, evt.SrcIP, evt.DstIP, evt.DstPort, evt.Protocol))
+		if evt.SrcIP != "" {
+			ipSet[evt.SrcIP] = struct{}{}
+		}
+	}
+
+	if len(ipSet) > 0 {
+		ips := make([]string, 0, len(ipSet))
+		for ip := range ipSet {
+			ips = append(ips, ip)
+		}
+		enriched := ipinfo.Enrich(ips)
+		sb.WriteString("\nIP intel:\n")
+		for ip, info := range enriched {
+			sb.WriteString(fmt.Sprintf("  %s: %s\n", ip, info.Summary()))
+		}
+	}
+
+	return sb.String()
 }
 
 func (h *Handler) cmdCases(channelID, userID string) {
@@ -216,7 +360,6 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 
 	if existingThread != "" {
 		// Compact thread reply — no full briefing, no backtick case IDs.
-		// Derive the port and event count from the report summary if available.
 		port := extractFirstPort(report)
 		eventCount := len(c.RelatedEventIDs)
 		var update string
@@ -318,10 +461,7 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		return
 	}
 
-	// Post thinking indicator and LLM response to sec-intel-external,
-	// not sec-alerts — keeps the alert channel clean.
 	destChannel := h.externalThreatChannel
-
 	h.postMessage(destChannel, "", "_Thinking…_")
 
 	ctx := h.buildLLMContext()
@@ -336,7 +476,7 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 	h.postMessage(destChannel, "", answer)
 }
 
-// buildLLMContext assembles a compact snapshot for the LLM.
+// buildLLMContext assembles a compact snapshot for general @mention queries.
 // Limits: 10 cases, 5 events/case, 20 IPs for enrichment.
 func (h *Handler) buildLLMContext() string {
 	var sb strings.Builder
@@ -516,6 +656,8 @@ Available commands:
 • ` + "`/scantrace report <case-id>`" + ` — full case report
 • ` + "`/scantrace alert`" + ` — post latest high-severity case to alerts channel
 • ` + "`/scantrace devices`" + ` — show known device registry
+• ` + "`/scantrace review-all`" + ` — queue all open cases for individual LLM briefings (posted to sec-intel-external)
+• ` + "`/scantrace next`" + ` — briefing for the single highest-priority open case
 • ` + "`/scantrace mcp`" + ` — MCP server status
 • ` + "`/scantrace help`" + ` — this message
 
