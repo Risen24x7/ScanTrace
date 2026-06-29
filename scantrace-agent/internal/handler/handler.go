@@ -10,6 +10,7 @@ import (
 
 	"github.com/Risen24x7/scantrace/internal/casebuilder"
 	"github.com/Risen24x7/scantrace/internal/db"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/ipinfo"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/slack-go/slack"
@@ -318,6 +319,9 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 	h.postMessage(channelID, "", answer)
 }
 
+// buildLLMContext assembles a text snapshot of current cases and device registry
+// for injection into the LLM system prompt. It also enriches unique external
+// source IPs with real WHOIS/ASN data via ip-api.com.
 func (h *Handler) buildLLMContext() string {
 	var sb strings.Builder
 
@@ -345,6 +349,9 @@ func (h *Handler) buildLLMContext() string {
 	}
 	sb.WriteString(fmt.Sprintf("Total cases: %d\n\nRecent cases (newest first):\n", len(cases)))
 
+	// Collect unique external source IPs for bulk enrichment.
+	ipSet := make(map[string]struct{})
+
 	for _, c := range cases {
 		sb.WriteString(fmt.Sprintf(
 			"\nCase id=%s severity=%s confidence=%.0f%% status=%s title=%q\n",
@@ -371,6 +378,7 @@ func (h *Handler) buildLLMContext() string {
 				parts = append(parts, fmt.Sprintf("source=%s", evt.SourceType))
 				if evt.SrcIP != "" {
 					parts = append(parts, fmt.Sprintf("src=%s", evt.SrcIP))
+					ipSet[evt.SrcIP] = struct{}{}
 					if dev, _ := h.store.GetKnownDeviceByIP(evt.SrcIP); dev != nil {
 						parts = append(parts, fmt.Sprintf("[trust=%s label=%q]", dev.TrustLabel, dev.Label))
 					}
@@ -400,6 +408,19 @@ func (h *Handler) buildLLMContext() string {
 					))
 				}
 			}
+		}
+	}
+
+	// Bulk-enrich unique source IPs and append intel section.
+	if len(ipSet) > 0 {
+		ips := make([]string, 0, len(ipSet))
+		for ip := range ipSet {
+			ips = append(ips, ip)
+		}
+		enriched := ipinfo.Enrich(ips)
+		sb.WriteString("\nIP intelligence (via ip-api.com):\n")
+		for ip, info := range enriched {
+			sb.WriteString(fmt.Sprintf("  %s: %s\n", ip, info.Summary()))
 		}
 	}
 
