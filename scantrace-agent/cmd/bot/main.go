@@ -13,7 +13,7 @@
 //   EXTERNAL_THREAT_CHANNEL   Slack channel ID where external threat work is done;
 //                             @mention LLM responses are posted here (default: ALERT_CHANNEL)
 //   MCP_ADDR                  MCP HTTP listen addr   (default: :8765)
-//   LLM_BASE_URL              Ollama endpoint        (default: http://192.168.50.250:11434)
+//   LLM_BASE_URL              llama.cpp endpoint    (default: http://192.168.50.250:11434)
 //   LLM_MODEL                 model name
 package main
 
