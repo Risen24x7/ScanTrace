@@ -25,8 +25,6 @@ type Handler struct {
 	rts          *rts.Client
 	llm          *llm.Client
 
-	// caseThreads maps case ID → Slack thread_ts so repeat alerts
-	// for the same case get posted as thread replies, not new messages.
 	mu          sync.Mutex
 	caseThreads map[string]string
 }
@@ -42,7 +40,6 @@ func New(api *slack.Client, store *db.DB, alertChannel string, rtsClient *rts.Cl
 	}
 }
 
-// Dispatch routes incoming Socket Mode events.
 func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 	switch evt.Type {
 	case socketmode.EventTypeConnecting:
@@ -50,7 +47,6 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 	case socketmode.EventTypeConnected:
 		log.Println("[handler] connected to Dilldozer ✓")
 		go h.subscribeRTS()
-
 	case socketmode.EventTypeSlashCommand:
 		cmd, ok := evt.Data.(slack.SlashCommand)
 		if !ok {
@@ -59,7 +55,6 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 		}
 		client.Ack(*evt.Request)
 		h.handleSlashCommand(cmd)
-
 	case socketmode.EventTypeEventsAPI:
 		eventsAPI, ok := evt.Data.(slackevents.EventsAPIEvent)
 		if !ok {
@@ -68,9 +63,6 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 		}
 		client.Ack(*evt.Request)
 		h.handleEvent(eventsAPI)
-
-	default:
-		// ignore heartbeats and unknown types
 	}
 }
 
@@ -209,8 +201,6 @@ func (h *Handler) cmdPostLatestAlert(cmdChannelID string) {
 	h.PostCaseAlert(cases[0])
 }
 
-// PostCaseAlert posts a new Slack message for a new case, or a thread reply
-// if we already posted a top-level message for the same case ID.
 func (h *Handler) PostCaseAlert(c *db.Case) {
 	builder := casebuilder.New(h.store)
 	report, err := builder.BuildReport(c.CaseID)
@@ -223,7 +213,6 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 	h.mu.Unlock()
 
 	if existingThread != "" {
-		// Already posted for this case — reply in the thread.
 		update := fmt.Sprintf("🔄 *Case `%s` updated* — %s (%.0f%% confidence)",
 			c.CaseID[:8], c.Title, c.Confidence*100)
 		h.postMessage(h.alertChannel, existingThread, update)
@@ -231,7 +220,6 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 		return
 	}
 
-	// New case — post top-level message.
 	blocks, err := blocksFromRaw(report.SlackBlock())
 	var ts string
 	if err != nil {
@@ -247,7 +235,6 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 			slack.MsgOptionBlocks(blocks...),
 		)
 	}
-
 	if err != nil {
 		log.Printf("[handler] PostMessage error for case %s: %v", c.CaseID[:8], err)
 		return
@@ -288,9 +275,6 @@ func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 	}
 }
 
-// handleMention routes all natural-language @mentions directly to the LLM.
-// Slash commands (/scantrace cases, /scantrace report, etc.) retain direct
-// shortcuts. Only empty messages and "help" short-circuit here.
 func (h *Handler) handleMention(channelID, userID, text string) {
 	clean := strings.TrimSpace(mentionRE(text))
 	lower := strings.ToLower(clean)
@@ -299,7 +283,6 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		h.postEphemeral(channelID, userID, helpText())
 		return
 	}
-
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured. Use `/scantrace help` for available commands.")
 		return
@@ -319,106 +302,68 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 	h.postMessage(channelID, "", answer)
 }
 
-// buildLLMContext assembles a text snapshot of current cases and device registry
-// for injection into the LLM system prompt. It also enriches unique external
-// source IPs with real WHOIS/ASN data via ip-api.com.
+// buildLLMContext assembles a compact snapshot for the LLM.
+// Limits: 10 cases, 5 events/case, 20 IPs for enrichment.
 func (h *Handler) buildLLMContext() string {
 	var sb strings.Builder
 
-	devices, _ := h.store.ListKnownDevices("", 50)
+	devices, _ := h.store.ListKnownDevices("", 30)
 	if len(devices) > 0 {
-		sb.WriteString(fmt.Sprintf("Known device registry (%d entries):\n", len(devices)))
+		sb.WriteString(fmt.Sprintf("Known devices (%d):\n", len(devices)))
 		for _, d := range devices {
 			identifier := d.IP
 			if identifier == "" {
 				identifier = d.MAC
 			}
-			sb.WriteString(fmt.Sprintf(
-				"  %s trust=%s label=%q zone=%s suppress=%v last_seen=%s\n",
-				identifier, d.TrustLabel, d.Label, d.NetworkZone,
-				d.AutoSuppress, d.LastSeen.Format("2006-01-02 15:04"),
-			))
+			sb.WriteString(fmt.Sprintf("  %s trust=%s label=%q suppress=%v\n",
+				identifier, d.TrustLabel, d.Label, d.AutoSuppress))
 		}
 		sb.WriteString("\n")
 	}
 
-	cases, err := h.store.ListCases("", 20)
+	cases, err := h.store.ListCases("", 10)
 	if err != nil || len(cases) == 0 {
-		sb.WriteString("No cases in database.\n")
+		sb.WriteString("No cases.\n")
 		return sb.String()
 	}
-	sb.WriteString(fmt.Sprintf("Total cases: %d\n\nRecent cases (newest first):\n", len(cases)))
+	sb.WriteString(fmt.Sprintf("Cases (%d):\n", len(cases)))
 
-	// Collect unique external source IPs for bulk enrichment.
 	ipSet := make(map[string]struct{})
 
 	for _, c := range cases {
-		sb.WriteString(fmt.Sprintf(
-			"\nCase id=%s severity=%s confidence=%.0f%% status=%s title=%q\n",
-			c.CaseID[:8], c.Severity, c.Confidence*100, c.Status, c.Title,
-		))
-		if c.Summary != "" {
-			sb.WriteString(fmt.Sprintf("  summary: %s\n", c.Summary))
-		}
+		sb.WriteString(fmt.Sprintf("%s id=%s sev=%s conf=%.0f%% status=%s\n",
+			c.Title, c.CaseID[:8], c.Severity, c.Confidence*100, c.Status))
 
-		const maxEvents = 10
-		if len(c.RelatedEventIDs) > 0 {
-			sb.WriteString("  events:\n")
-			for i, evtID := range c.RelatedEventIDs {
-				if i >= maxEvents {
-					sb.WriteString(fmt.Sprintf("    … and %d more\n", len(c.RelatedEventIDs)-maxEvents))
-					break
-				}
-				evt, err := h.store.GetEvent(evtID)
-				if err != nil || evt == nil {
-					continue
-				}
-				var parts []string
-				parts = append(parts, fmt.Sprintf("type=%s", evt.EventType))
-				parts = append(parts, fmt.Sprintf("source=%s", evt.SourceType))
-				if evt.SrcIP != "" {
-					parts = append(parts, fmt.Sprintf("src=%s", evt.SrcIP))
-					ipSet[evt.SrcIP] = struct{}{}
-					if dev, _ := h.store.GetKnownDeviceByIP(evt.SrcIP); dev != nil {
-						parts = append(parts, fmt.Sprintf("[trust=%s label=%q]", dev.TrustLabel, dev.Label))
-					}
-				}
-				if evt.DstIP != "" {
-					parts = append(parts, fmt.Sprintf("dst=%s", evt.DstIP))
-				}
-				if evt.DstPort > 0 {
-					parts = append(parts, fmt.Sprintf("dport=%d", evt.DstPort))
-				}
-				if evt.Protocol != "" {
-					parts = append(parts, fmt.Sprintf("proto=%s", evt.Protocol))
-				}
-				parts = append(parts, fmt.Sprintf("ts=%s", evt.Timestamp.Format("2006-01-02 15:04")))
-				sb.WriteString(fmt.Sprintf("    - %s\n", strings.Join(parts, " ")))
+		const maxEvents = 5
+		for i, evtID := range c.RelatedEventIDs {
+			if i >= maxEvents {
+				sb.WriteString(fmt.Sprintf("  +%d more events\n", len(c.RelatedEventIDs)-maxEvents))
+				break
 			}
-		}
-
-		if len(c.RelatedEntityIDs) > 0 {
-			entities, err := h.store.GetEntitiesForCase(c.CaseID)
-			if err == nil && len(entities) > 0 {
-				sb.WriteString("  entities:\n")
-				for _, en := range entities {
-					sb.WriteString(fmt.Sprintf(
-						"    - ip=%s type=%s asn=%s provider=%s country=%s rdns=%s\n",
-						en.IP, en.EntityType, en.ASN, en.Provider, en.GeoCountry, en.RDNS,
-					))
-				}
+			evt, err := h.store.GetEvent(evtID)
+			if err != nil || evt == nil {
+				continue
 			}
+			line := fmt.Sprintf("  evt type=%s src=%s dst=%s dport=%d proto=%s",
+				evt.EventType, evt.SrcIP, evt.DstIP, evt.DstPort, evt.Protocol)
+			if evt.SrcIP != "" {
+				ipSet[evt.SrcIP] = struct{}{}
+			}
+			sb.WriteString(line + "\n")
 		}
 	}
 
-	// Bulk-enrich unique source IPs and append intel section.
+	// Enrich up to 20 unique external IPs.
 	if len(ipSet) > 0 {
 		ips := make([]string, 0, len(ipSet))
 		for ip := range ipSet {
+			if len(ips) >= 20 {
+				break
+			}
 			ips = append(ips, ip)
 		}
 		enriched := ipinfo.Enrich(ips)
-		sb.WriteString("\nIP intelligence (via ip-api.com):\n")
+		sb.WriteString("\nIP intel:\n")
 		for ip, info := range enriched {
 			sb.WriteString(fmt.Sprintf("  %s: %s\n", ip, info.Summary()))
 		}
@@ -457,7 +402,6 @@ func (h *Handler) cmdHighSeverity(channelID, userID string) {
 	})
 }
 
-// postMessage sends plain text; if threadTS is non-empty, sends as a thread reply.
 func (h *Handler) postMessage(channelID, threadTS, text string) {
 	opts := []slack.MsgOption{
 		slack.MsgOptionText(text, false),
@@ -481,7 +425,6 @@ func (h *Handler) postEphemeral(channelID, userID, text string) {
 	}
 }
 
-// postBlocks sends Block Kit; if threadTS is non-empty, sends as a thread reply.
 func (h *Handler) postBlocks(channelID, threadTS string, blocks []slack.Block) {
 	opts := []slack.MsgOption{slack.MsgOptionBlocks(blocks...)}
 	if threadTS != "" {
@@ -493,8 +436,6 @@ func (h *Handler) postBlocks(channelID, threadTS string, blocks []slack.Block) {
 	}
 }
 
-// blocksFromRaw converts the raw map from report.SlackBlock() into typed slack.Block objects.
-// Uses JSON round-trip to avoid fragile type assertions on interface{} maps.
 func blocksFromRaw(raw map[string]interface{}) ([]slack.Block, error) {
 	data, err := json.Marshal(raw)
 	if err != nil {
