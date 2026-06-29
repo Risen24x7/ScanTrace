@@ -105,7 +105,9 @@ Fill every TRIAGE field with a concrete answer from the context data.
 - *Plausible legitimate explanation?* [state one if it exists, or NONE]
 
 *Summary*
-One sentence verdict: what is happening and whether it is LIKELY BENIGN, NEEDS INVESTIGATION, or LIKELY MALICIOUS. Base this on the triage answers above.
+First token MUST be one of: [VERDICT: LIKELY BENIGN] [VERDICT: NEEDS INVESTIGATION] [VERDICT: LIKELY MALICIOUS]
+Follow immediately with one sentence explaining what is happening. Example:
+[VERDICT: LIKELY MALICIOUS] Repeated inbound HTTPS traffic forwarded to an unregistered internal host from a known VPN/hosting ASN with no legitimate explanation.
 
 *Details*
 - Source: IP, org, country, ASN, hosting/proxy flags
