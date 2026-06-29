@@ -562,6 +562,12 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		h.postEphemeral(channelID, userID, helpText())
 		return
 	}
+
+	// Fast path: deterministic case-specific commands — no LLM involved.
+	if h.handleMentionCaseCommand(channelID, userID, clean) {
+		return
+	}
+
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured. Use `/scantrace help` for available commands.")
 		return
@@ -580,6 +586,81 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		return
 	}
 	h.postMessage(destChannel, "", answer)
+}
+
+// handleMentionCaseCommand handles mention patterns that target a specific case:
+//
+//	@ScanTrace case <id>
+//	@ScanTrace report <id>
+//	@ScanTrace review case <id>
+//
+// Returns true if the command was recognised and handled (caller should return).
+func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool {
+	parts := strings.Fields(strings.ToLower(clean))
+	if len(parts) < 2 {
+		return false
+	}
+
+	// Extract the raw parts preserving original case for the ID lookup.
+	rawParts := strings.Fields(clean)
+
+	var caseIDPrefix string
+	switch parts[0] {
+	case "case", "report":
+		caseIDPrefix = rawParts[1]
+	case "review":
+		if len(parts) >= 3 && parts[1] == "case" {
+			caseIDPrefix = rawParts[2]
+		} else {
+			return false
+		}
+	default:
+		return false
+	}
+
+	// Resolve the case by prefix.
+	cases, _ := h.store.ListCases("", 50)
+	var target *db.Case
+	for _, c := range cases {
+		if strings.HasPrefix(strings.ToLower(c.CaseID), strings.ToLower(caseIDPrefix)) {
+			target = c
+			break
+		}
+	}
+	if target == nil {
+		h.postMessage(channelID, "", fmt.Sprintf(
+			"Case `%s` not found. Try `/scantrace cases` to list active cases.", caseIDPrefix,
+		))
+		return true
+	}
+
+	if h.llm == nil {
+		h.postMessage(channelID, "", "LLM not configured.")
+		return true
+	}
+
+	h.postMessage(channelID, "", fmt.Sprintf("_Briefing case: %s %s…_",
+		severityEmoji(target.Severity), target.CaseID[:8]))
+
+	go func() {
+		ctx, triage := h.buildSingleCaseContext(target)
+		actionPlan := selectActionPlan(triage)
+		prompt := fmt.Sprintf(
+			"Analyse this case and provide a full briefing.\n\nCase ID: %s",
+			target.CaseID[:8],
+		)
+		answer, err := h.llm.AskCase(prompt, ctx, actionPlan)
+		if err != nil {
+			log.Printf("[handler] mention case llm error %s: %v", target.CaseID[:8], err)
+			h.postMessage(channelID, "", fmt.Sprintf(
+				"⚠️ Case %s — inference error: %v", target.CaseID[:8], err,
+			))
+			return
+		}
+		h.postMessage(channelID, "", fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
+	}()
+
+	return true
 }
 
 func (h *Handler) buildLLMContext() string {
@@ -756,6 +837,11 @@ Available commands:
 • ` + "`/scantrace mcp`" + ` — MCP server status
 • ` + "`/scantrace help`" + ` — this message
 
-You can also @mention ScanTrace with any natural language security question.
-Example: _@ScanTrace review all open cases and advise on course of action_`
+You can also @mention ScanTrace with a specific case or any natural language question:
+• ` + "`@ScanTrace case <id>`" + ` — full briefing for a specific case
+• ` + "`@ScanTrace report <id>`" + ` — alias for case briefing
+• ` + "`@ScanTrace review case <id>`" + ` — alias for case briefing
+• ` + "`@ScanTrace <any question>`" + ` — natural language security analysis
+
+Example: _@ScanTrace case 7f3a21c9_`
 }
