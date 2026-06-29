@@ -62,28 +62,24 @@ type triageState struct {
 func selectActionPlan(ts triageState) string {
 	switch {
 	case ts.logsConfirmMalicious:
-		// Condition D — confirmed malicious activity
 		return "*Recommended Actions*\nCondition Matched: D — host verified, logs confirm malicious activity\n" +
 			"- Block the source IP or subnet at the gateway firewall.\n" +
 			"- Close or restrict the targeted port if no external access is required.\n" +
 			"- Escalate to a human analyst if the internal host shows signs of compromise."
 
 	case ts.isWANEdgeOnly:
-		// Condition A — traffic hit WAN edge only, never reached LAN
 		return "*Recommended Actions*\nCondition Matched: A — wan_new_connection (WAN edge only, never reached LAN)\n" +
 			"- Traffic hit the WAN interface only and was not forwarded. No internal host is at risk.\n" +
 			"- If the port is not intentionally exposed, consider closing it at the gateway to reduce noise.\n" +
 			"- No urgent action required unless volume is significant or ports are highly sensitive (22, 3389)."
 
 	case !ts.dstInRegistry:
-		// Condition B — dst is an unknown internal host, traffic forwarded
 		return "*Recommended Actions*\nCondition Matched: B — unknown internal host, wan_forward traffic landed\n" +
 			"- Identify the device at the destination IP — run arp-scan or check DHCP leases before any other step.\n" +
 			"- Once identified, check its app/proxy logs for requests matching these event timestamps.\n" +
 			"- If no legitimate service found, remove or restrict the port-forwarding rule at the gateway."
 
 	default:
-		// Condition C — dst is known in registry, traffic forwarded
 		return "*Recommended Actions*\nCondition Matched: C — registered host, wan_forward traffic landed\n" +
 			"- Check app/proxy logs on the destination host for requests matching these timestamps.\n" +
 			"- If no matching legitimate requests, restrict or remove the port-forwarding rule.\n" +
@@ -338,8 +334,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 				if tag != "" {
 					sb.WriteString(fmt.Sprintf("  %s → %s\n", ip, tag))
 				}
-				// Elevate triage state: any confirmed-malicious or Tor source
-				// flips Condition D so the action plan escalates.
 				if s.IsConfirmedMalicious() || s.IsTorExit {
 					ts.logsConfirmMalicious = true
 				}
@@ -359,26 +353,82 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	return sb.String(), ts
 }
 
+// cmdCases posts a rich Block Kit card per case — severity colour, ID, title,
+// confidence pill, event count, and a Report button. Fully deterministic.
 func (h *Handler) cmdCases(channelID, userID string) {
 	cases, err := h.store.ListCases("", 10)
 	if err != nil || len(cases) == 0 {
 		h.postEphemeral(channelID, userID, "No cases found.")
 		return
 	}
-	var lines []string
+
+	// Count by severity for the header summary line.
+	counts := map[string]int{"high": 0, "medium": 0, "low": 0}
 	for _, c := range cases {
-		emoji := severityEmoji(c.Severity)
-		lines = append(lines, fmt.Sprintf("%s %s *%s* — %s (%.0f%%)",
-			emoji, c.CaseID[:8], strings.ToUpper(c.Severity), c.Title, c.Confidence*100))
+		counts[strings.ToLower(c.Severity)]++
 	}
+
+	headerText := fmt.Sprintf(
+		"🔍  *ScanTrace — Active Cases*   %s %d HIGH  %s %d MED  %s %d LOW",
+		"🔴", counts["high"], "🟡", counts["medium"], "🟢", counts["low"],
+	)
+
 	blocks := []slack.Block{
-		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "🔍 ScanTrace Cases", false, false)),
-		slack.NewDividerBlock(),
+		slack.NewHeaderBlock(
+			slack.NewTextBlockObject("plain_text", "ScanTrace — Active Cases", false, false),
+		),
 		slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", strings.Join(lines, "\n"), false, false),
+			slack.NewTextBlockObject("mrkdwn", headerText, false, false),
 			nil, nil,
 		),
+		slack.NewDividerBlock(),
 	}
+
+	for _, c := range cases {
+		sev := strings.ToUpper(c.Severity)
+		emoji := severityEmoji(c.Severity)
+		shortID := c.CaseID[:8]
+		conf := int(c.Confidence * 100)
+		evtCount := len(c.RelatedEventIDs)
+
+		// Confidence pill: filled squares as a visual bar (max 5 squares).
+		filled := conf / 20
+		if filled > 5 {
+			filled = 5
+		}
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", 5-filled)
+		confPill := fmt.Sprintf("`%s` %d%%", bar, conf)
+
+		caseText := fmt.Sprintf(
+			"%s  *[%s]* `%s`\n>%s\n>Confidence: %s   Events: *%d*",
+			emoji, sev, shortID, c.Title, confPill, evtCount,
+		)
+
+		reportBtn := slack.NewButtonBlockElement(
+			"scantrace_report_"+shortID,
+			shortID,
+			slack.NewTextBlockObject("plain_text", "📋 Report", false, false),
+		)
+
+		blocks = append(blocks,
+			slack.NewSectionBlock(
+				slack.NewTextBlockObject("mrkdwn", caseText, false, false),
+				nil,
+				slack.NewAccessory(reportBtn),
+			),
+			slack.NewDividerBlock(),
+		)
+	}
+
+	// Footer hint.
+	blocks = append(blocks,
+		slack.NewContextBlock("",
+			slack.NewTextBlockObject("mrkdwn",
+				"Use `/scantrace report <id>` or `@ScanTrace case <id>` for a full briefing",
+				false, false),
+		),
+	)
+
 	h.postBlocks(channelID, "", blocks)
 }
 
@@ -568,6 +618,12 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		return
 	}
 
+	// Fast path: @ScanTrace cases — same rich card as /scantrace cases.
+	if lower == "cases" {
+		h.cmdCases(channelID, userID)
+		return
+	}
+
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured. Use `/scantrace help` for available commands.")
 		return
@@ -601,7 +657,6 @@ func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool
 		return false
 	}
 
-	// Extract the raw parts preserving original case for the ID lookup.
 	rawParts := strings.Fields(clean)
 
 	var caseIDPrefix string
@@ -618,7 +673,6 @@ func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool
 		return false
 	}
 
-	// Resolve the case by prefix.
 	cases, _ := h.store.ListCases("", 50)
 	var target *db.Case
 	for _, c := range cases {
@@ -720,7 +774,6 @@ func (h *Handler) buildLLMContext() string {
 			}
 			ips = append(ips, ip)
 		}
-		// Threat feed verdicts in general LLM context
 		if h.threat != nil {
 			scores := h.threat.LookupMany(ips)
 			if len(scores) > 0 {
@@ -838,6 +891,7 @@ Available commands:
 • ` + "`/scantrace help`" + ` — this message
 
 You can also @mention ScanTrace with a specific case or any natural language question:
+• ` + "`@ScanTrace cases`" + ` — same rich case list
 • ` + "`@ScanTrace case <id>`" + ` — full briefing for a specific case
 • ` + "`@ScanTrace report <id>`" + ` — alias for case briefing
 • ` + "`@ScanTrace review case <id>`" + ` — alias for case briefing
