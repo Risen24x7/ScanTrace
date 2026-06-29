@@ -48,8 +48,9 @@ const (
 
 // Score holds the result of a threat-feed lookup for a single IP.
 type Score struct {
-	IPSumScore int  // 0 = not listed; >=MaliciousThreshold = confirmed malicious
-	IsTorExit  bool // true if the IP is an active Tor exit node
+	IPSumScore      int  // 0 = not listed; >=MaliciousThreshold = confirmed malicious
+	IsTorExit       bool // true if the IP is an active Tor exit node
+	IsBenignScanner bool // true if the IP belongs to a known research scanner (Shodan, Censys, etc.)
 }
 
 // Tier returns the IPSum consensus tier for this score.
@@ -72,7 +73,18 @@ func (s Score) IsConfirmedMalicious() bool {
 }
 
 // Tag returns a short human-readable label for use in triage context.
+// Benign scanner detection takes precedence over IPSum tiers — a known
+// research scanner hitting the feed is normal internet behaviour, not an
+// active threat, even if it appears in some blocklists.
 func (s Score) Tag() string {
+	// Benign scanner overrides all other tags — these are expected sources.
+	if s.IsBenignScanner {
+		if s.IPSumScore >= MaliciousThreshold {
+			return "🔬 BENIGN SCANNER — known research scanner (IPSum score: " + itoa(s.IPSumScore) + "/30 — expected, demote to LOW)"
+		}
+		return "🔬 BENIGN SCANNER — known research scanner (Shodan / Censys / Shadowserver — demote to LOW)"
+	}
+
 	switch {
 	case s.IPSumScore >= BlacklistThreshold && s.IsTorExit:
 		return "☠️ UNIVERSALLY BLACKLISTED + TOR EXIT (IPSum score: " + itoa(s.IPSumScore) + "/30 feeds)"
@@ -104,9 +116,11 @@ type Enricher struct {
 	mu       sync.RWMutex
 	ipsum    map[string]int  // ip -> score
 	torExits map[string]bool // ip -> true
+
+	benign *BenignScanners // known research scanner registry
 }
 
-// New creates an Enricher, loads both feed files immediately, and starts the
+// New creates an Enricher, loads all feed files immediately, and starts the
 // background reload ticker. Missing files are logged as warnings, not errors.
 func New(ipSumPath, torExitPath string) *Enricher {
 	if ipSumPath == "" {
@@ -120,6 +134,7 @@ func New(ipSumPath, torExitPath string) *Enricher {
 		torExitPath: torExitPath,
 		ipsum:       make(map[string]int),
 		torExits:    make(map[string]bool),
+		benign:      NewBenignScanners(""), // loads defaults + /opt/scantrace/benign-scanners.txt
 	}
 	e.reload()
 	go e.reloadLoop()
@@ -131,23 +146,26 @@ func (e *Enricher) Lookup(ip string) Score {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return Score{
-		IPSumScore: e.ipsum[ip],
-		IsTorExit:  e.torExits[ip],
+		IPSumScore:      e.ipsum[ip],
+		IsTorExit:       e.torExits[ip],
+		IsBenignScanner: e.benign.IsBenignScanner(ip),
 	}
 }
 
 // LookupMany returns scores for a slice of IPs. Only IPs with a non-zero score
-// are included in the result map.
+// or a positive flag are included in the result map.
 func (e *Enricher) LookupMany(ips []string) map[string]Score {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	out := make(map[string]Score, len(ips))
 	for _, ip := range ips {
+		isBenign := e.benign.IsBenignScanner(ip)
 		s := Score{
-			IPSumScore: e.ipsum[ip],
-			IsTorExit:  e.torExits[ip],
+			IPSumScore:      e.ipsum[ip],
+			IsTorExit:       e.torExits[ip],
+			IsBenignScanner: isBenign,
 		}
-		if s.IPSumScore > 0 || s.IsTorExit {
+		if s.IPSumScore > 0 || s.IsTorExit || s.IsBenignScanner {
 			out[ip] = s
 		}
 	}
