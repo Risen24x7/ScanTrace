@@ -14,6 +14,7 @@ import (
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/ipinfo"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/threat"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -27,6 +28,7 @@ type Handler struct {
 	wanIP                 string // public WAN IP of the gateway
 	rts                   *rts.Client
 	llm                   *llm.Client
+	threat                *threat.Enricher
 
 	mu          sync.Mutex
 	caseThreads map[string]string
@@ -41,6 +43,7 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 		wanIP:                 wanIP,
 		rts:                   rtsClient,
 		llm:                   llmClient,
+		threat:                threat.New("", ""), // uses default /opt/scantrace paths
 		caseThreads:           make(map[string]string),
 	}
 }
@@ -48,9 +51,9 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 // triageState captures the facts Go already knows so we can pre-select the
 // correct action plan before the LLM prompt is assembled.
 type triageState struct {
-	isWANEdgeOnly       bool // all events are wan_new_connection
-	dstInRegistry       bool // at least one dst IP found in device registry
-	logsConfirmMalicious bool // reserved: set by future signal/enrichment layer
+	isWANEdgeOnly        bool // all events are wan_new_connection
+	dstInRegistry        bool // at least one dst IP found in device registry
+	logsConfirmMalicious bool // set by threat-feed lookup (IPSum or Tor exit)
 }
 
 // selectActionPlan converts the pre-evaluated triage state into a single
@@ -262,7 +265,7 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	var sb strings.Builder
 	var ts triageState
 
-	evtTypesSeen := make(map[string]int) // count event types to determine dominance
+	evtTypesSeen := make(map[string]int)
 
 	devices, _ := h.store.ListKnownDevices("", 30)
 	deviceMap := make(map[string]*db.KnownDevice)
@@ -311,8 +314,7 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		}
 	}
 
-	// Determine dominant event type: if ALL events are wan_new_connection the
-	// traffic never reached the LAN.
+	// Determine dominant event type.
 	total := 0
 	for _, n := range evtTypesSeen {
 		total += n
@@ -321,11 +323,32 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		ts.isWANEdgeOnly = true
 	}
 
-	if len(ipSet) > 0 {
-		ips := make([]string, 0, len(ipSet))
-		for ip := range ipSet {
-			ips = append(ips, ip)
+	// ── Threat-feed enrichment ───────────────────────────────────────────────
+	ips := make([]string, 0, len(ipSet))
+	for ip := range ipSet {
+		ips = append(ips, ip)
+	}
+
+	if h.threat != nil && len(ips) > 0 {
+		scores := h.threat.LookupMany(ips)
+		if len(scores) > 0 {
+			sb.WriteString("\nThreat feed verdicts:\n")
+			for ip, s := range scores {
+				tag := s.Tag()
+				if tag != "" {
+					sb.WriteString(fmt.Sprintf("  %s → %s\n", ip, tag))
+				}
+				// Elevate triage state: any confirmed-malicious or Tor source
+				// flips Condition D so the action plan escalates.
+				if s.IsConfirmedMalicious() || s.IsTorExit {
+					ts.logsConfirmMalicious = true
+				}
+			}
 		}
+	}
+
+	// ── IPInfo geo/ASN enrichment ────────────────────────────────────────────
+	if len(ips) > 0 {
 		enriched := ipinfo.Enrich(ips)
 		sb.WriteString("\nIP intel:\n")
 		for ip, info := range enriched {
@@ -615,6 +638,18 @@ func (h *Handler) buildLLMContext() string {
 				break
 			}
 			ips = append(ips, ip)
+		}
+		// Threat feed verdicts in general LLM context
+		if h.threat != nil {
+			scores := h.threat.LookupMany(ips)
+			if len(scores) > 0 {
+				sb.WriteString("\nThreat feed verdicts:\n")
+				for ip, s := range scores {
+					if tag := s.Tag(); tag != "" {
+						sb.WriteString(fmt.Sprintf("  %s → %s\n", ip, tag))
+					}
+				}
+			}
 		}
 		enriched := ipinfo.Enrich(ips)
 		sb.WriteString("\nIP intel:\n")
