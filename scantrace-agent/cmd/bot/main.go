@@ -1,9 +1,5 @@
 // ScanTrace Slack Bot — Dead Reckoning Edition
 //
-// Single-process daemon: runs the Slack socket-mode bot, MCP server, live
-// UDP syslog listener, and periodic correlator loop in one binary.
-// The separate `scantrace serve` command is no longer needed.
-//
 // Required env vars:
 //   SLACK_BOT_TOKEN      xoxb-...  (Bot token from OAuth)
 //   SLACK_APP_TOKEN      xapp-...  (App-level token for Socket Mode)
@@ -13,10 +9,10 @@
 //   SCANTRACE_ASUS_STATE      Asus sensor-id file    (default: .asus-sensor-id)
 //   SCANTRACE_SYSLOG_PORT     UDP syslog port        (default: 5140)
 //   CORRELATE_INTERVAL        correlator run interval (default: 5m)
-//   ALERT_CHANNEL             Slack channel ID for case alerts
+//   ALERT_CHANNEL             Slack channel ID for case alerts (default: C0BBP1EP68P)
 //   MCP_ADDR                  MCP HTTP listen addr   (default: :8765)
-//   LLM_BASE_URL              ik_llama.cpp endpoint  (default: http://192.168.50.250:11434)
-//   LLM_MODEL                 model name             (default: "", uses server default)
+//   LLM_BASE_URL              Ollama endpoint        (default: http://192.168.50.250:11434)
+//   LLM_MODEL                 model name
 package main
 
 import (
@@ -41,7 +37,9 @@ func main() {
 	appToken := mustEnv("SLACK_APP_TOKEN")
 
 	dbPath := envOrDefault("SCANTRACE_DB", "../ScanTrace/scantrace.db")
-	alertChannel := envOrDefault("ALERT_CHANNEL", "#sec-alerts")
+	// Default to the actual channel ID — NOT a channel name like #sec-alerts.
+	// PostMessage requires a channel ID (Cxxxxxxxxx), not a name.
+	alertChannel := envOrDefault("ALERT_CHANNEL", "C0BBP1EP68P")
 	mcpAddr := envOrDefault("MCP_ADDR", ":8765")
 	llmBase := envOrDefault("LLM_BASE_URL", "http://192.168.50.250:11434")
 	llmModel := envOrDefault("LLM_MODEL", "")
@@ -52,9 +50,6 @@ func main() {
 	}
 	defer store.Close()
 
-	// -----------------------------------------------------------------------
-	// Slack API client (needed by handler AND the correlator alert callback)
-	// -----------------------------------------------------------------------
 	api := slack.New(
 		botToken,
 		slack.OptionAppLevelToken(appToken),
@@ -68,9 +63,7 @@ func main() {
 	rtsClient := rts.New(botToken)
 	h := handler.New(api, store, alertChannel, rtsClient, llmClient)
 
-	// -----------------------------------------------------------------------
 	// UDP syslog listener
-	// -----------------------------------------------------------------------
 	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")
 	asusSensorID, err := collector.RegisterAsusSensor(store, statePath)
 	if err != nil {
@@ -82,15 +75,12 @@ func main() {
 		go func() {
 			if err := syslogSrv.Listen(); err != nil {
 				log.Printf("[syslog] fatal: %v", err)
-				log.Printf("[syslog] TIP: run with sudo, or set SCANTRACE_SYSLOG_PORT=5140")
 			}
 		}()
 		log.Printf("[bot] syslog listener on UDP :%d (sensor=%s)", port, asusSensorID[:8])
 	}
 
-	// -----------------------------------------------------------------------
-	// Correlator loop — posts Slack alert for every new case
-	// -----------------------------------------------------------------------
+	// Correlator loop
 	correlateInterval := correlateIntervalFromEnv()
 	go func() {
 		runCorrelate(store, h)
@@ -102,9 +92,7 @@ func main() {
 	}()
 	log.Printf("[bot] correlator running every %s", correlateInterval)
 
-	// -----------------------------------------------------------------------
 	// MCP server
-	// -----------------------------------------------------------------------
 	mcpServer := mcp.New(store)
 	go func() {
 		if err := mcpServer.ListenAndServe(mcpAddr); err != nil {
@@ -112,15 +100,12 @@ func main() {
 		}
 	}()
 
-	// -----------------------------------------------------------------------
 	// Slack socket-mode bot
-	// -----------------------------------------------------------------------
 	client := socketmode.New(
 		api,
 		socketmode.OptionDebug(false),
 		socketmode.OptionLog(log.New(os.Stdout, "[socketmode] ", log.LstdFlags|log.Lshortfile)),
 	)
-
 	go func() {
 		for evt := range client.Events {
 			h.Dispatch(client, evt)
@@ -132,10 +117,6 @@ func main() {
 		log.Fatalf("[bot] socket mode error: %v", err)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Correlator helper — posts a Slack alert for each new case produced
-// ---------------------------------------------------------------------------
 
 func runCorrelate(store *db.DB, h *handler.Handler) {
 	cfg := correlator.DefaultConfig()
@@ -156,10 +137,6 @@ func runCorrelate(store *db.DB, h *handler.Handler) {
 		h.PostCaseAlert(c)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 func syslogPortFromEnv() int {
 	if v := os.Getenv("SCANTRACE_SYSLOG_PORT"); v != "" {

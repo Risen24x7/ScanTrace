@@ -2,9 +2,11 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 
 	"github.com/Risen24x7/scantrace/internal/casebuilder"
 	"github.com/Risen24x7/scantrace/internal/db"
@@ -21,10 +23,22 @@ type Handler struct {
 	alertChannel string
 	rts          *rts.Client
 	llm          *llm.Client
+
+	// caseThreads maps case ID → Slack thread_ts so repeat alerts
+	// for the same case get posted as thread replies, not new messages.
+	mu          sync.Mutex
+	caseThreads map[string]string
 }
 
 func New(api *slack.Client, store *db.DB, alertChannel string, rtsClient *rts.Client, llmClient *llm.Client) *Handler {
-	return &Handler{api: api, store: store, alertChannel: alertChannel, rts: rtsClient, llm: llmClient}
+	return &Handler{
+		api:          api,
+		store:        store,
+		alertChannel: alertChannel,
+		rts:          rtsClient,
+		llm:          llmClient,
+		caseThreads:  make(map[string]string),
+	}
 }
 
 // Dispatch routes incoming Socket Mode events.
@@ -117,13 +131,13 @@ func (h *Handler) cmdCases(channelID, userID string) {
 			nil, nil,
 		),
 	}
-	h.postBlocks(channelID, blocks)
+	h.postBlocks(channelID, "", blocks)
 }
 
 func (h *Handler) cmdDevices(channelID, userID string) {
 	devices, err := h.store.ListKnownDevices("", 20)
 	if err != nil || len(devices) == 0 {
-		h.postEphemeral(channelID, userID, "No devices in registry. Use the API or MCP tool to register devices.")
+		h.postEphemeral(channelID, userID, "No devices in registry.")
 		return
 	}
 	var lines []string
@@ -152,7 +166,7 @@ func (h *Handler) cmdDevices(channelID, userID string) {
 			nil, nil,
 		),
 	}
-	h.postBlocks(channelID, blocks)
+	h.postBlocks(channelID, "", blocks)
 }
 
 func (h *Handler) cmdReport(channelID, userID, caseIDPrefix string) {
@@ -174,13 +188,12 @@ func (h *Handler) cmdReport(channelID, userID, caseIDPrefix string) {
 		h.postEphemeral(channelID, userID, fmt.Sprintf("Error building report: %v", err))
 		return
 	}
-	raw := report.SlackBlock()
-	blocks, err := blocksFromRaw(raw)
+	blocks, err := blocksFromRaw(report.SlackBlock())
 	if err != nil {
-		h.postMessage(channelID, report.Markdown)
+		h.postMessage(channelID, "", report.Markdown)
 		return
 	}
-	h.postBlocks(channelID, blocks)
+	h.postBlocks(channelID, "", blocks)
 }
 
 func (h *Handler) cmdPostLatestAlert(cmdChannelID string) {
@@ -188,26 +201,61 @@ func (h *Handler) cmdPostLatestAlert(cmdChannelID string) {
 	if err != nil || len(cases) == 0 {
 		cases, err = h.store.ListCases("", 1)
 		if err != nil || len(cases) == 0 {
-			h.postMessage(cmdChannelID, "No cases available to alert.")
+			h.postMessage(cmdChannelID, "", "No cases available to alert.")
 			return
 		}
 	}
 	h.PostCaseAlert(cases[0])
 }
 
+// PostCaseAlert posts a new Slack message for a new case, or a thread reply
+// if we already posted a top-level message for the same case ID.
 func (h *Handler) PostCaseAlert(c *db.Case) {
 	builder := casebuilder.New(h.store)
 	report, err := builder.BuildReport(c.CaseID)
 	if err != nil {
 		report = casebuilder.BuildReportFromCase(c, nil, nil)
 	}
-	raw := report.SlackBlock()
-	blocks, err := blocksFromRaw(raw)
-	if err != nil {
-		h.postMessage(h.alertChannel, report.Markdown)
+
+	h.mu.Lock()
+	existingThread := h.caseThreads[c.CaseID]
+	h.mu.Unlock()
+
+	if existingThread != "" {
+		// Already posted for this case — reply in the thread.
+		update := fmt.Sprintf("🔄 *Case `%s` updated* — %s (%.0f%% confidence)",
+			c.CaseID[:8], c.Title, c.Confidence*100)
+		h.postMessage(h.alertChannel, existingThread, update)
+		log.Printf("[handler] thread reply for case %s to %s", c.CaseID[:8], h.alertChannel)
 		return
 	}
-	h.postBlocks(h.alertChannel, blocks)
+
+	// New case — post top-level message.
+	blocks, err := blocksFromRaw(report.SlackBlock())
+	var ts string
+	if err != nil {
+		// Block parsing failed — fall back to plain text.
+		text := fmt.Sprintf("%s *[%s] Case `%s`* — %s\nseverity=%s confidence=%.0f%%",
+			severityEmoji(c.Severity), strings.ToUpper(c.Severity),
+			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
+		_, ts, err = h.api.PostMessage(h.alertChannel,
+			slack.MsgOptionText(text, false),
+			slack.MsgOptionAsUser(false),
+		)
+	} else {
+		_, ts, err = h.api.PostMessage(h.alertChannel,
+			slack.MsgOptionBlocks(blocks...),
+		)
+	}
+
+	if err != nil {
+		log.Printf("[handler] PostMessage error for case %s: %v", c.CaseID[:8], err)
+		return
+	}
+
+	h.mu.Lock()
+	h.caseThreads[c.CaseID] = ts
+	h.mu.Unlock()
 
 	go func() {
 		err := h.rts.PublishSignal(h.alertChannel, "scantrace.case.alert", map[string]interface{}{
@@ -220,7 +268,7 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 		}
 	}()
 
-	log.Printf("[handler] posted alert for case %s to %s", c.CaseID[:8], h.alertChannel)
+	log.Printf("[handler] posted alert for case %s to %s (ts=%s)", c.CaseID[:8], h.alertChannel, ts)
 }
 
 func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
@@ -268,27 +316,23 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		return
 	}
 
-	h.postMessage(channelID, "_Thinking…_")
+	h.postMessage(channelID, "", "_Thinking…_")
 
 	ctx := h.buildLLMContext()
 	answer, err := h.llm.Ask(clean, ctx)
 	if err != nil {
 		log.Printf("[handler] llm error: %v", err)
-		h.postMessage(channelID,
+		h.postMessage(channelID, "",
 			"⚠️ Could not reach the inference worker. Is the desktop running?\n"+
 				"Use `/scantrace cases` or `/scantrace report <id>` in the meantime.")
 		return
 	}
-	h.postMessage(channelID, answer)
+	h.postMessage(channelID, "", answer)
 }
 
-// buildLLMContext assembles a rich text summary of recent DB state.
-// Hydrates linked events (IPs, MACs, event types) and cross-references
-// the known_devices registry so the model knows device trust status.
 func (h *Handler) buildLLMContext() string {
 	var sb strings.Builder
 
-	// --- known device registry snapshot (top 50) ---
 	devices, _ := h.store.ListKnownDevices("", 50)
 	if len(devices) > 0 {
 		sb.WriteString(fmt.Sprintf("Known device registry (%d entries):\n", len(devices)))
@@ -306,7 +350,6 @@ func (h *Handler) buildLLMContext() string {
 		sb.WriteString("\n")
 	}
 
-	// --- cases with hydrated events ---
 	cases, err := h.store.ListCases("", 20)
 	if err != nil || len(cases) == 0 {
 		sb.WriteString("No cases in database.\n")
@@ -323,7 +366,6 @@ func (h *Handler) buildLLMContext() string {
 			sb.WriteString(fmt.Sprintf("  summary: %s\n", c.Summary))
 		}
 
-		// Hydrate linked events (cap at 10 per case).
 		const maxEvents = 10
 		if len(c.RelatedEventIDs) > 0 {
 			sb.WriteString("  events:\n")
@@ -341,7 +383,6 @@ func (h *Handler) buildLLMContext() string {
 				parts = append(parts, fmt.Sprintf("source=%s", evt.SourceType))
 				if evt.SrcIP != "" {
 					parts = append(parts, fmt.Sprintf("src=%s", evt.SrcIP))
-					// Cross-reference device registry.
 					if dev, _ := h.store.GetKnownDeviceByIP(evt.SrcIP); dev != nil {
 						parts = append(parts, fmt.Sprintf("[trust=%s label=%q]", dev.TrustLabel, dev.Label))
 					}
@@ -349,24 +390,17 @@ func (h *Handler) buildLLMContext() string {
 				if evt.DstIP != "" {
 					parts = append(parts, fmt.Sprintf("dst=%s", evt.DstIP))
 				}
-				if evt.SrcPort > 0 {
-					parts = append(parts, fmt.Sprintf("sport=%d", evt.SrcPort))
-				}
 				if evt.DstPort > 0 {
 					parts = append(parts, fmt.Sprintf("dport=%d", evt.DstPort))
 				}
 				if evt.Protocol != "" {
 					parts = append(parts, fmt.Sprintf("proto=%s", evt.Protocol))
 				}
-				if len(evt.Tags) > 0 {
-					parts = append(parts, fmt.Sprintf("tags=%s", strings.Join(evt.Tags, ",")))
-				}
 				parts = append(parts, fmt.Sprintf("ts=%s", evt.Timestamp.Format("2006-01-02 15:04")))
 				sb.WriteString(fmt.Sprintf("    - %s\n", strings.Join(parts, " ")))
 			}
 		}
 
-		// Linked entity enrichment (external IPs, ASN, reputation).
 		if len(c.RelatedEntityIDs) > 0 {
 			entities, err := h.store.GetEntitiesForCase(c.CaseID)
 			if err == nil && len(entities) > 0 {
@@ -404,7 +438,7 @@ func (h *Handler) cmdHighSeverity(channelID, userID string) {
 		lines = append(lines, fmt.Sprintf("🔴 `%s` *%s* (%.0f%% confidence)",
 			c.CaseID[:8], c.Title, c.Confidence*100))
 	}
-	h.postBlocks(channelID, []slack.Block{
+	h.postBlocks(channelID, "", []slack.Block{
 		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "🔴 High Severity Cases", false, false)),
 		slack.NewDividerBlock(),
 		slack.NewSectionBlock(
@@ -414,11 +448,16 @@ func (h *Handler) cmdHighSeverity(channelID, userID string) {
 	})
 }
 
-func (h *Handler) postMessage(channelID, text string) {
-	_, _, err := h.api.PostMessage(channelID,
+// postMessage sends plain text; if threadTS is non-empty, sends as a thread reply.
+func (h *Handler) postMessage(channelID, threadTS, text string) {
+	opts := []slack.MsgOption{
 		slack.MsgOptionText(text, false),
 		slack.MsgOptionAsUser(false),
-	)
+	}
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, _, err := h.api.PostMessage(channelID, opts...)
 	if err != nil {
 		log.Printf("[handler] postMessage error: %v", err)
 	}
@@ -433,43 +472,33 @@ func (h *Handler) postEphemeral(channelID, userID, text string) {
 	}
 }
 
-func (h *Handler) postBlocks(channelID string, blocks []slack.Block) {
-	_, _, err := h.api.PostMessage(channelID,
-		slack.MsgOptionBlocks(blocks...),
-	)
+// postBlocks sends Block Kit; if threadTS is non-empty, sends as a thread reply.
+func (h *Handler) postBlocks(channelID, threadTS string, blocks []slack.Block) {
+	opts := []slack.MsgOption{slack.MsgOptionBlocks(blocks...)}
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, _, err := h.api.PostMessage(channelID, opts...)
 	if err != nil {
 		log.Printf("[handler] postBlocks error: %v", err)
 	}
 }
 
+// blocksFromRaw converts the raw map from report.SlackBlock() into typed slack.Block objects.
+// Uses JSON round-trip to avoid fragile type assertions on interface{} maps.
 func blocksFromRaw(raw map[string]interface{}) ([]slack.Block, error) {
-	rawBlocks, ok := raw["blocks"].([]map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid blocks structure")
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("blocksFromRaw marshal: %w", err)
 	}
-	var blocks []slack.Block
-	for _, rb := range rawBlocks {
-		switch rb["type"] {
-		case "divider":
-			blocks = append(blocks, slack.NewDividerBlock())
-		case "section":
-			if text, ok := rb["text"].(map[string]string); ok {
-				blocks = append(blocks, slack.NewSectionBlock(
-					slack.NewTextBlockObject(text["type"], text["text"], false, false),
-					nil, nil,
-				))
-			}
-		case "context":
-			if elems, ok := rb["elements"].([]map[string]string); ok {
-				var textObjs []slack.MixedElement
-				for _, e := range elems {
-					textObjs = append(textObjs, slack.NewTextBlockObject(e["type"], e["text"], false, false))
-				}
-				blocks = append(blocks, slack.NewContextBlock("", textObjs...))
-			}
-		}
+	var msg slack.Msg
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return nil, fmt.Errorf("blocksFromRaw unmarshal: %w", err)
 	}
-	return blocks, nil
+	if len(msg.Blocks.BlockSet) == 0 {
+		return nil, fmt.Errorf("blocksFromRaw: no blocks in payload")
+	}
+	return msg.Blocks.BlockSet, nil
 }
 
 func severityEmoji(s string) string {
@@ -502,7 +531,7 @@ func helpText() string {
 Available commands:
 • ` + "`/scantrace cases`" + ` — list recent cases
 • ` + "`/scantrace report <case-id>`" + ` — full case report
-• ` + "`/scantrace alert`" + ` — post latest high-severity case to #sec-alerts
+• ` + "`/scantrace alert`" + ` — post latest high-severity case to alerts channel
 • ` + "`/scantrace devices`" + ` — show known device registry
 • ` + "`/scantrace mcp`" + ` — MCP server status
 • ` + "`/scantrace help`" + ` — this message
