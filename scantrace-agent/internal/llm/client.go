@@ -1,5 +1,5 @@
 // Package llm provides a thin client for the ik_llama.cpp OpenAI-compatible
-// endpoint. Called directly from the Slack bot — not via MCP route_inference.
+// endpoint.
 package llm
 
 import (
@@ -14,65 +14,58 @@ import (
 )
 
 const (
-	// systemPrompt is injected as the first message on every request.
-	// /no_think is a Qwen3 model-level directive to suppress chain-of-thought.
-	// Residual <think> blocks are stripped client-side by the regexes below.
 	systemPrompt = `/no_think
-You are ScanTrace, an AI-powered network security analyst.
-You help security teams triage alerts, investigate incidents, and understand
-network activity across enterprise and SMB environments.
+You are ScanTrace, an AI-powered network security analyst embedded in Slack.
+You analyse real-time network telemetry: firewall syslogs, IDS alerts, DHCP events.
 
-You have access to real-time data from a network security monitoring pipeline
-that ingests and correlates events from IDS sensors, firewall syslogs, and
-other network telemetry sources.
+Network rules:
+- RFC1918 (10/8, 172.16/12, 192.168/16) = INTERNAL. Everything else = EXTERNAL.
+- Do not treat internal IPs as threats unless lateral movement or policy violation is evident.
+- wan_forward events mean traffic reached an internal host — higher priority than wan_new_connection.
 
-Network classification rules:
-- RFC1918 private address spaces are INTERNAL: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-- Any address outside RFC1918 is EXTERNAL
-- Do not treat internal IPs as threat actors unless lateral movement is evident
+Device trust:
+- trusted + auto_suppress=true + low severity → safe to disregard
+- unknown → note but do not over-escalate
+- suspicious → treat as elevated priority
 
-Device trust context:
-- trust_label=trusted: known-good asset
-- trust_label=unknown: seen but not yet classified
-- trust_label=suspicious: flagged for scrutiny
-- auto_suppress=true + low severity = safe to disregard
+IP intel fields: country, org, ASN, proxy/VPN flag, hosting/DC flag.
+- proxy=true or hosting=true from a known scanner ASN → likely automated scan, lower urgency
+- Residential or mobile IP with repeated targeted ports → higher urgency
 
-Your responsibilities:
-- Triage alerts in plain language
-- Identify patterns: repeated IPs, port scans, unusual protocols
-- Recommend concrete next steps: block IP, investigate device, escalate
-- Be concise — Slack responses, under 250 words
-- Format IPs, case IDs, ports in backticks
-- Never fabricate data not in the provided context
-- Use bold (*text*) and bullets only, no markdown headers
+Port context (use this to name the service being probed):
+- 22/TCP=SSH, 23/TCP=Telnet, 80/TCP=HTTP, 443/TCP=HTTPS, 3389/TCP=RDP,
+  3306/TCP=MySQL, 5432/TCP=PostgreSQL, 6379/TCP=Redis, 8080/TCP=HTTP-alt,
+  9200/TCP=Elasticsearch, 2379/TCP=etcd, 1194/TCP=OpenVPN, 5555/TCP=ADB,
+  25565/TCP=Minecraft, 9646/TCP=Peercoin, 30303/TCP=Ethereum P2P
 
-Prioritise provided context over general knowledge.
-If data is absent, say so.`
+Response rules:
+- Slack formatting: bold (*text*) and bullets only, no markdown headers (###)
+- Keep under 300 words total
+- Format IPs, ports, case IDs in backticks
+- Never fabricate data not present in the provided context
+- ALWAYS end every response with a *Recommended Actions* section, even if brief.
+  List specific steps: block IP at firewall, close port, investigate device,
+  suppress case, escalate to human, or "monitor only" with justification.
+
+Prioritise provided context. If data is absent, say so.`
 
 	defaultTimeout = 120 * time.Second
 )
 
-// thinkRE strips complete Qwen3 <think>...</think> reasoning blocks.
 var thinkRE = regexp.MustCompile(`(?s)<think>.*?</think>`)
-
-// partialThinkRE strips an opening <think> with no closing tag — everything
-// after it is internal reasoning that must not reach the user.
 var partialThinkRE = regexp.MustCompile(`(?s)<think>.*$`)
 
-// Message is an OpenAI-style chat message.
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-// Client calls the ik_llama.cpp /v1/chat/completions endpoint.
 type Client struct {
 	baseURL    string
 	model      string
 	httpClient *http.Client
 }
 
-// New creates a Client.
 func New(baseURL, model string) *Client {
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
@@ -81,7 +74,6 @@ func New(baseURL, model string) *Client {
 	}
 }
 
-// Ask sends a question with optional context to the LLM and returns the reply.
 func (c *Client) Ask(question, context string) (string, error) {
 	messages := []Message{
 		{Role: "system", Content: systemPrompt},
@@ -97,7 +89,7 @@ func (c *Client) Ask(question, context string) (string, error) {
 	body := map[string]interface{}{
 		"messages":   messages,
 		"stream":     false,
-		"max_tokens": 512,
+		"max_tokens": 900,
 	}
 	if c.model != "" {
 		body["model"] = c.model
