@@ -3,9 +3,10 @@
 ## Prerequisites
 
 - Go 1.21+
-- Linux host (tested on Ubuntu/Debian)
+- Linux host (tested on Ubuntu 22.04 / Debian 12)
 - ASUS router (BE96U or any ASUSWRT/Merlin firmware) with syslog forwarding enabled
-- Slack workspace with a bot token (`SLACK_BOT_TOKEN`) and webhook URL (`SLACK_WEBHOOK_URL`)
+- Slack workspace with a bot token (`SLACK_BOT_TOKEN`) and an app-level Socket Mode token (`SLACK_APP_TOKEN`)
+- *(Optional)* `ik_llama.cpp` running Qwen3-30B on a desktop reachable at `LLM_BASE_URL`
 
 ---
 
@@ -14,46 +15,52 @@
 ```bash
 git clone https://github.com/Risen24x7/ScanTrace.git
 cd ScanTrace/scantrace-agent
-go build -o scantrace ./cmd/bot/
+go build -o scantrace-agent ./cmd/bot/
 ```
 
-The binary is `./scantrace`. All state files (`scantrace.db`, `.asus-sensor-id`) are written **next to the binary** automatically — you never need to `cd` to a specific directory to run it.
+The binary is `./scantrace-agent`. The SQLite database (`scantrace.db`) is written next to the binary by default.
 
 ---
 
 ## 2. Environment Variables
 
-Create a `.env` file in `ScanTrace/scantrace-agent/`:
+Create `.env` in `ScanTrace/scantrace-agent/` (see `.env.example`):
 
 ```env
+# Required
 SLACK_BOT_TOKEN=xoxb-...
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
-IPINFO_TOKEN=optional_token
-SCANTRACE_DB=/absolute/path/to/scantrace.db        # optional, defaults to <exe-dir>/scantrace.db
-SCANTRACE_ASUS_STATE=/absolute/path/.asus-sensor-id # optional, defaults to <exe-dir>/.asus-sensor-id
+SLACK_APP_TOKEN=xapp-...
+ALERT_CHANNEL=C0BBP1EP68P
+
+# Optional — defaults shown
+EXTERNAL_THREAT_CHANNEL=C0BCYSW3KNC   # channel for LLM Q&A replies (defaults to ALERT_CHANNEL)
+LLM_BASE_URL=http://192.168.50.250:11434  # ik_llama.cpp endpoint; works without if omitted
+LLM_MODEL=Qwen3-30B-A3B-UD-Q3_K_XL
+DB_PATH=../scantrace.db
+WAN_IP=                                # leave blank; agent auto-detects from syslog
 SCANTRACE_SYSLOG_PORT=5140
 ```
 
 Load and run:
 
 ```bash
-export $(grep -v '^#' .env | xargs)
-./scantrace
+cd ~/ScanTrace/scantrace-agent
+export $(grep -v '^#' .env | xargs) && ./scantrace-agent
 ```
+
+> **Note:** Run `export $(...)` from inside `scantrace-agent/` so the path to `.env` is just `.env`.
 
 ---
 
 ## 3. Port Binding (No sudo required)
 
-The agent listens on UDP **:5140** by default. Grant the binary the capability to bind that port without root:
+The agent listens on UDP **:5140** by default. Grant the capability once after each build:
 
 ```bash
-sudo setcap cap_net_bind_service=+ep ~/ScanTrace/scantrace-agent/scantrace
+sudo setcap cap_net_bind_service=+ep ~/ScanTrace/scantrace-agent/scantrace-agent
 ```
 
-Run this once after every `go build`. Then run the binary as your normal user — **no sudo needed**.
-
-> If you rebuild the binary, re-run `setcap` because the capability is attached to the file inode.
+Re-run after every `go build` — the capability is attached to the file inode.
 
 ---
 
@@ -73,24 +80,35 @@ Run this once after every `go build`. Then run the binary as your normal user �
 
 ```bash
 cd ~/ScanTrace/scantrace-agent
-export $(grep -v '^#' .env | xargs)
-./scantrace
+export $(grep -v '^#' .env | xargs) && ./scantrace-agent
 ```
+
+On startup you should see:
+
+```
+[main] ScanTrace agent starting…
+[handler] connecting to Slack...
+[handler] connected to Dilldozer ✓
+[main] LLM endpoint: http://192.168.50.250:11434 (model="Qwen3-30B-A3B-UD-Q3_K_XL")
+```
+
+The `subscribe skipped: unknown_method` RTS line is cosmetic on the Dilldozer sandbox — the agent continues normally.
 
 The agent will:
 - Listen on UDP :5140 for router syslog
-- Parse `WAN_NEW_ACCEPT` and `WAN_FWD` events
+- Classify WAN edge traffic vs. internal traffic in Go (not the LLM)
 - Run the correlator every 5 minutes
-- Post alerts to Slack for every new case (all severities)
+- Post Block Kit alerts to `#sec-alerts` for every new case
+- Post LLM Q&A responses to `EXTERNAL_THREAT_CHANNEL`
 
 ---
 
 ## 6. After Every Rebuild
 
 ```bash
-go build -o scantrace ./cmd/bot/
-sudo setcap cap_net_bind_service=+ep ./scantrace
-export $(grep -v '^#' .env | xargs) && ./scantrace
+go build -o scantrace-agent ./cmd/bot/
+sudo setcap cap_net_bind_service=+ep ./scantrace-agent
+export $(grep -v '^#' .env | xargs) && ./scantrace-agent
 ```
 
 ---
@@ -100,3 +118,15 @@ export $(grep -v '^#' .env | xargs) && ./scantrace
 ```bash
 sqlite3 scantrace.db "SELECT event_type, src_ip, dst_port, timestamp FROM events ORDER BY timestamp DESC LIMIT 20;"
 ```
+
+---
+
+## 8. Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `LLM not configured` in Slack | `LLM_BASE_URL` not exported | Add to `.env` or just restart — defaults to `http://192.168.50.250:11434` |
+| `grep: scantrace-agent/.env: Not a directory` | Running `export $(...)` from parent dir | `cd scantrace-agent/` first |
+| Agent exits immediately | Missing `SLACK_BOT_TOKEN` or `SLACK_APP_TOKEN` | Check `.env` has both |
+| No alerts in Slack | Wrong `ALERT_CHANNEL` ID | Must be channel ID (`C0...`), not name |
+| WAN traffic shows as internal threat | Old binary without WAN_IP pre-classification | Rebuild from current `main` |

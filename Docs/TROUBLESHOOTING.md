@@ -1,132 +1,97 @@
 # ScanTrace — Troubleshooting
 
-> **Last updated:** June 28, 2026
+## Agent Won't Start
+
+### `LLM not configured`
+
+**Cause:** `LLM_BASE_URL` not in environment.  
+**Fix:** The agent now defaults to `http://192.168.50.250:11434` — just restart and it will connect. If your `ik_llama.cpp` is on a different host, add `LLM_BASE_URL=http://<host>:11434` to `.env`.
+
+### `grep: scantrace-agent/.env: Not a directory`
+
+**Cause:** Running the `export $(grep ...)` command from the parent `ScanTrace/` directory.  
+**Fix:**
+```bash
+cd ~/ScanTrace/scantrace-agent
+export $(grep -v '^#' .env | xargs) && ./scantrace-agent
+```
+
+### `required env var "SLACK_BOT_TOKEN" is not set`
+
+**Cause:** `.env` file missing or not loaded.  
+**Fix:** Create `.env` from `.env.example` and `export` it before running.
 
 ---
 
-## `systemctl restart` — "Too few arguments"
+## No Alerts Appearing in Slack
 
-You forgot the unit name. Always specify the service:
+### Wrong channel ID
 
+`ALERT_CHANNEL` must be the channel **ID** (format `C0XXXXXXXXX`), not the channel name.  
+Get it from Slack: right-click the channel → **Copy link** → the ID is the last path component.
+
+### Events not reaching the agent
+
+Verify UDP packets are arriving:
 ```bash
-sudo systemctl restart rsyslog
+sudo tcpdump -i any -n udp port 5140
+```
+
+Verify events are stored:
+```bash
+sqlite3 scantrace.db "SELECT count(*) FROM events;"
 ```
 
 ---
 
-## `tail -F` pipe appears to hang with no output
+## WAN Traffic Shows as Internal Threat
 
-This is expected. `tail -F` waits for **new lines to be appended** to the file. The pipeline will sit idle until the router sends a new syslog message.
-
-**Immediate test — ingest existing lines:**
+**Cause:** Running an older binary that lacked Go-layer WAN IP pre-classification.  
+**Fix:** Rebuild from current `main`:
 ```bash
-sudo tail -n 50 /var/log/asus-router.log | \
-CGO_ENABLED=1 go run ./cmd/bot/ ingest --adapter asus-syslog --file -
+cd ~/ScanTrace/scantrace-agent
+go build -o scantrace-agent ./cmd/bot/
+sudo setcap cap_net_bind_service=+ep ./scantrace-agent
 ```
 
-**Trigger a live event on the router side** (not the ScanTrace host):
-- Disconnect and reconnect a Wi-Fi device
-- Let any DHCP lease renew
-
-**Note:** `logger` on the ScanTrace host writes to the local syslog, NOT to `/var/log/asus-router.log`. Only messages forwarded from the router land there.
+After the fix, triage output will read:
+```
+Dst host in registry? [WAN EDGE — gateway interface only]
+```
+And the Assessment block will correctly state no internal devices are at risk.
 
 ---
 
-## No events in DB after ingest
+## LLM Responses
 
-The Asus adapter only parses these line types:
-- `kernel: DROP` / `kernel: ACCEPT` — firewall events
-- `dnsmasq-dhcp: DHCPACK` / `DHCPREQUEST` / `DHCPDISCOVER` — DHCP events
-- `hostapd: STA ... associated/disassociated` — Wi-Fi association events
-- WAN IP change lines
+### Assessment or Summary blocks are missing
 
-Unknown line types are silently skipped. Check:
-
+**Cause:** `ik_llama.cpp` not running or unreachable.  
+**Fix:** Start the model server on the desktop and confirm:
 ```bash
-sudo tail -n 20 /var/log/asus-router.log
+curl http://192.168.50.250:11434/v1/models
 ```
 
-If you only see lines from daemons other than the above, those will not produce events.
+### LLM generates wrong action list
 
-**Isolation test — pipe a known-good line directly:**
-```bash
-printf '2026-06-25T21:39:30+00:00 Rzn-BE96U dnsmasq-dhcp[8492]: DHCPACK(br0) 192.168.50.238 70:f0:88:2d:db:1e\n' | \
-CGO_ENABLED=1 go run ./cmd/bot/ ingest --adapter asus-syslog --file -
-
-sqlite3 scantrace.db "SELECT * FROM events WHERE source_type='asus_syslog' ORDER BY timestamp DESC LIMIT 5;"
-```
+This should no longer happen. The Recommended Actions section is now a `fmt.Sprintf` skeleton populated entirely in Go — the LLM only fills the Assessment and Summary blocks. If you see hallucinated actions, you are running an old binary.
 
 ---
 
-## Ghost cases with blank `src_ip` or title `[new_device]`
+## RTS Subscription Error on Startup
 
-These come from `wifi_associated` events ingested before the MAC-fix was deployed. The adapter was not populating `src_ip` for hostapd lines.
-
-**Clean them up:**
-```bash
-# Find the ghost case ID
-sqlite3 scantrace.db "SELECT case_id FROM cases WHERE title='[new_device]' AND status='open';"
-
-# Delete it
-sqlite3 scantrace.db "DELETE FROM cases WHERE case_id='<full-uuid>';"
-
-# Purge the underlying events with no src_ip
-sqlite3 scantrace.db "DELETE FROM events WHERE event_type LIKE 'wifi_%' AND src_ip='';"
+```
+[rts] subscribe skipped: [rts] signal.subscriptions.add error: unknown_method
 ```
 
+This is **cosmetic**. The Dilldozer Slack sandbox does not support the RTS subscription method. The agent continues normally — all Socket Mode events are still received and processed.
+
 ---
 
-## Correlator keeps re-opening the same case
+## Capability Lost After Rebuild
 
-This means the case was closed (or deleted) but the underlying events remain. Dedup only skips re-firing if an **open** case already exists for that `srcIP + ruleType`.
-
-To reset cleanly for a demo:
+`setcap` is attached to the file inode. Every `go build` produces a new inode.  
+Always re-run after rebuilding:
 ```bash
-# Close all open cases
-sqlite3 scantrace.db "UPDATE cases SET status='closed' WHERE status='open';"
-
-# Then run correlate — should produce zero new cases if all events are already covered
-CGO_ENABLED=1 go run ./cmd/bot/ correlate
+sudo setcap cap_net_bind_service=+ep ./scantrace-agent
 ```
-
----
-
-## rsyslog not writing to `/var/log/asus-router.log`
-
-1. Confirm UDP 514 is open on the host firewall:
-   ```bash
-   sudo ufw status
-   sudo ufw allow 514/udp
-   ```
-
-2. Confirm rsyslog is listening:
-   ```bash
-   sudo ss -ulnp | grep 514
-   ```
-
-3. Confirm the rule file syntax is correct (IP-scoped, not wildcard):
-   ```bash
-   cat /etc/rsyslog.d/asus-router.conf
-   # Should contain:
-   # if $fromhost-ip == "192.168.50.1" then /var/log/asus-router.log
-   # & stop
-   ```
-
-4. Restart rsyslog after any config change:
-   ```bash
-   sudo systemctl restart rsyslog
-   ```
-
-5. Check rsyslog errors:
-   ```bash
-   sudo journalctl -u rsyslog -n 30
-   ```
-
----
-
-## Slack alerts not posting
-
-- Confirm `SLACK_WEBHOOK_URL` is set and not expired
-- Rotate the webhook in Slack if it was accidentally exposed: **Apps → Incoming Webhooks → Regenerate**
-- For socket mode (Bolt app), confirm both `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are set
-- Check the serve output for `[alerts] posted case` vs. any HTTP error lines
