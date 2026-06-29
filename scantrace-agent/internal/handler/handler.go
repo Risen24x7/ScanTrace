@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/threat"
+	"github.com/google/uuid"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -168,6 +170,14 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 		h.cmdPostLatestAlert(cmd.ChannelID)
 	case "devices":
 		h.cmdDevices(cmd.ChannelID, cmd.UserID)
+	case "adddevice":
+		h.cmdAddDevice(cmd.ChannelID, cmd.UserID, parts[1:])
+	case "removedevice":
+		if len(parts) < 2 {
+			h.postEphemeral(cmd.ChannelID, cmd.UserID, "Usage: `/scantrace removedevice <ip>`")
+			return
+		}
+		h.cmdRemoveDevice(cmd.ChannelID, cmd.UserID, parts[1])
 	case "review-all":
 		h.cmdReviewAll(cmd.ChannelID, cmd.UserID)
 	case "next":
@@ -180,6 +190,121 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 	default:
 		h.postEphemeral(cmd.ChannelID, cmd.UserID, helpText())
 	}
+}
+
+// cmdAddDevice handles:
+//
+//	/scantrace adddevice <ip> [label="My Device"] [trust=trusted|unknown|suspicious] [suppress=true]
+//
+// All fields except <ip> are optional and default to label="<ip>", trust=unknown, suppress=false.
+// The upsert is keyed on IP — running the command again updates an existing entry.
+func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
+	if len(args) == 0 {
+		h.postEphemeral(channelID, userID,
+			"Usage: `/scantrace adddevice <ip> [label=\"My Device\"] [trust=trusted|unknown|suspicious] [suppress=true]`\n"+
+				"Examples:\n"+
+				"• `/scantrace adddevice 192.168.50.4 label=\"Plex Server\" trust=trusted`\n"+
+				"• `/scantrace adddevice 192.168.50.4 trust=suspicious`")
+		return
+	}
+
+	ipArg := args[0]
+	if net.ParseIP(ipArg) == nil {
+		h.postEphemeral(channelID, userID, fmt.Sprintf("`%s` is not a valid IP address.", ipArg))
+		return
+	}
+
+	// Defaults.
+	label := ipArg
+	trustLabel := "unknown"
+	autoSuppress := false
+
+	// Parse key=value pairs from remaining args.
+	// Handles both label=Plex and label="Plex Server" (shell already strips quotes,
+	// but Slack sends the raw text so we strip them ourselves).
+	for _, arg := range args[1:] {
+		kv := strings.SplitN(arg, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		val := strings.Trim(strings.TrimSpace(kv[1]), `"`)
+		switch key {
+		case "label":
+			label = val
+		case "trust":
+			switch strings.ToLower(val) {
+			case "trusted", "unknown", "suspicious":
+				trustLabel = strings.ToLower(val)
+			default:
+				h.postEphemeral(channelID, userID,
+					fmt.Sprintf("Invalid trust value `%s`. Use: `trusted`, `unknown`, or `suspicious`.", val))
+				return
+			}
+		case "suppress":
+			autoSuppress = strings.ToLower(val) == "true"
+		}
+	}
+
+	// Check if this IP already exists so we can report add vs update.
+	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
+
+	now := time.Now().UTC()
+	deviceID := uuid.NewString()
+	if existing != nil {
+		deviceID = existing.DeviceID // keep stable ID on update
+	}
+
+	d := &db.KnownDevice{
+		DeviceID:     deviceID,
+		IP:           ipArg,
+		Label:        label,
+		TrustLabel:   trustLabel,
+		AutoSuppress: autoSuppress,
+		FirstSeen:    now,
+		LastSeen:     now,
+	}
+	if existing != nil && !existing.FirstSeen.IsZero() {
+		d.FirstSeen = existing.FirstSeen
+	}
+
+	if err := h.store.UpsertKnownDevice(d); err != nil {
+		log.Printf("[handler] adddevice upsert error: %v", err)
+		h.postEphemeral(channelID, userID, fmt.Sprintf("Failed to save device: %v", err))
+		return
+	}
+
+	action := "✅ Device *added* to registry"
+	if existing != nil {
+		action = "✏️ Device *updated* in registry"
+	}
+	suppressLine := ""
+	if autoSuppress {
+		suppressLine = "\n• Auto-suppress: *on* (low-severity cases for this host will be silenced)"
+	}
+	h.postMessage(channelID, "", fmt.Sprintf(
+		"%s\n• IP: `%s`\n• Label: *%s*\n• Trust: `%s`%s\n\nRe-run `/scantrace report <case-id>` or `@ScanTrace case <id>` to see the updated classification.",
+		action, ipArg, label, trustLabel, suppressLine,
+	))
+	log.Printf("[handler] adddevice ip=%s label=%q trust=%s suppress=%v by user=%s",
+		ipArg, label, trustLabel, autoSuppress, userID)
+}
+
+// cmdRemoveDevice handles: /scantrace removedevice <ip>
+func (h *Handler) cmdRemoveDevice(channelID, userID, ipArg string) {
+	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
+	if existing == nil {
+		h.postEphemeral(channelID, userID, fmt.Sprintf("Device `%s` not found in registry.", ipArg))
+		return
+	}
+	if err := h.store.DeleteKnownDevice(existing.DeviceID); err != nil {
+		h.postEphemeral(channelID, userID, fmt.Sprintf("Failed to remove device: %v", err))
+		return
+	}
+	h.postMessage(channelID, "", fmt.Sprintf(
+		"🗑️ Device `%s` (*%s*) removed from registry.", ipArg, existing.Label,
+	))
+	log.Printf("[handler] removedevice ip=%s label=%q by user=%s", ipArg, existing.Label, userID)
 }
 
 func (h *Handler) cmdReviewAll(channelID, userID string) {
@@ -1079,17 +1204,16 @@ Available commands:
 • ` + "`/scantrace report <case-id>`" + ` — full case report
 • ` + "`/scantrace alert`" + ` — post latest high-severity case to alerts channel
 • ` + "`/scantrace devices`" + ` — show known device registry
-• ` + "`/scantrace review-all`" + ` — queue all open cases for individual LLM briefings (posted to sec-intel-external)
+• ` + "`/scantrace adddevice <ip> [label=\"...\"] [trust=trusted|unknown|suspicious] [suppress=true]`" + ` — register or update a device
+• ` + "`/scantrace removedevice <ip>`" + ` — remove a device from the registry
+• ` + "`/scantrace review-all`" + ` — queue all open cases for individual LLM briefings
 • ` + "`/scantrace next`" + ` — briefing for the single highest-priority open case
 • ` + "`/scantrace mcp`" + ` — MCP server status
 • ` + "`/scantrace help`" + ` — this message
 
-You can also @mention ScanTrace with a specific case or any natural language question:
+You can also @mention ScanTrace:
 • ` + "`@ScanTrace cases`" + ` — same rich case list
 • ` + "`@ScanTrace case <id>`" + ` — full briefing for a specific case
 • ` + "`@ScanTrace report <id>`" + ` — alias for case briefing
-• ` + "`@ScanTrace review case <id>`" + ` — alias for case briefing
-• ` + "`@ScanTrace <any question>`" + ` — natural language security analysis
-
-Example: _@ScanTrace case 7f3a21c9_`
+• ` + "`@ScanTrace review case <id>`" + ` — alias for case briefing`
 }
