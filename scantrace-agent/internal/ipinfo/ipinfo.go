@@ -36,8 +36,9 @@ type Classification int
 const (
 	ClassUnknown    Classification = iota
 	ClassFeds                      // US government / military / federal agency
-	ClassKnownGood                 // major CDN, cloud infra, well-known benign network
-	ClassKnownBad                  // hosting DC, anonymous proxy, flagged infrastructure
+	ClassKnownGood                 // major CDN, cloud infra, well-known benign network (non-hosting)
+	ClassKnownCloud                // major cloud/CDN provider flagged as hosting infra (Google, AWS, Azure, etc.)
+	ClassKnownBad                  // anonymous proxy / bulletproof hosting DC
 	ClassSuspicious                // proxy/VPN without DC hosting
 )
 
@@ -100,18 +101,30 @@ var govASNs = []string{
 	"AS4323",  // CIA
 }
 
-// knownGoodKeywords identify well-known benign infrastructure operators.
-var knownGoodKeywords = []string{
+// knownCloudKeywords identify major cloud/CDN providers that may be flagged as
+// hosting infrastructure but are generally considered legitimate traffic sources.
+// Checked BEFORE the generic hosting=true → KnownBad rule.
+var knownCloudKeywords = []string{
+	"google",
+	"amazon",
+	"microsoft",
 	"cloudflare",
 	"akamai",
 	"fastly",
-	"amazon",
-	"google",
-	"microsoft",
 	"apple",
 	"cdn77",
 	"limelight",
 	"edgecast",
+	"stackpath",
+	"oracle cloud",
+	"digitalocean",
+	"linode",
+	"vultr",
+}
+
+// knownGoodKeywords identify well-known benign non-hosting networks (ISPs,
+// carriers, major telecoms). These are checked after cloud keywords.
+var knownGoodKeywords = []string{
 	"level 3",
 	"lumen",
 	"comcast",
@@ -135,12 +148,12 @@ func (i *Info) Classify() Classification {
 		return ClassUnknown
 	}
 	orgLower := strings.ToLower(i.Org + " " + i.ISP)
-	asUpper := strings.ToUpper(strings.Fields(i.AS)[0]) // e.g. "AS749"
-	if len(strings.Fields(i.AS)) == 0 {
-		asUpper = ""
+	asUpper := ""
+	if fields := strings.Fields(i.AS); len(fields) > 0 {
+		asUpper = strings.ToUpper(fields[0]) // e.g. "AS749"
 	}
 
-	// US Government / Military — checked first, takes precedence over everything.
+	// 1. US Government / Military — takes precedence over everything.
 	for _, kw := range govOrgKeywords {
 		if strings.Contains(orgLower, kw) {
 			return ClassFeds
@@ -152,22 +165,35 @@ func (i *Info) Classify() Classification {
 		}
 	}
 
-	// Hosting DC + Proxy together — usually bulletproof / C2 infra.
+	// 2. Hosting DC + Proxy together — bulletproof / C2 infra signal.
+	//    Even major cloud providers get KnownBad if proxy is also flagged.
 	if i.Hosting && i.Proxy {
 		return ClassKnownBad
 	}
 
-	// Proxy/VPN without hosting — anonymised source.
+	// 3. Proxy/VPN without hosting — anonymised source.
 	if i.Proxy {
 		return ClassSuspicious
 	}
 
-	// Hosting DC only — could be scanner, could be legit cloud.
+	// 4. Major cloud/CDN flagged as hosting — legitimate infra, not hostile DC.
+	//    Must be checked BEFORE the generic hosting=true → KnownBad rule.
 	if i.Hosting {
+		for _, kw := range knownCloudKeywords {
+			if strings.Contains(orgLower, kw) {
+				return ClassKnownCloud
+			}
+		}
+		// Generic hosting DC with no recognised cloud brand → KnownBad.
 		return ClassKnownBad
 	}
 
-	// Major CDN / carrier / big-tech — almost certainly benign.
+	// 5. Major CDN / carrier / big-tech (non-hosting) — benign.
+	for _, kw := range knownCloudKeywords {
+		if strings.Contains(orgLower, kw) {
+			return ClassKnownGood
+		}
+	}
 	for _, kw := range knownGoodKeywords {
 		if strings.Contains(orgLower, kw) {
 			return ClassKnownGood
@@ -185,8 +211,10 @@ func (i *Info) ClassBadge() string {
 		return "🇺🇸 *THE FEDS* — US Government / Federal Agency"
 	case ClassKnownGood:
 		return "✅ *KNOWN GOOD* — Major CDN / carrier infrastructure"
+	case ClassKnownCloud:
+		return "☁️ *KNOWN CLOUD* — Major cloud / CDN infrastructure"
 	case ClassKnownBad:
-		return "🚨 *KNOWN BAD* — Hosting datacenter / anonymous proxy"
+		return "🚨 *KNOWN BAD* — Anonymous proxy / bulletproof hosting"
 	case ClassSuspicious:
 		return "⚠️ *SUSPICIOUS* — Proxy / VPN detected"
 	default:
