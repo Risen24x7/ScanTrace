@@ -174,8 +174,41 @@ func (h *Handler) subscribeRTS() {
 	log.Printf("[rts] signal subscriptions active")
 }
 
+// splitArgs splits a raw Slack command text string into tokens, respecting
+// double-quoted strings. For example:
+//
+//	adddevice 192.168.50.4 label="Media Server" trust=trusted
+//
+// becomes ["adddevice", "192.168.50.4", `label=Media Server`, "trust=trusted"].
+// Quotes are stripped from the result values so downstream key=value parsing
+// works correctly regardless of whether the user quotes their label or not.
+func splitArgs(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inQuote = !inQuote
+		case c == ' ' && !inQuote:
+			if cur.Len() > 0 {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if cur.Len() > 0 {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
+}
+
 func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
-	parts := strings.Fields(strings.TrimSpace(cmd.Text))
+	// Use quote-aware splitting so label="Media Server" is one token.
+	parts := splitArgs(strings.TrimSpace(cmd.Text))
 	sub := "help"
 	if len(parts) > 0 {
 		sub = strings.ToLower(parts[0])
@@ -221,6 +254,7 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 //
 // All fields except <ip> are optional and default to label="<ip>", trust=unknown, suppress=false.
 // The upsert is keyed on IP — running the command again updates an existing entry.
+// Args are pre-split by splitArgs so quoted labels arrive as single tokens.
 func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 	if len(args) == 0 {
 		h.postEphemeral(channelID, userID,
@@ -243,15 +277,14 @@ func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 	autoSuppress := false
 
 	// Parse key=value pairs from remaining args.
-	// Handles both label=Plex and label="Plex Server" (shell already strips quotes,
-	// but Slack sends the raw text so we strip them ourselves).
+	// splitArgs already stripped surrounding quotes, so val is clean.
 	for _, arg := range args[1:] {
 		kv := strings.SplitN(arg, "=", 2)
 		if len(kv) != 2 {
 			continue
 		}
 		key := strings.ToLower(strings.TrimSpace(kv[0]))
-		val := strings.Trim(strings.TrimSpace(kv[1]), `"`)
+		val := strings.TrimSpace(kv[1])
 		switch key {
 		case "label":
 			label = val
@@ -292,8 +325,8 @@ func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 	}
 
 	if err := h.store.UpsertKnownDevice(d); err != nil {
-		log.Printf("[handler] adddevice upsert error: %v", err)
-		h.postEphemeral(channelID, userID, fmt.Sprintf("Failed to save device: %v", err))
+		log.Printf("[handler] adddevice upsert error ip=%s label=%q: %v", ipArg, label, err)
+		h.postEphemeral(channelID, userID, fmt.Sprintf("❌ Failed to save device `%s`: %v", ipArg, err))
 		return
 	}
 
@@ -1028,12 +1061,13 @@ func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool
 	}
 
 	if h.llm == nil {
-		h.postMessage(channelID, "", "LLM not configured.")
+		// No LLM — fall back to static report.
+		h.cmdReport(channelID, userID, caseIDPrefix)
 		return true
 	}
 
-	h.postMessage(channelID, "", fmt.Sprintf("_Briefing case: %s %s…_",
-		severityEmoji(target.Severity), target.CaseID[:8]))
+	dest := h.externalThreatChannel
+	h.postMessage(dest, "", fmt.Sprintf("_Briefing case %s…_", target.CaseID[:8]))
 
 	go func() {
 		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
@@ -1046,12 +1080,10 @@ func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool
 		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 		if err != nil {
 			log.Printf("[handler] mention case llm error %s: %v", target.CaseID[:8], err)
-			h.postMessage(channelID, "", fmt.Sprintf(
-				"⚠️ Case %s — inference error: %v", target.CaseID[:8], err,
-			))
+			h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", target.CaseID[:8], err))
 			return
 		}
-		h.postMessage(channelID, "", fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
+		h.postMessage(dest, "", fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
 	}()
 
 	return true
@@ -1059,111 +1091,77 @@ func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool
 
 func (h *Handler) buildLLMContext() string {
 	var sb strings.Builder
-
-	devices, _ := h.store.ListKnownDevices("", 30)
+	cases, _ := h.store.ListCases("", 10)
+	if len(cases) > 0 {
+		sb.WriteString("Recent cases:\n")
+		for _, c := range cases {
+			sb.WriteString(fmt.Sprintf("  id=%s title=%q sev=%s conf=%.0f%%\n",
+				c.CaseID[:8], c.Title, c.Severity, c.Confidence*100))
+		}
+	}
+	devices, _ := h.store.ListKnownDevices("", 20)
 	if len(devices) > 0 {
-		sb.WriteString(fmt.Sprintf("Known devices (%d):\n", len(devices)))
+		sb.WriteString("Known devices:\n")
 		for _, d := range devices {
-			identifier := d.IP
-			if identifier == "" {
-				identifier = d.MAC
-			}
-			sb.WriteString(fmt.Sprintf("  %s trust=%s label=%q suppress=%v\n",
-				identifier, d.TrustLabel, d.Label, d.AutoSuppress))
-		}
-		sb.WriteString("\n")
-	}
-
-	cases, err := h.store.ListCases("", 10)
-	if err != nil || len(cases) == 0 {
-		sb.WriteString("No cases.\n")
-		return sb.String()
-	}
-	sb.WriteString(fmt.Sprintf("Cases (%d):\n", len(cases)))
-
-	ipSet := make(map[string]struct{})
-
-	for _, c := range cases {
-		sb.WriteString(fmt.Sprintf("%s id=%s sev=%s conf=%.0f%% status=%s\n",
-			c.Title, c.CaseID[:8], c.Severity, c.Confidence*100, c.Status))
-
-		const maxEvents = 5
-		for i, evtID := range c.RelatedEventIDs {
-			if i >= maxEvents {
-				sb.WriteString(fmt.Sprintf("  +%d more events\n", len(c.RelatedEventIDs)-maxEvents))
-				break
-			}
-			evt, err := h.store.GetEvent(evtID)
-			if err != nil || evt == nil {
-				continue
-			}
-			line := fmt.Sprintf("  evt type=%s src=%s dst=%s dport=%d proto=%s",
-				evt.EventType, evt.SrcIP, evt.DstIP, evt.DstPort, evt.Protocol)
-			if evt.SrcIP != "" {
-				ipSet[evt.SrcIP] = struct{}{}
-			}
-			sb.WriteString(line + "\n")
+			sb.WriteString(fmt.Sprintf("  %s trust=%s label=%q\n", d.IP, d.TrustLabel, d.Label))
 		}
 	}
-
-	if len(ipSet) > 0 {
-		ips := make([]string, 0, len(ipSet))
-		for ip := range ipSet {
-			if len(ips) >= 20 {
-				break
-			}
-			ips = append(ips, ip)
-		}
-		if h.threat != nil {
-			scores := h.threat.LookupMany(ips)
-			if len(scores) > 0 {
-				sb.WriteString("\nThreat feed verdicts:\n")
-				for ip, s := range scores {
-					if tag := s.Tag(); tag != "" {
-						sb.WriteString(fmt.Sprintf("  %s → %s\n", ip, tag))
-					}
-				}
-			}
-		}
-		enriched := ipinfo.Enrich(ips)
-		sb.WriteString("\nIP intel:\n")
-		for ip, info := range enriched {
-			sb.WriteString(fmt.Sprintf("  %s: %s\n", ip, info.Summary()))
-		}
-	}
-
 	return sb.String()
 }
 
-func mentionRE(text string) string {
-	if len(text) > 0 && text[0] == '<' {
-		if idx := strings.Index(text, ">"); idx != -1 {
-			return strings.TrimSpace(text[idx+1:])
+func blocksFromRaw(raw string) ([]slack.Block, error) {
+	var payload struct {
+		Blocks []json.RawMessage `json:"blocks"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil, err
+	}
+	blocks := make([]slack.Block, 0, len(payload.Blocks))
+	for _, b := range payload.Blocks {
+		var typed struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(b, &typed); err != nil {
+			continue
+		}
+		switch typed.Type {
+		case "header":
+			var v slack.HeaderBlock
+			if err := json.Unmarshal(b, &v); err == nil {
+				blocks = append(blocks, &v)
+			}
+		case "section":
+			var v slack.SectionBlock
+			if err := json.Unmarshal(b, &v); err == nil {
+				blocks = append(blocks, &v)
+			}
+		case "divider":
+			blocks = append(blocks, slack.NewDividerBlock())
+		case "context":
+			var v slack.ContextBlock
+			if err := json.Unmarshal(b, &v); err == nil {
+				blocks = append(blocks, &v)
+			}
 		}
 	}
-	return text
+	return blocks, nil
 }
 
 func (h *Handler) postMessage(channelID, threadTS, text string) {
-	opts := []slack.MsgOption{
-		slack.MsgOptionText(text, false),
-		slack.MsgOptionAsUser(false),
-	}
+	opts := []slack.MsgOption{slack.MsgOptionText(text, false)}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 	_, _, err := h.api.PostMessage(channelID, opts...)
 	if err != nil {
-		log.Printf("[handler] postMessage error: %v", err)
+		log.Printf("[handler] postMessage error channel=%s: %v", channelID, err)
 	}
 }
 
 func (h *Handler) postEphemeral(channelID, userID, text string) {
-	_, err := h.api.PostEphemeral(channelID, userID,
-		slack.MsgOptionText(text, false),
-	)
+	_, err := h.api.PostEphemeralMessage(channelID, userID, slack.MsgOptionText(text, false))
 	if err != nil {
-		log.Printf("[handler] postEphemeral error: %v", err)
+		log.Printf("[handler] postEphemeral error channel=%s user=%s: %v", channelID, userID, err)
 	}
 }
 
@@ -1174,67 +1172,48 @@ func (h *Handler) postBlocks(channelID, threadTS string, blocks []slack.Block) {
 	}
 	_, _, err := h.api.PostMessage(channelID, opts...)
 	if err != nil {
-		log.Printf("[handler] postBlocks error: %v", err)
+		log.Printf("[handler] postBlocks error channel=%s: %v", channelID, err)
 	}
 }
 
-func blocksFromRaw(raw map[string]interface{}) ([]slack.Block, error) {
-	data, err := json.Marshal(raw)
-	if err != nil {
-		return nil, fmt.Errorf("blocksFromRaw marshal: %w", err)
-	}
-	var msg slack.Msg
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return nil, fmt.Errorf("blocksFromRaw unmarshal: %w", err)
-	}
-	if len(msg.Blocks.BlockSet) == 0 {
-		return nil, fmt.Errorf("blocksFromRaw: no blocks in payload")
-	}
-	return msg.Blocks.BlockSet, nil
-}
-
-func severityEmoji(s string) string {
-	switch strings.ToLower(s) {
+func severityEmoji(sev string) string {
+	switch strings.ToLower(sev) {
 	case "high":
 		return "🔴"
 	case "medium":
 		return "🟡"
-	case "low":
-		return "🟢"
 	default:
-		return "⚪"
+		return "🟢"
 	}
 }
 
-func trustEmoji(t string) string {
-	switch strings.ToLower(t) {
+func trustEmoji(trust string) string {
+	switch strings.ToLower(trust) {
 	case "trusted":
 		return "✅"
 	case "suspicious":
-		return "🚨"
+		return "⚠️"
 	default:
-		return "❔"
+		return "❓"
 	}
 }
 
 func helpText() string {
-	return `*ScanTrace — Network Security Intelligence*
-
-Available commands:
-• ` + "`/scantrace cases`" + ` — list recent cases
-• ` + "`/scantrace report <case-id>`" + ` — full case report
-• ` + "`/scantrace alert`" + ` — post latest high-severity case to alerts channel
-• ` + "`/scantrace devices`" + ` — show known device registry
-• ` + "`/scantrace adddevice <ip> [label=\"...\"] [trust=trusted|unknown|suspicious] [suppress=true]`" + ` — register or update a device
-• ` + "`/scantrace removedevice <ip>`" + ` — remove a device from the registry
-• ` + "`/scantrace review-all`" + ` — queue all open cases for individual LLM briefings
-• ` + "`/scantrace next`" + ` — briefing for the single highest-priority open case
-• ` + "`/scantrace mcp`" + ` — MCP server status
-• ` + "`/scantrace help`" + ` — this message
-
-You can also @mention ScanTrace:
-• ` + "`@ScanTrace cases`" + ` — same rich case list
-• ` + "`@ScanTrace case <id>`" + ` — full briefing for a specific case
-• ` + "`@ScanTrace report <id>`" + ` — alias for case briefing
-• ` + "`@ScanTrace review case <id>`" + ` — alias for case briefing`
+	return "*ScanTrace Commands*\n\n" +
+		"*Cases*\n" +
+		"• `/scantrace cases` — list active cases\n" +
+		"• `/scantrace report <id>` — static report for a case\n" +
+		"• `/scantrace next` — AI briefing of highest-priority case\n" +
+		"• `/scantrace review-all` — AI briefing of all open cases\n" +
+		"• `/scantrace alert` — repost latest case alert\n\n" +
+		"*Devices*\n" +
+		"• `/scantrace devices` — list known device registry\n" +
+		"• `/scantrace adddevice <ip> [label=\"Name\"] [trust=trusted|unknown|suspicious] [suppress=true]`\n" +
+		"• `/scantrace removedevice <ip>` — remove device from registry\n\n" +
+		"*Mentions*\n" +
+		"• `@ScanTrace case <id>` — AI briefing for a specific case\n" +
+		"• `@ScanTrace report <id>` — same as above\n" +
+		"• `@ScanTrace cases` — list active cases\n\n" +
+		"*Other*\n" +
+		"• `/scantrace mcp` — MCP server info"
 }
