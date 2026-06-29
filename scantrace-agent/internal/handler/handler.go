@@ -29,6 +29,7 @@ type Handler struct {
 	rts                   *rts.Client
 	llm                   *llm.Client
 	threat                *threat.Enricher
+	benignScanners        *threat.BenignScanners
 
 	mu          sync.Mutex
 	caseThreads map[string]string
@@ -43,7 +44,8 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 		wanIP:                 wanIP,
 		rts:                   rtsClient,
 		llm:                   llmClient,
-		threat:                threat.New("", ""), // uses default /opt/scantrace paths
+		threat:                threat.New("", ""),             // uses default /opt/scantrace paths
+		benignScanners:        threat.NewBenignScanners(""),   // uses default /opt/scantrace/benign-scanners.txt
 		caseThreads:           make(map[string]string),
 	}
 }
@@ -53,7 +55,9 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 type triageState struct {
 	isWANEdgeOnly        bool // all events are wan_new_connection
 	dstInRegistry        bool // at least one dst IP found in device registry
-	logsConfirmMalicious bool // set by threat-feed lookup (IPSum or Tor exit)
+	logsConfirmMalicious bool // set by threat-feed lookup (IPSum >= threshold or Tor exit)
+	isBenignScanner      bool // source matched known research scanner list (Shodan, Censys, etc.)
+	ipsumTier            int  // highest IPSum tier across all case IPs (0=clean, 1=noise, 2=scanner, 3=blacklisted)
 }
 
 // selectActionPlan converts the pre-evaluated triage state into a single
@@ -61,24 +65,44 @@ type triageState struct {
 // alternative conditions to collapse into a checklist.
 func selectActionPlan(ts triageState) string {
 	switch {
+	// F — universally blacklisted: auto-escalate regardless of topology.
+	case ts.ipsumTier >= threat.TierBlacklisted:
+		return "*Recommended Actions*\nCondition Matched: F — source universally blacklisted (IPSum score ≥6, majority of feeds agree)\n" +
+			"- [VERDICT: LIKELY MALICIOUS] Source is blacklisted across the majority of independent threat-feed sources.\n" +
+			"- Block the source IP or subnet at the gateway firewall immediately.\n" +
+			"- Close or restrict the targeted port if no external access is required.\n" +
+			"- Escalate to a human analyst if the internal host shows any signs of compromise."
+
+	// E — benign research scanner: demote to LOW, no action required.
+	case ts.isBenignScanner:
+		return "*Recommended Actions*\nCondition Matched: E — source is a known benign research scanner (Shodan / Censys / Shadowserver / similar)\n" +
+			"- [VERDICT: LIKELY BENIGN] This traffic originates from a well-known, opt-outable internet scanning service.\n" +
+			"- No blocking required. These scanners perform routine internet-wide surveys.\n" +
+			"- If you wish to suppress future alerts from this source, add the IP/CIDR to /opt/scantrace/benign-scanners.txt.\n" +
+			"- Review only if the scan volume is unusually high (>50 events/hour from the same IP)."
+
+	// D — threat feed confirms malicious activity.
 	case ts.logsConfirmMalicious:
 		return "*Recommended Actions*\nCondition Matched: D — host verified, logs confirm malicious activity\n" +
 			"- Block the source IP or subnet at the gateway firewall.\n" +
 			"- Close or restrict the targeted port if no external access is required.\n" +
 			"- Escalate to a human analyst if the internal host shows signs of compromise."
 
+	// A — WAN edge only, never reached LAN.
 	case ts.isWANEdgeOnly:
 		return "*Recommended Actions*\nCondition Matched: A — wan_new_connection (WAN edge only, never reached LAN)\n" +
 			"- Traffic hit the WAN interface only and was not forwarded. No internal host is at risk.\n" +
 			"- If the port is not intentionally exposed, consider closing it at the gateway to reduce noise.\n" +
 			"- No urgent action required unless volume is significant or ports are highly sensitive (22, 3389)."
 
+	// B — unknown internal host, wan_forward landed.
 	case !ts.dstInRegistry:
 		return "*Recommended Actions*\nCondition Matched: B — unknown internal host, wan_forward traffic landed\n" +
 			"- Identify the device at the destination IP — run arp-scan or check DHCP leases before any other step.\n" +
 			"- Once identified, check its app/proxy logs for requests matching these event timestamps.\n" +
 			"- If no legitimate service found, remove or restrict the port-forwarding rule at the gateway."
 
+	// C — registered host, wan_forward landed.
 	default:
 		return "*Recommended Actions*\nCondition Matched: C — registered host, wan_forward traffic landed\n" +
 			"- Check app/proxy logs on the destination host for requests matching these timestamps.\n" +
@@ -319,12 +343,23 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		ts.isWANEdgeOnly = true
 	}
 
-	// ── Threat-feed enrichment ───────────────────────────────────────────────
 	ips := make([]string, 0, len(ipSet))
 	for ip := range ipSet {
 		ips = append(ips, ip)
 	}
 
+	// ── Benign scanner check (before threat feed) ────────────────────────────
+	if h.benignScanners != nil {
+		for _, ip := range ips {
+			if h.benignScanners.IsBenignScanner(ip) {
+				ts.isBenignScanner = true
+				sb.WriteString(fmt.Sprintf("\nBenign scanner detected: %s → known research scanner (Shodan/Censys/Shadowserver/similar)\n", ip))
+				break // one match is enough to demote the case
+			}
+		}
+	}
+
+	// ── Threat-feed enrichment ───────────────────────────────────────────────
 	if h.threat != nil && len(ips) > 0 {
 		scores := h.threat.LookupMany(ips)
 		if len(scores) > 0 {
@@ -336,6 +371,9 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 				}
 				if s.IsConfirmedMalicious() || s.IsTorExit {
 					ts.logsConfirmMalicious = true
+				}
+				if tier := s.Tier(); tier > ts.ipsumTier {
+					ts.ipsumTier = tier
 				}
 			}
 		}
