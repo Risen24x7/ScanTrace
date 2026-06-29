@@ -9,7 +9,9 @@
 //   SCANTRACE_ASUS_STATE      Asus sensor-id file    (default: .asus-sensor-id)
 //   SCANTRACE_SYSLOG_PORT     UDP syslog port        (default: 5140)
 //   CORRELATE_INTERVAL        correlator run interval (default: 5m)
-//   ALERT_CHANNEL             Slack channel ID for case alerts (default: C0BBP1EP68P)
+//   ALERT_CHANNEL             Slack channel ID for incoming case alerts (default: C0BBP1EP68P)
+//   EXTERNAL_THREAT_CHANNEL   Slack channel ID where external threat work is done;
+//                             @mention LLM responses are posted here (default: ALERT_CHANNEL)
 //   MCP_ADDR                  MCP HTTP listen addr   (default: :8765)
 //   LLM_BASE_URL              Ollama endpoint        (default: http://192.168.50.250:11434)
 //   LLM_MODEL                 model name
@@ -37,9 +39,10 @@ func main() {
 	appToken := mustEnv("SLACK_APP_TOKEN")
 
 	dbPath := envOrDefault("SCANTRACE_DB", "../ScanTrace/scantrace.db")
-	// Default to the actual channel ID — NOT a channel name like #sec-alerts.
-	// PostMessage requires a channel ID (Cxxxxxxxxx), not a name.
 	alertChannel := envOrDefault("ALERT_CHANNEL", "C0BBP1EP68P")
+	// EXTERNAL_THREAT_CHANNEL: where @mention LLM responses are posted (sec-intel-external).
+	// Falls back to alertChannel so single-channel setups keep working.
+	externalThreatChannel := envOrDefault("EXTERNAL_THREAT_CHANNEL", alertChannel)
 	mcpAddr := envOrDefault("MCP_ADDR", ":8765")
 	llmBase := envOrDefault("LLM_BASE_URL", "http://192.168.50.250:11434")
 	llmModel := envOrDefault("LLM_MODEL", "")
@@ -61,7 +64,8 @@ func main() {
 	log.Printf("[bot] LLM endpoint: %s (model=%q)", llmBase, llmModel)
 
 	rtsClient := rts.New(botToken)
-	h := handler.New(api, store, alertChannel, rtsClient, llmClient)
+	h := handler.New(api, store, alertChannel, externalThreatChannel, rtsClient, llmClient)
+	log.Printf("[bot] alert channel: %s | external threat channel: %s", alertChannel, externalThreatChannel)
 
 	// UDP syslog listener
 	statePath := envOrDefault("SCANTRACE_ASUS_STATE", ".asus-sensor-id")

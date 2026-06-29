@@ -19,24 +19,26 @@ import (
 )
 
 type Handler struct {
-	api          *slack.Client
-	store        *db.DB
-	alertChannel string
-	rts          *rts.Client
-	llm          *llm.Client
+	api                  *slack.Client
+	store                *db.DB
+	alertChannel         string // sec-alerts — raw case alerts
+	externalThreatChannel string // sec-intel-external — LLM mention responses
+	rts                  *rts.Client
+	llm                  *llm.Client
 
 	mu          sync.Mutex
 	caseThreads map[string]string
 }
 
-func New(api *slack.Client, store *db.DB, alertChannel string, rtsClient *rts.Client, llmClient *llm.Client) *Handler {
+func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel string, rtsClient *rts.Client, llmClient *llm.Client) *Handler {
 	return &Handler{
-		api:          api,
-		store:        store,
-		alertChannel: alertChannel,
-		rts:          rtsClient,
-		llm:          llmClient,
-		caseThreads:  make(map[string]string),
+		api:                  api,
+		store:                store,
+		alertChannel:         alertChannel,
+		externalThreatChannel: externalThreatChannel,
+		rts:                  rtsClient,
+		llm:                  llmClient,
+		caseThreads:          make(map[string]string),
 	}
 }
 
@@ -113,7 +115,7 @@ func (h *Handler) cmdCases(channelID, userID string) {
 	var lines []string
 	for _, c := range cases {
 		emoji := severityEmoji(c.Severity)
-		lines = append(lines, fmt.Sprintf("%s `%s` *%s* — %s (%.0f%%)",
+		lines = append(lines, fmt.Sprintf("%s %s *%s* — %s (%.0f%%)",
 			emoji, c.CaseID[:8], strings.ToUpper(c.Severity), c.Title, c.Confidence*100))
 	}
 	blocks := []slack.Block{
@@ -213,17 +215,28 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 	h.mu.Unlock()
 
 	if existingThread != "" {
-		update := fmt.Sprintf("🔄 *Case `%s` updated* — %s (%.0f%% confidence)",
-			c.CaseID[:8], c.Title, c.Confidence*100)
+		// Compact thread reply — no full briefing, no backtick case IDs.
+		// Derive the port and event count from the report summary if available.
+		port := extractFirstPort(report)
+		eventCount := len(c.RelatedEventIDs)
+		var update string
+		if port != "" {
+			update = fmt.Sprintf("%s [%s] Additional entry for Case ID: %s  Port: %s  Events: %d",
+				severityEmoji(c.Severity), c.Title, c.CaseID[:8], port, eventCount)
+		} else {
+			update = fmt.Sprintf("%s [%s] Additional entry for Case ID: %s  Events: %d",
+				severityEmoji(c.Severity), c.Title, c.CaseID[:8], eventCount)
+		}
 		h.postMessage(h.alertChannel, existingThread, update)
 		log.Printf("[handler] thread reply for case %s to %s", c.CaseID[:8], h.alertChannel)
 		return
 	}
 
+	// First occurrence — full alert block.
 	blocks, err := blocksFromRaw(report.SlackBlock())
 	var ts string
 	if err != nil {
-		text := fmt.Sprintf("%s *[%s] Case `%s`* — %s\nseverity=%s confidence=%.0f%%",
+		text := fmt.Sprintf("%s *[%s] Case %s* — %s\nseverity=%s confidence=%.0f%%",
 			severityEmoji(c.Severity), strings.ToUpper(c.Severity),
 			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
 		_, ts, err = h.api.PostMessage(h.alertChannel,
@@ -258,6 +271,23 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 	log.Printf("[handler] posted alert for case %s to %s (ts=%s)", c.CaseID[:8], h.alertChannel, ts)
 }
 
+// extractFirstPort pulls the first destination port from a report's related events.
+func extractFirstPort(report *casebuilder.Report) string {
+	if report == nil {
+		return ""
+	}
+	for _, line := range strings.Split(report.Markdown, "\n") {
+		if strings.Contains(line, "dport=") {
+			for _, field := range strings.Fields(line) {
+				if strings.HasPrefix(field, "dport=") {
+					return strings.TrimPrefix(field, "dport=")
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 	switch event.InnerEvent.Type {
 	case "app_mention":
@@ -288,18 +318,22 @@ func (h *Handler) handleMention(channelID, userID, text string) {
 		return
 	}
 
-	h.postMessage(channelID, "", "_Thinking…_")
+	// Post thinking indicator and LLM response to sec-intel-external,
+	// not sec-alerts — keeps the alert channel clean.
+	destChannel := h.externalThreatChannel
+
+	h.postMessage(destChannel, "", "_Thinking…_")
 
 	ctx := h.buildLLMContext()
 	answer, err := h.llm.Ask(clean, ctx)
 	if err != nil {
 		log.Printf("[handler] llm error: %v", err)
-		h.postMessage(channelID, "",
+		h.postMessage(destChannel, "",
 			"⚠️ Could not reach the inference worker. Is the desktop running?\n"+
 				"Use `/scantrace cases` or `/scantrace report <id>` in the meantime.")
 		return
 	}
-	h.postMessage(channelID, "", answer)
+	h.postMessage(destChannel, "", answer)
 }
 
 // buildLLMContext assembles a compact snapshot for the LLM.
@@ -353,7 +387,6 @@ func (h *Handler) buildLLMContext() string {
 		}
 	}
 
-	// Enrich up to 20 unique external IPs.
 	if len(ipSet) > 0 {
 		ips := make([]string, 0, len(ipSet))
 		for ip := range ipSet {
@@ -389,7 +422,7 @@ func (h *Handler) cmdHighSeverity(channelID, userID string) {
 	}
 	var lines []string
 	for _, c := range cases {
-		lines = append(lines, fmt.Sprintf("🔴 `%s` *%s* (%.0f%% confidence)",
+		lines = append(lines, fmt.Sprintf("🔴 %s *%s* (%.0f%% confidence)",
 			c.CaseID[:8], c.Title, c.Confidence*100))
 	}
 	h.postBlocks(channelID, "", []slack.Block{
