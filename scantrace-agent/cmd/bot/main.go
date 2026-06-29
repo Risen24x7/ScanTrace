@@ -9,6 +9,7 @@ import (
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/syslog"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/socketmode"
 )
@@ -53,6 +54,18 @@ func main() {
 
 	h := handler.New(api, store, alertChannel, externalThreatChannel, wanIP, rtsClient, llmClient)
 
+	// ── Syslog UDP ingest ──────────────────────────────────────────────────
+	// Binds to SCANTRACE_SYSLOG_PORT (default 5140) and parses iptables DROP
+	// lines forwarded from the gateway router into ScanTrace events + cases.
+	syslogPort := envOrDefault("SCANTRACE_SYSLOG_PORT", "5140")
+	go func() {
+		if err := syslog.Listen(":"+syslogPort, store, h); err != nil {
+			log.Fatalf("[main] syslog listener: %v", err)
+		}
+	}()
+	log.Printf("[main] syslog ingest started on UDP :%s", syslogPort)
+
+	// ── Slack Socket Mode ──────────────────────────────────────────────────
 	go func() {
 		for evt := range client.Events {
 			h.Dispatch(client, evt)
