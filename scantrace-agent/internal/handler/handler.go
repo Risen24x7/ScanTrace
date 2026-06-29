@@ -116,6 +116,29 @@ func selectActionPlan(ts triageState) string {
 	}
 }
 
+// buildTriageBlock returns the plain-text triage block that is injected
+// verbatim into the singleCasePromptTemplate %s[0] placeholder.
+// It must match what buildSingleCaseContext writes into the context string
+// so the LLM sees consistent data in both places.
+func buildTriageBlock(ts triageState, portsSeen []string) string {
+	blacklistNote := ""
+	switch {
+	case ts.ipsumTier >= threat.TierBlacklisted:
+		blacklistNote = "\n- Source threat tier? [UNIVERSALLY BLACKLISTED — IPSum score ≥6, majority of independent feeds agree]"
+	case ts.isBenignScanner:
+		blacklistNote = "\n- Source threat tier? [BENIGN SCANNER — known research scanner, opt-outable]"
+	case ts.logsConfirmMalicious:
+		blacklistNote = "\n- Source threat tier? [CONFIRMED MALICIOUS — threat feed verified]"
+	}
+	return fmt.Sprintf(
+		"- Dst host in registry? [%s]\n- Event type(s)? [%s]\n- Ports targeted? [%s]%s",
+		ts.dstLabel,
+		ts.evtSummary,
+		strings.Join(portsSeen, ", "),
+		blacklistNote,
+	)
+}
+
 func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 	switch evt.Type {
 	case socketmode.EventTypeConnecting:
@@ -325,13 +348,14 @@ func (h *Handler) cmdReviewAll(channelID, userID string) {
 
 	go func() {
 		for i, c := range cases {
-			ctx, triage := h.buildSingleCaseContext(c)
+			ctx, triage, portsSeen := h.buildSingleCaseContext(c)
+			triageBlock := buildTriageBlock(triage, portsSeen)
 			actionPlan := selectActionPlan(triage)
 			prompt := fmt.Sprintf(
 				"Analyse this single case and provide a full briefing.\n\nCase ID: %s",
 				c.CaseID[:8],
 			)
-			answer, err := h.llm.AskCase(prompt, ctx, actionPlan)
+			answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 			if err != nil {
 				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
 				h.postMessage(dest, "", fmt.Sprintf(
@@ -374,13 +398,14 @@ func (h *Handler) cmdNext(channelID, userID string) {
 		severityEmoji(target.Severity), target.CaseID[:8]))
 
 	go func() {
-		ctx, triage := h.buildSingleCaseContext(target)
+		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
+		triageBlock := buildTriageBlock(triage, portsSeen)
 		actionPlan := selectActionPlan(triage)
 		prompt := fmt.Sprintf(
 			"Analyse this case and provide a full briefing.\n\nCase ID: %s",
 			target.CaseID[:8],
 		)
-		answer, err := h.llm.AskCase(prompt, ctx, actionPlan)
+		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 		if err != nil {
 			log.Printf("[handler] next llm error case %s: %v", target.CaseID[:8], err)
 			h.postMessage(dest, "", fmt.Sprintf(
@@ -423,13 +448,14 @@ func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge 
 
 // buildSingleCaseContext builds the LLM context string and simultaneously
 // evaluates the triageState so the caller can pre-select the action plan.
+// It now also returns portsSeen so callers can pass it to buildTriageBlock.
 //
 // Key ordering guarantee: threat-feed and benign-scanner checks run during
 // Pass 1 (alongside event classification) so ts.ipsumTier,
 // ts.logsConfirmMalicious, and ts.isBenignScanner are all resolved before
 // the Triage block is written. This ensures the LLM sees the blacklist
 // verdict inline in Triage rather than only discovering it later.
-func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
+func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []string) {
 	var sb strings.Builder
 	var ts triageState
 
@@ -530,8 +556,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	ts.evtSummary = strings.Join(evtParts, ", ")
 
 	// ── Resolve threat-feed + benign-scanner flags BEFORE writing Triage ─────
-	// This must happen here so ts.ipsumTier / ts.isBenignScanner are populated
-	// when the Triage block is written below.
 	ips := make([]string, 0, len(ipSet))
 	for ip := range ipSet {
 		ips = append(ips, ip)
@@ -579,11 +603,7 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		ts.dstLabel = "MIXED — see event list below"
 	}
 
-	// ── Triage block — written after threat-feed so blacklist tier is known ───
-	//
-	// Threat severity line is injected here when the source is blacklisted so
-	// the LLM sees it as a pre-resolved fact at the top of context, not buried
-	// in the threat-feed section below.
+	// ── Triage block written into context string ──────────────────────────────
 	blacklistNote := ""
 	switch {
 	case ts.ipsumTier >= threat.TierBlacklisted:
@@ -631,7 +651,7 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		}
 	}
 
-	return sb.String(), ts
+	return sb.String(), ts, portsSeen
 }
 
 // caseSrcIPs collects unique source IPs for a case (fast, no LLM).
@@ -1016,13 +1036,14 @@ func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool
 		severityEmoji(target.Severity), target.CaseID[:8]))
 
 	go func() {
-		ctx, triage := h.buildSingleCaseContext(target)
+		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
+		triageBlock := buildTriageBlock(triage, portsSeen)
 		actionPlan := selectActionPlan(triage)
 		prompt := fmt.Sprintf(
 			"Analyse this case and provide a full briefing.\n\nCase ID: %s",
 			target.CaseID[:8],
 		)
-		answer, err := h.llm.AskCase(prompt, ctx, actionPlan)
+		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 		if err != nil {
 			log.Printf("[handler] mention case llm error %s: %v", target.CaseID[:8], err)
 			h.postMessage(channelID, "", fmt.Sprintf(
