@@ -15,7 +15,8 @@ import (
 
 const (
 	// systemPrompt is injected as the first message on every request.
-	// /no_think disables Qwen3 chain-of-thought, reducing latency and token usage.
+	// /no_think disables Qwen3 chain-of-thought — Ollama may ignore this;
+	// partial or full think blocks are stripped client-side by thinkRE/partialThinkRE.
 	systemPrompt = `/no_think
 You are ScanTrace, an AI-powered network security analyst.
 You help security teams triage alerts, investigate incidents, and understand
@@ -53,8 +54,13 @@ When no relevant context is available, say so honestly.`
 	defaultTimeout = 120 * time.Second
 )
 
-// thinkRE strips Qwen3 <think>...</think> reasoning blocks from output.
+// thinkRE strips complete Qwen3 <think>...</think> reasoning blocks.
 var thinkRE = regexp.MustCompile(`(?s)<think>.*?</think>`)
+
+// partialThinkRE strips an opening <think> tag with no matching </think>
+// (i.e. the model started reasoning but the block was never closed — everything
+// after the tag is reasoning, so we drop it all).
+var partialThinkRE = regexp.MustCompile(`(?s)<think>.*$`)
 
 // Message is an OpenAI-style chat message.
 type Message struct {
@@ -99,6 +105,8 @@ func (c *Client) Ask(question, context string) (string, error) {
 		"messages":   messages,
 		"stream":     false,
 		"max_tokens": 800,
+		// Ollama-specific: disable thinking mode
+		"think": false,
 	}
 	if c.model != "" {
 		body["model"] = c.model
@@ -147,7 +155,13 @@ func (c *Client) Ask(question, context string) (string, error) {
 		return "", fmt.Errorf("llm: empty choices")
 	}
 
-	// Strip any residual <think>...</think> blocks.
-	text := thinkRE.ReplaceAllString(result.Choices[0].Message.Content, "")
+	text := result.Choices[0].Message.Content
+
+	// 1. Strip complete <think>...</think> blocks.
+	text = thinkRE.ReplaceAllString(text, "")
+
+	// 2. Strip any remaining partial <think> block (open tag, no close).
+	text = partialThinkRE.ReplaceAllString(text, "")
+
 	return strings.TrimSpace(text), nil
 }
