@@ -62,7 +62,10 @@ Response rules:
 
 Prioritise provided context. If data is absent, say so.`
 
-	singleCasePrompt = `/no_think
+	// singleCasePromptTemplate is rendered by AskCase with the pre-selected
+	// action plan injected by the Go layer. The model only sees one condition
+	// block — it cannot collapse multiple branches into a generic checklist.
+	singleCasePromptTemplate = `/no_think
 You are ScanTrace, an AI-powered network security analyst.
 You are analysing a SINGLE network security case from a home/MSP gateway.
 The operator built this system and knows their own network. Apply engineering
@@ -120,38 +123,10 @@ Example: [VERDICT: LIKELY MALICIOUS] Repeated inbound HTTPS from an unregistered
 Reasoning tied to triage answers only. No generic scanner warnings for cloud IPs.
 If event type is wan_new_connection, note that traffic never reached the LAN.
 
-[RECOMMENDED ACTIONS FORMAT]
-Step 1: Write "Condition Matched: [A | B | C | D]"
-Step 2: Write the action plan for that condition only.
-Do not print any other condition or its actions.
+[RECOMMENDED ACTIONS]
+Copy the block below verbatim. Do not rewrite, summarise, or add extra bullets.
 
-Condition A — Event type is wan_new_connection (WAN edge only, never reached LAN):
-*Recommended Actions*
-Condition Matched: A
-- Traffic hit the WAN interface only and was not forwarded. No internal host is at risk.
-- If the port is not intentionally exposed, consider closing it at the gateway to reduce noise.
-- No urgent action required unless volume is significant or ports are highly sensitive (22, 3389).
-
-Condition B — Dst is unknown internal host AND event type is wan_forward:
-*Recommended Actions*
-Condition Matched: B
-- Identify the device at [dst IP] — run arp-scan or check DHCP leases before any other step.
-- Once identified, check its app/proxy logs for requests matching these event timestamps.
-- If no legitimate service found, remove or restrict the port-forwarding rule at the gateway.
-
-Condition C — Dst IS in registry AND event type is wan_forward:
-*Recommended Actions*
-Condition Matched: C
-- Check app/proxy logs on [dst IP] for requests matching these timestamps.
-- If no matching legitimate requests, restrict or remove the port-forwarding rule.
-- If logs confirm malicious intent, block the source IP at the gateway.
-
-Condition D — Host is verified AND logs confirm malicious activity:
-*Recommended Actions*
-Condition Matched: D
-- Block the source IP or subnet at the gateway firewall.
-- Close or restrict the targeted port if no external access is required.
-- Escalate to a human analyst if the internal host shows signs of compromise.
+%s
 
 ================================================================
 
@@ -186,8 +161,11 @@ func (c *Client) Ask(question, context string) (string, error) {
 	return c.ask(systemPrompt, question, context)
 }
 
-func (c *Client) AskCase(question, context string) (string, error) {
-	return c.ask(singleCasePrompt, question, context)
+// AskCase renders the single-case prompt with the pre-selected actionPlan
+// injected by the Go handler layer before calling the LLM.
+func (c *Client) AskCase(question, context, actionPlan string) (string, error) {
+	prompt := fmt.Sprintf(singleCasePromptTemplate, actionPlan)
+	return c.ask(prompt, question, context)
 }
 
 func (c *Client) ask(prompt, question, context string) (string, error) {

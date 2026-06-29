@@ -45,6 +45,49 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 	}
 }
 
+// triageState captures the facts Go already knows so we can pre-select the
+// correct action plan before the LLM prompt is assembled.
+type triageState struct {
+	isWANEdgeOnly       bool // all events are wan_new_connection
+	dstInRegistry       bool // at least one dst IP found in device registry
+	logsConfirmMalicious bool // reserved: set by future signal/enrichment layer
+}
+
+// selectActionPlan converts the pre-evaluated triage state into a single
+// ready-to-inject action block. The model receives only this block — no
+// alternative conditions to collapse into a checklist.
+func selectActionPlan(ts triageState) string {
+	switch {
+	case ts.logsConfirmMalicious:
+		// Condition D — confirmed malicious activity
+		return "*Recommended Actions*\nCondition Matched: D — host verified, logs confirm malicious activity\n" +
+			"- Block the source IP or subnet at the gateway firewall.\n" +
+			"- Close or restrict the targeted port if no external access is required.\n" +
+			"- Escalate to a human analyst if the internal host shows signs of compromise."
+
+	case ts.isWANEdgeOnly:
+		// Condition A — traffic hit WAN edge only, never reached LAN
+		return "*Recommended Actions*\nCondition Matched: A — wan_new_connection (WAN edge only, never reached LAN)\n" +
+			"- Traffic hit the WAN interface only and was not forwarded. No internal host is at risk.\n" +
+			"- If the port is not intentionally exposed, consider closing it at the gateway to reduce noise.\n" +
+			"- No urgent action required unless volume is significant or ports are highly sensitive (22, 3389)."
+
+	case !ts.dstInRegistry:
+		// Condition B — dst is an unknown internal host, traffic forwarded
+		return "*Recommended Actions*\nCondition Matched: B — unknown internal host, wan_forward traffic landed\n" +
+			"- Identify the device at the destination IP — run arp-scan or check DHCP leases before any other step.\n" +
+			"- Once identified, check its app/proxy logs for requests matching these event timestamps.\n" +
+			"- If no legitimate service found, remove or restrict the port-forwarding rule at the gateway."
+
+	default:
+		// Condition C — dst is known in registry, traffic forwarded
+		return "*Recommended Actions*\nCondition Matched: C — registered host, wan_forward traffic landed\n" +
+			"- Check app/proxy logs on the destination host for requests matching these timestamps.\n" +
+			"- If no matching legitimate requests, restrict or remove the port-forwarding rule.\n" +
+			"- If logs confirm malicious intent, block the source IP at the gateway."
+	}
+}
+
 func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 	switch evt.Type {
 	case socketmode.EventTypeConnecting:
@@ -133,12 +176,13 @@ func (h *Handler) cmdReviewAll(channelID, userID string) {
 
 	go func() {
 		for i, c := range cases {
-			ctx := h.buildSingleCaseContext(c)
+			ctx, triage := h.buildSingleCaseContext(c)
+			actionPlan := selectActionPlan(triage)
 			prompt := fmt.Sprintf(
-				"Analyse this single case and provide a full briefing with recommended actions.\n\nCase ID: %s",
+				"Analyse this single case and provide a full briefing.\n\nCase ID: %s",
 				c.CaseID[:8],
 			)
-			answer, err := h.llm.AskCase(prompt, ctx)
+			answer, err := h.llm.AskCase(prompt, ctx, actionPlan)
 			if err != nil {
 				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
 				h.postMessage(dest, "", fmt.Sprintf(
@@ -182,12 +226,13 @@ func (h *Handler) cmdNext(channelID, userID string) {
 		severityEmoji(target.Severity), target.CaseID[:8]))
 
 	go func() {
-		ctx := h.buildSingleCaseContext(target)
+		ctx, triage := h.buildSingleCaseContext(target)
+		actionPlan := selectActionPlan(triage)
 		prompt := fmt.Sprintf(
-			"Analyse this case and provide a full briefing with recommended actions.\n\nCase ID: %s",
+			"Analyse this case and provide a full briefing.\n\nCase ID: %s",
 			target.CaseID[:8],
 		)
-		answer, err := h.llm.AskCase(prompt, ctx)
+		answer, err := h.llm.AskCase(prompt, ctx, actionPlan)
 		if err != nil {
 			log.Printf("[handler] next llm error case %s: %v", target.CaseID[:8], err)
 			h.postMessage(dest, "", fmt.Sprintf(
@@ -200,24 +245,24 @@ func (h *Handler) cmdNext(channelID, userID string) {
 }
 
 // classifyDst determines the triage label for a destination IP.
-// wan_new_connection events hit only the WAN edge — the dst is the gateway
-// itself, not an internal host. We must not pass it to the LLM as an
-// "unknown internal host" or it will hallucinate a rogue device on the LAN.
 func (h *Handler) classifyDst(dstIP, eventType string) string {
-	// Public WAN IP: the connection hit the router's external interface.
 	if h.wanIP != "" && dstIP == h.wanIP {
 		return "WAN edge interface (gateway external IP — not an internal host)"
 	}
-	// wan_new_connection without a matching port-forward rule never reaches LAN.
 	if strings.EqualFold(eventType, "wan_new_connection") {
 		return "WAN edge interface (connection hit gateway only — no port-forward rule matched)"
 	}
-	return "" // caller will check device registry
+	return ""
 }
 
-// buildSingleCaseContext builds a focused context for one case only.
-func (h *Handler) buildSingleCaseContext(c *db.Case) string {
+// buildSingleCaseContext builds the LLM context string and simultaneously
+// evaluates the triageState so the caller can pre-select the action plan
+// without asking the model to perform conditional logic.
+func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	var sb strings.Builder
+	var ts triageState
+
+	evtTypesSeen := make(map[string]int) // count event types to determine dominance
 
 	devices, _ := h.store.ListKnownDevices("", 30)
 	deviceMap := make(map[string]*db.KnownDevice)
@@ -247,14 +292,13 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) string {
 			continue
 		}
 
-		// Resolve dst label before writing the event line so the LLM gets
-		// accurate triage state rather than seeing a public IP presented as
-		// an unmapped internal host.
+		evtTypesSeen[strings.ToLower(evt.EventType)]++
+
 		dstLabel := h.classifyDst(evt.DstIP, evt.EventType)
 		if dstLabel == "" {
-			// Check device registry.
 			if dev, ok := deviceMap[evt.DstIP]; ok {
 				dstLabel = fmt.Sprintf("registry: label=%q trust=%s", dev.Label, dev.TrustLabel)
+				ts.dstInRegistry = true
 			} else {
 				dstLabel = "unknown internal host"
 			}
@@ -265,6 +309,16 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) string {
 		if evt.SrcIP != "" {
 			ipSet[evt.SrcIP] = struct{}{}
 		}
+	}
+
+	// Determine dominant event type: if ALL events are wan_new_connection the
+	// traffic never reached the LAN.
+	total := 0
+	for _, n := range evtTypesSeen {
+		total += n
+	}
+	if total > 0 && evtTypesSeen["wan_new_connection"] == total {
+		ts.isWANEdgeOnly = true
 	}
 
 	if len(ipSet) > 0 {
@@ -279,7 +333,7 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) string {
 		}
 	}
 
-	return sb.String()
+	return sb.String(), ts
 }
 
 func (h *Handler) cmdCases(channelID, userID string) {
