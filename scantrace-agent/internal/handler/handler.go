@@ -60,7 +60,7 @@ type triageState struct {
 	isBenignScanner      bool // source matched known research scanner list
 	ipsumTier            int  // highest IPSum tier across all case IPs
 	// Triage summary strings — injected directly into LLM context.
-	dstLabel  string // e.g. "WAN EDGE — gateway interface only" or "unknown internal host" or "registry: label=..."
+	dstLabel   string // e.g. "WAN EDGE — gateway interface only" or "unknown internal host" or "registry: label=..."
 	evtSummary string // e.g. "wan_forward (2), wan_new_connection (2)"
 }
 
@@ -298,6 +298,12 @@ func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge 
 
 // buildSingleCaseContext builds the LLM context string and simultaneously
 // evaluates the triageState so the caller can pre-select the action plan.
+//
+// Key ordering guarantee: threat-feed and benign-scanner checks run during
+// Pass 1 (alongside event classification) so ts.ipsumTier,
+// ts.logsConfirmMalicious, and ts.isBenignScanner are all resolved before
+// the Triage block is written. This ensures the LLM sees the blacklist
+// verdict inline in Triage rather than only discovering it later.
 func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 	var sb strings.Builder
 	var ts triageState
@@ -391,13 +397,53 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		ts.isWANEdgeOnly = true
 	}
 
-	// Build human-readable triage summary strings.
+	// Build human-readable event-type summary string.
 	var evtParts []string
 	for typ, n := range evtTypeCount {
 		evtParts = append(evtParts, fmt.Sprintf("%s (%d)", typ, n))
 	}
 	ts.evtSummary = strings.Join(evtParts, ", ")
 
+	// ── Resolve threat-feed + benign-scanner flags BEFORE writing Triage ─────
+	// This must happen here so ts.ipsumTier / ts.isBenignScanner are populated
+	// when the Triage block is written below.
+	ips := make([]string, 0, len(ipSet))
+	for ip := range ipSet {
+		ips = append(ips, ip)
+	}
+
+	var threatLines []string
+	if h.benignScanners != nil {
+		for _, ip := range ips {
+			if h.benignScanners.IsBenignScanner(ip) {
+				ts.isBenignScanner = true
+				threatLines = append(threatLines, fmt.Sprintf(
+					"Benign scanner detected: %s → known research scanner (Shodan/Censys/Shadowserver/similar)", ip,
+				))
+				break
+			}
+		}
+	}
+
+	var threatFeedLines []string
+	if h.threat != nil && len(ips) > 0 {
+		scores := h.threat.LookupMany(ips)
+		if len(scores) > 0 {
+			for ip, s := range scores {
+				if tag := s.Tag(); tag != "" {
+					threatFeedLines = append(threatFeedLines, fmt.Sprintf("  %s → %s", ip, tag))
+				}
+				if s.IsConfirmedMalicious() || s.IsTorExit {
+					ts.logsConfirmMalicious = true
+				}
+				if tier := s.Tier(); tier > ts.ipsumTier {
+					ts.ipsumTier = tier
+				}
+			}
+		}
+	}
+
+	// ── Build dst label for Triage ────────────────────────────────────────────
 	if ts.isWANEdgeOnly {
 		ts.dstLabel = "WAN EDGE — gateway interface only"
 	} else if ts.hasWANForward && ts.dstInRegistry {
@@ -408,15 +454,30 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 		ts.dstLabel = "MIXED — see event list below"
 	}
 
-	// ── Triage block (injected before event list so LLM sees it first) ───────
+	// ── Triage block — written after threat-feed so blacklist tier is known ───
+	//
+	// Threat severity line is injected here when the source is blacklisted so
+	// the LLM sees it as a pre-resolved fact at the top of context, not buried
+	// in the threat-feed section below.
+	blacklistNote := ""
+	switch {
+	case ts.ipsumTier >= threat.TierBlacklisted:
+		blacklistNote = "\n- Source threat tier? [UNIVERSALLY BLACKLISTED — IPSum score ≥6, majority of independent feeds agree]"
+	case ts.isBenignScanner:
+		blacklistNote = "\n- Source threat tier? [BENIGN SCANNER — known research scanner, opt-outable]"
+	case ts.logsConfirmMalicious:
+		blacklistNote = "\n- Source threat tier? [CONFIRMED MALICIOUS — threat feed verified]"
+	}
+
 	sb.WriteString(fmt.Sprintf(
 		"\nTriage:\n"+
 			"- Dst host in registry? [%s]\n"+
 			"- Event type(s)? [%s]\n"+
-			"- Ports targeted? [%s]\n",
+			"- Ports targeted? [%s]%s\n",
 		ts.dstLabel,
 		ts.evtSummary,
 		strings.Join(portsSeen, ", "),
+		blacklistNote,
 	))
 
 	// ── Pass 2: write per-event lines ────────────────────────────────────────
@@ -425,38 +486,14 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState) {
 			r.evtType, r.srcIP, r.dstIP, r.dstLabel, r.dstPort, r.proto))
 	}
 
-	ips := make([]string, 0, len(ipSet))
-	for ip := range ipSet {
-		ips = append(ips, ip)
+	// ── Write pre-resolved threat-feed lines ─────────────────────────────────
+	for _, line := range threatLines {
+		sb.WriteString("\n" + line + "\n")
 	}
-
-	// ── Benign scanner check ─────────────────────────────────────────────────
-	if h.benignScanners != nil {
-		for _, ip := range ips {
-			if h.benignScanners.IsBenignScanner(ip) {
-				ts.isBenignScanner = true
-				sb.WriteString(fmt.Sprintf("\nBenign scanner detected: %s → known research scanner (Shodan/Censys/Shadowserver/similar)\n", ip))
-				break
-			}
-		}
-	}
-
-	// ── Threat-feed enrichment ───────────────────────────────────────────────
-	if h.threat != nil && len(ips) > 0 {
-		scores := h.threat.LookupMany(ips)
-		if len(scores) > 0 {
-			sb.WriteString("\nThreat feed verdicts:\n")
-			for ip, s := range scores {
-				if tag := s.Tag(); tag != "" {
-					sb.WriteString(fmt.Sprintf("  %s → %s\n", ip, tag))
-				}
-				if s.IsConfirmedMalicious() || s.IsTorExit {
-					ts.logsConfirmMalicious = true
-				}
-				if tier := s.Tier(); tier > ts.ipsumTier {
-					ts.ipsumTier = tier
-				}
-			}
+	if len(threatFeedLines) > 0 {
+		sb.WriteString("\nThreat feed verdicts:\n")
+		for _, line := range threatFeedLines {
+			sb.WriteString(line + "\n")
 		}
 	}
 
