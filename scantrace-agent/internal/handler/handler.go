@@ -234,7 +234,6 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 	blocks, err := blocksFromRaw(report.SlackBlock())
 	var ts string
 	if err != nil {
-		// Block parsing failed — fall back to plain text.
 		text := fmt.Sprintf("%s *[%s] Case `%s`* — %s\nseverity=%s confidence=%.0f%%",
 			severityEmoji(c.Severity), strings.ToUpper(c.Severity),
 			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
@@ -288,25 +287,14 @@ func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 	}
 }
 
+// handleMention routes all natural-language @mentions directly to the LLM.
+// Slash commands (/scantrace cases, /scantrace report, etc.) retain direct
+// shortcuts. Only empty messages and "help" short-circuit here.
 func (h *Handler) handleMention(channelID, userID, text string) {
 	clean := strings.TrimSpace(mentionRE(text))
 	lower := strings.ToLower(clean)
 
-	switch {
-	case strings.Contains(lower, "cases") || strings.Contains(lower, "list"):
-		h.cmdCases(channelID, userID)
-		return
-	case strings.Contains(lower, "high") || strings.Contains(lower, "critical"):
-		h.cmdHighSeverity(channelID, userID)
-		return
-	case strings.Contains(lower, "device") && strings.Contains(lower, "registry"):
-		h.cmdDevices(channelID, userID)
-		return
-	case strings.Contains(lower, "mcp"):
-		h.postEphemeral(channelID, userID,
-			"*MCP Server* is live on `localhost:8765` — tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`, `list_known_devices`")
-		return
-	case lower == "help" || lower == "" || strings.Contains(lower, "help"):
+	if lower == "" || lower == "help" {
 		h.postEphemeral(channelID, userID, helpText())
 		return
 	}
@@ -536,6 +524,6 @@ Available commands:
 • ` + "`/scantrace mcp`" + ` — MCP server status
 • ` + "`/scantrace help`" + ` — this message
 
-You can also @mention ScanTrace or DM it with any security question.
-Example: _@ScanTrace are there any unclassified devices on the network?_`
+You can also @mention ScanTrace with any natural language security question.
+Example: _@ScanTrace review all open cases and advise on course of action_`
 }
