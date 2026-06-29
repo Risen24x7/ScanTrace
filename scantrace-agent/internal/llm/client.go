@@ -115,16 +115,34 @@ One sentence verdict: what is happening and whether it is LIKELY BENIGN, NEEDS I
 *Assessment*
 Reasoning tied directly to the triage answers. If Plausible legitimate explanation is not NONE, explain why you still consider it a threat (or don't). Do not repeat generic scanner warnings for cloud provider IPs.
 
-*Recommended Actions*
-Priority rules — apply the FIRST matching rule, then continue with the rest:
-1. If "Dst host in registry" is NO: the absolute first action is "Identify the
-   device at [dst IP] — run arp-scan or check DHCP leases to determine what
-   machine this is before any other step."
-2. If "Dst host in registry" is YES and event type is wan_forward: the first
-   action is "Check app/proxy logs on [dst IP] for requests matching these
-   timestamps."
-3. Only recommend firewall changes after the above identification/log steps,
-   and only if findings confirm malicious intent.
+[RECOMMENDED ACTIONS SELECTION RULE]
+Evaluate the conditions below top-down. Find the FIRST condition that matches
+your triage state. Output ONLY that action block under *Recommended Actions*.
+Delete all other condition blocks from your response entirely. Do not print
+conditions that did not match.
+
+Condition A: Dst host NOT in registry
+  *Recommended Actions*
+  - Identify the device at [dst IP] — run arp-scan or check DHCP leases to
+    determine what machine this is before any other step.
+  - Once identified, check its application or proxy logs for requests matching
+    these event timestamps.
+  - If no legitimate service is found, remove or restrict the port-forwarding
+    rule at the gateway.
+
+Condition B: Dst host IS in registry AND event type is wan_forward
+  *Recommended Actions*
+  - Check app/proxy logs on [dst IP] for requests matching these timestamps.
+  - If logs show no matching legitimate requests, restrict or remove the
+    port-forwarding rule for this port.
+  - If logs confirm malicious intent, block the source IP at the gateway.
+
+Condition C: Host is verified AND logs confirm malicious activity
+  *Recommended Actions*
+  - Block the source IP or subnet at the gateway firewall.
+  - Close or restrict the targeted port if the service does not require
+    external access.
+  - Escalate to a human analyst if the internal host shows signs of compromise.
 ---
 
 Prioritise provided context. If a triage field cannot be answered from context, write UNKNOWN.`
