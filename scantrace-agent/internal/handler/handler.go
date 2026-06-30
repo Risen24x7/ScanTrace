@@ -24,8 +24,7 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-// mentionRE strips all <@UXXXXXXXX> mention tokens from a Slack message so
-// that handleMention receives only the user's actual command text.
+// mentionRE strips all <@UXXXXXXXX> mention tokens from a Slack message.
 var mentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>`)
 
 func mentionRE(text string) string {
@@ -181,15 +180,13 @@ func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 	}
 }
 
-// handleMention processes @ScanTrace mentions and responds with LLM analysis.
+// handleMention processes @ScanTrace mentions.
 func (h *Handler) handleMention(channel, thread, text string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		h.postMessage(channel, thread, "Hi! Ask me about a case: `@ScanTrace case <id>` or just ask a question.")
 		return
 	}
-
-	// Quick shortcut: "case <id>" → run a full report.
 	lower := strings.ToLower(text)
 	if strings.HasPrefix(lower, "case ") {
 		parts := strings.Fields(text)
@@ -198,22 +195,17 @@ func (h *Handler) handleMention(channel, thread, text string) {
 			return
 		}
 	}
-
 	if h.llm == nil {
 		h.postMessage(channel, thread, "LLM not configured — I can't answer questions right now.")
 		return
 	}
-
-	// Build context from recent cases and answer the question.
 	cases, _ := h.store.ListCases("", 5)
 	var ctxLines []string
 	for _, c := range cases {
 		ctxLines = append(ctxLines, fmt.Sprintf("case id=%s title=%q sev=%s status=%s",
 			c.CaseID[:8], c.Title, c.Severity, c.Status))
 	}
-	ctxStr := strings.Join(ctxLines, "\n")
-
-	answer, err := h.llm.AskCase(text, ctxStr, "", "")
+	answer, err := h.llm.AskCase(text, strings.Join(ctxLines, "\n"), "", "")
 	if err != nil {
 		log.Printf("[handler] mention llm error: %v", err)
 		h.postMessage(channel, thread, fmt.Sprintf("⚠️ Inference error: %v", err))
@@ -505,39 +497,6 @@ func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge 
 		}
 		return "", false
 	}
-}
-
-// recordPortHits persists a batch of port hit records to the portintel store.
-func (h *Handler) recordPortHits(hits []portintel.HitRecord) {
-	if h.portIntel == nil {
-		return
-	}
-	for _, hr := range hits {
-		if err := h.portIntel.RecordHit(hr); err != nil {
-			log.Printf("[handler] portintel RecordHit port=%d: %v", hr.Port, err)
-		}
-	}
-}
-
-// portIntelAdvisory returns a formatted advisory string for the given ports,
-// or "" if the portintel store is unavailable or no data exists.
-func (h *Handler) portIntelAdvisory(ports []int) string {
-	if h.portIntel == nil || len(ports) == 0 {
-		return ""
-	}
-	var lines []string
-	for _, p := range ports {
-		summary, err := h.portIntel.Summary(p, 30)
-		if err != nil || summary == nil {
-			continue
-		}
-		lines = append(lines, fmt.Sprintf("  Port %d: %d hits over 30 days from %d unique IPs (last seen: %s)",
-			p, summary.TotalHits, summary.UniqueIPs, summary.LastSeen.Format("2006-01-02 15:04")))
-	}
-	if len(lines) == 0 {
-		return ""
-	}
-	return "[PORT INTEL ADVISORY]\n" + strings.Join(lines, "\n")
 }
 
 func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []string) {
@@ -1010,8 +969,7 @@ func trustEmoji(trust string) string {
 	}
 }
 
-// extractFirstPort scans the report Markdown for a "Port:" line and returns
-// the first value found, or "" if none is present.
+// extractFirstPort scans the report Markdown for a "Port:" line.
 func extractFirstPort(report *casebuilder.CaseReport) string {
 	if report == nil {
 		return ""
