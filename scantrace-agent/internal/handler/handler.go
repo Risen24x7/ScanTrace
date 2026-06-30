@@ -35,14 +35,14 @@ func mentionRE(text string) string {
 type Handler struct {
 	api                   *slack.Client
 	store                 *db.DB
-	alertChannel          string // sec-alerts — raw case alerts
-	externalThreatChannel string // sec-intel-external — LLM mention responses
-	wanIP                 string // public WAN IP of the gateway
+	alertChannel          string
+	externalThreatChannel string
+	wanIP                 string
 	rts                   *rts.Client
 	llm                   *llm.Client
 	threat                *threat.Enricher
 	benignScanners        *threat.BenignScanners
-	portIntel             *portintel.Store // nil-safe; wired in New if db opens OK
+	portIntel             *portintel.Store
 
 	mu          sync.Mutex
 	caseThreads map[string]string
@@ -61,8 +61,6 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 		benignScanners:        threat.NewBenignScanners(""),
 		caseThreads:           make(map[string]string),
 	}
-	// Open the port-intel store alongside the main DB. We derive its path
-	// from the main store connection string so ops only set one path env var.
 	pi, err := portintel.Open("")
 	if err != nil {
 		log.Printf("[handler] portintel store unavailable (port-trends disabled): %v", err)
@@ -72,62 +70,47 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 	return h
 }
 
-// triageState captures the facts Go already knows so we can pre-select the
-// correct action plan before the LLM prompt is assembled.
+// triageState captures pre-evaluated facts injected into the LLM prompt.
 type triageState struct {
-	isWANEdgeOnly        bool // ALL events are wan_new_connection (no wan_forward present)
-	hasWANForward        bool // at least one wan_forward event exists
-	dstInRegistry        bool // at least one wan_forward dst IP found in device registry
-	logsConfirmMalicious bool // set by threat-feed lookup (IPSum >= threshold or Tor exit)
-	isBenignScanner      bool // source matched known research scanner list
-	ipsumTier            int  // highest IPSum tier across all case IPs
-	// Triage summary strings — injected directly into LLM context.
-	dstLabel   string // e.g. "WAN EDGE — gateway interface only" or "unknown internal host" or "registry: label=..."
-	evtSummary string // e.g. "wan_forward (2), wan_new_connection (2)"
+	isWANEdgeOnly        bool
+	hasWANForward        bool
+	dstInRegistry        bool
+	logsConfirmMalicious bool
+	isBenignScanner      bool
+	ipsumTier            int
+	dstLabel             string
+	evtSummary           string
 }
 
-// selectActionPlan converts the pre-evaluated triage state into a single
-// ready-to-inject action block.
 func selectActionPlan(ts triageState) string {
 	switch {
-	// F — universally blacklisted.
 	case ts.ipsumTier >= threat.TierBlacklisted:
 		return "*Recommended Actions*\nCondition Matched: F — source universally blacklisted (IPSum score ≥6, majority of feeds agree)\n" +
 			"- [VERDICT: LIKELY MALICIOUS] Source is blacklisted across the majority of independent threat-feed sources.\n" +
 			"- Block the source IP or subnet at the gateway firewall immediately.\n" +
 			"- Close or restrict the targeted port if no external access is required.\n" +
 			"- Escalate to a human analyst if the internal host shows any signs of compromise."
-
-	// E — benign research scanner.
 	case ts.isBenignScanner:
 		return "*Recommended Actions*\nCondition Matched: E — source is a known benign research scanner (Shodan / Censys / Shadowserver / similar)\n" +
 			"- [VERDICT: LIKELY BENIGN] This traffic originates from a well-known, opt-outable internet scanning service.\n" +
 			"- No blocking required. These scanners perform routine internet-wide surveys.\n" +
 			"- If you wish to suppress future alerts from this source, add the IP/CIDR to /opt/scantrace/benign-scanners.txt.\n" +
 			"- Review only if the scan volume is unusually high (>50 events/hour from the same IP)."
-
-	// D — threat feed confirms malicious.
 	case ts.logsConfirmMalicious:
 		return "*Recommended Actions*\nCondition Matched: D — host verified, logs confirm malicious activity\n" +
 			"- Block the source IP or subnet at the gateway firewall.\n" +
 			"- Close or restrict the targeted port if no external access is required.\n" +
 			"- Escalate to a human analyst if the internal host shows signs of compromise."
-
-	// A — WAN edge only, never reached LAN.
 	case ts.isWANEdgeOnly:
 		return "*Recommended Actions*\nCondition Matched: A — wan_new_connection (WAN edge only, never reached LAN)\n" +
 			"- Traffic hit the WAN interface only and was not forwarded. No internal host is at risk.\n" +
 			"- If the port is not intentionally exposed, consider closing it at the gateway to reduce noise.\n" +
 			"- No urgent action required unless volume is significant or ports are highly sensitive (22, 3389)."
-
-	// B — unknown internal host, wan_forward landed.
 	case !ts.dstInRegistry:
 		return "*Recommended Actions*\nCondition Matched: B — unknown internal host, wan_forward traffic landed\n" +
 			"- Identify the device at the destination IP — run arp-scan or check DHCP leases before any other step.\n" +
 			"- Once identified, check its app/proxy logs for requests matching these event timestamps.\n" +
 			"- If no legitimate service found, remove or restrict the port-forwarding rule at the gateway."
-
-	// C — registered host, wan_forward landed.
 	default:
 		return "*Recommended Actions*\nCondition Matched: C — registered host, wan_forward traffic landed\n" +
 			"- Check app/proxy logs on the destination host for requests matching these timestamps.\n" +
@@ -136,8 +119,6 @@ func selectActionPlan(ts triageState) string {
 	}
 }
 
-// buildTriageBlock returns the plain-text triage block that is injected
-// verbatim into the singleCasePromptTemplate %s[0] placeholder.
 func buildTriageBlock(ts triageState, portsSeen []string) string {
 	blacklistNote := ""
 	switch {
@@ -150,10 +131,7 @@ func buildTriageBlock(ts triageState, portsSeen []string) string {
 	}
 	return fmt.Sprintf(
 		"- Dst host in registry? [%s]\n- Event type(s)? [%s]\n- Ports targeted? [%s]%s",
-		ts.dstLabel,
-		ts.evtSummary,
-		strings.Join(portsSeen, ", "),
-		blacklistNote,
+		ts.dstLabel, ts.evtSummary, strings.Join(portsSeen, ", "), blacklistNote,
 	)
 }
 
@@ -191,6 +169,59 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 	}
 }
 
+// handleEvent routes Slack EventsAPI events.
+func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
+	switch event.Type {
+	case slackevents.CallbackEvent:
+		inner := event.InnerEvent
+		switch ev := inner.Data.(type) {
+		case *slackevents.AppMentionEvent:
+			go h.handleMention(ev.Channel, ev.TimeStamp, mentionRE(ev.Text))
+		}
+	}
+}
+
+// handleMention processes @ScanTrace mentions and responds with LLM analysis.
+func (h *Handler) handleMention(channel, thread, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		h.postMessage(channel, thread, "Hi! Ask me about a case: `@ScanTrace case <id>` or just ask a question.")
+		return
+	}
+
+	// Quick shortcut: "case <id>" → run a full report.
+	lower := strings.ToLower(text)
+	if strings.HasPrefix(lower, "case ") {
+		parts := strings.Fields(text)
+		if len(parts) >= 2 {
+			h.cmdReport(channel, "", parts[1])
+			return
+		}
+	}
+
+	if h.llm == nil {
+		h.postMessage(channel, thread, "LLM not configured — I can't answer questions right now.")
+		return
+	}
+
+	// Build context from recent cases and answer the question.
+	cases, _ := h.store.ListCases("", 5)
+	var ctxLines []string
+	for _, c := range cases {
+		ctxLines = append(ctxLines, fmt.Sprintf("case id=%s title=%q sev=%s status=%s",
+			c.CaseID[:8], c.Title, c.Severity, c.Status))
+	}
+	ctxStr := strings.Join(ctxLines, "\n")
+
+	answer, err := h.llm.AskCase(text, ctxStr, "", "")
+	if err != nil {
+		log.Printf("[handler] mention llm error: %v", err)
+		h.postMessage(channel, thread, fmt.Sprintf("⚠️ Inference error: %v", err))
+		return
+	}
+	h.postMessage(channel, thread, answer)
+}
+
 func (h *Handler) subscribeRTS() {
 	_, err := h.rts.Subscribe(rts.SignalAppMention, "scantrace-mention")
 	if err != nil {
@@ -200,8 +231,7 @@ func (h *Handler) subscribeRTS() {
 	log.Printf("[rts] signal subscriptions active")
 }
 
-// splitArgs splits a raw Slack command text string into tokens, respecting
-// double-quoted strings.
+// splitArgs splits command text into tokens, respecting double-quoted strings.
 func splitArgs(s string) []string {
 	var tokens []string
 	var cur strings.Builder
@@ -227,7 +257,6 @@ func splitArgs(s string) []string {
 }
 
 func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
-	// Use quote-aware splitting so label="Media Server" is one token.
 	parts := splitArgs(strings.TrimSpace(cmd.Text))
 	sub := "help"
 	if len(parts) > 0 {
@@ -282,33 +311,22 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 	}
 }
 
-// handleBlockAction processes interactive button clicks from Slack Block Kit.
-// Action IDs follow the pattern: scantrace_close_<shortID> / scantrace_reopen_<shortID> / scantrace_report_<shortID>
 func (h *Handler) handleBlockAction(cb slack.InteractionCallback) {
 	for _, action := range cb.ActionCallback.BlockActions {
 		actionID := action.ActionID
 		channelID := cb.Channel.ID
 		userID := cb.User.ID
-
 		switch {
 		case strings.HasPrefix(actionID, "scantrace_close_"):
-			shortID := strings.TrimPrefix(actionID, "scantrace_close_")
-			h.cmdCloseCase(channelID, userID, shortID)
-
+			h.cmdCloseCase(channelID, userID, strings.TrimPrefix(actionID, "scantrace_close_"))
 		case strings.HasPrefix(actionID, "scantrace_reopen_"):
-			shortID := strings.TrimPrefix(actionID, "scantrace_reopen_")
-			h.cmdReopenCase(channelID, userID, shortID)
-
+			h.cmdReopenCase(channelID, userID, strings.TrimPrefix(actionID, "scantrace_reopen_"))
 		case strings.HasPrefix(actionID, "scantrace_report_"):
-			shortID := strings.TrimPrefix(actionID, "scantrace_report_")
-			h.cmdReport(channelID, userID, shortID)
+			h.cmdReport(channelID, userID, strings.TrimPrefix(actionID, "scantrace_report_"))
 		}
 	}
 }
 
-// cmdAddDevice handles:
-//
-//	/scantrace adddevice <ip> [label="My Device"] [trust=trusted|unknown|suspicious] [suppress=true]
 func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 	if len(args) == 0 {
 		h.postEphemeral(channelID, userID,
@@ -318,18 +336,14 @@ func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 				"• `/scantrace adddevice 192.168.50.4 trust=suspicious`")
 		return
 	}
-
 	ipArg := args[0]
 	if net.ParseIP(ipArg) == nil {
 		h.postEphemeral(channelID, userID, fmt.Sprintf("`%s` is not a valid IP address.", ipArg))
 		return
 	}
-
-	// Defaults.
 	label := ipArg
 	trustLabel := "unknown"
 	autoSuppress := false
-
 	for _, arg := range args[1:] {
 		kv := strings.SplitN(arg, "=", 2)
 		if len(kv) != 2 {
@@ -353,15 +367,12 @@ func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 			autoSuppress = strings.ToLower(val) == "true"
 		}
 	}
-
 	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
-
 	now := time.Now().UTC()
 	deviceID := uuid.NewString()
 	if existing != nil {
 		deviceID = existing.DeviceID
 	}
-
 	d := &db.KnownDevice{
 		DeviceID:     deviceID,
 		IP:           ipArg,
@@ -374,13 +385,11 @@ func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 	if existing != nil && !existing.FirstSeen.IsZero() {
 		d.FirstSeen = existing.FirstSeen
 	}
-
 	if err := h.store.UpsertKnownDevice(d); err != nil {
 		log.Printf("[handler] adddevice upsert error ip=%s label=%q: %v", ipArg, label, err)
 		h.postEphemeral(channelID, userID, fmt.Sprintf("❌ Failed to save device `%s`: %v", ipArg, err))
 		return
 	}
-
 	action := "✅ Device *added* to registry"
 	if existing != nil {
 		action = "✏️ Device *updated* in registry"
@@ -397,7 +406,6 @@ func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 		ipArg, label, trustLabel, autoSuppress, userID)
 }
 
-// cmdRemoveDevice handles: /scantrace removedevice <ip>
 func (h *Handler) cmdRemoveDevice(channelID, userID, ipArg string) {
 	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
 	if existing == nil {
@@ -424,31 +432,20 @@ func (h *Handler) cmdReviewAll(channelID, userID string) {
 		h.postEphemeral(channelID, userID, "No open cases found.")
 		return
 	}
-
 	dest := h.externalThreatChannel
-	h.postMessage(dest, "", fmt.Sprintf(
-		"_Queuing %d cases for review — posting one at a time…_", len(cases),
-	))
-
+	h.postMessage(dest, "", fmt.Sprintf("_Queuing %d cases for review — posting one at a time…_", len(cases)))
 	go func() {
 		for i, c := range cases {
 			ctx, triage, portsSeen := h.buildSingleCaseContext(c)
 			triageBlock := buildTriageBlock(triage, portsSeen)
 			actionPlan := selectActionPlan(triage)
-			prompt := fmt.Sprintf(
-				"Analyse this single case and provide a full briefing.\n\nCase ID: %s",
-				c.CaseID[:8],
-			)
+			prompt := fmt.Sprintf("Analyse this single case and provide a full briefing.\n\nCase ID: %s", c.CaseID[:8])
 			answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 			if err != nil {
 				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
-				h.postMessage(dest, "", fmt.Sprintf(
-					"⚠️ Case %s — inference error: %v", c.CaseID[:8], err,
-				))
+				h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", c.CaseID[:8], err))
 			} else {
-				h.postCaseBriefingWithActions(dest, c.CaseID[:8], fmt.Sprintf(
-					"*Case %d/%d — %s*\n%s", i+1, len(cases), c.CaseID[:8], answer,
-				))
+				h.postCaseBriefingWithActions(dest, c.CaseID[:8], fmt.Sprintf("*Case %d/%d — %s*\n%s", i+1, len(cases), c.CaseID[:8], answer))
 			}
 			if i < len(cases)-1 {
 				time.Sleep(3 * time.Second)
@@ -463,7 +460,6 @@ func (h *Handler) cmdNext(channelID, userID string) {
 		h.postEphemeral(channelID, userID, "LLM not configured.")
 		return
 	}
-
 	var target *db.Case
 	for _, sev := range []string{"high", "medium", "low"} {
 		cases, err := h.store.ListCases(sev, 1)
@@ -476,25 +472,17 @@ func (h *Handler) cmdNext(channelID, userID string) {
 		h.postEphemeral(channelID, userID, "No open cases found.")
 		return
 	}
-
 	dest := h.externalThreatChannel
-	h.postMessage(dest, "", fmt.Sprintf("_Briefing next case: %s %s…_",
-		severityEmoji(target.Severity), target.CaseID[:8]))
-
+	h.postMessage(dest, "", fmt.Sprintf("_Briefing next case: %s %s…_", severityEmoji(target.Severity), target.CaseID[:8]))
 	go func() {
 		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
 		triageBlock := buildTriageBlock(triage, portsSeen)
 		actionPlan := selectActionPlan(triage)
-		prompt := fmt.Sprintf(
-			"Analyse this case and provide a full briefing.\n\nCase ID: %s",
-			target.CaseID[:8],
-		)
+		prompt := fmt.Sprintf("Analyse this case and provide a full briefing.\n\nCase ID: %s", target.CaseID[:8])
 		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 		if err != nil {
 			log.Printf("[handler] next llm error case %s: %v", target.CaseID[:8], err)
-			h.postMessage(dest, "", fmt.Sprintf(
-				"⚠️ Case %s — inference error: %v", target.CaseID[:8], err,
-			))
+			h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", target.CaseID[:8], err))
 			return
 		}
 		h.postCaseBriefingWithActions(dest, target.CaseID[:8],
@@ -502,7 +490,6 @@ func (h *Handler) cmdNext(channelID, userID string) {
 	}()
 }
 
-// classifyDst resolves the destination label for a single event.
 func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge bool) {
 	switch strings.ToLower(eventType) {
 	case "wan_new_connection":
@@ -520,7 +507,39 @@ func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge 
 	}
 }
 
-// buildSingleCaseContext builds the LLM context string and evaluates triageState.
+// recordPortHits persists a batch of port hit records to the portintel store.
+func (h *Handler) recordPortHits(hits []portintel.HitRecord) {
+	if h.portIntel == nil {
+		return
+	}
+	for _, hr := range hits {
+		if err := h.portIntel.RecordHit(hr); err != nil {
+			log.Printf("[handler] portintel RecordHit port=%d: %v", hr.Port, err)
+		}
+	}
+}
+
+// portIntelAdvisory returns a formatted advisory string for the given ports,
+// or "" if the portintel store is unavailable or no data exists.
+func (h *Handler) portIntelAdvisory(ports []int) string {
+	if h.portIntel == nil || len(ports) == 0 {
+		return ""
+	}
+	var lines []string
+	for _, p := range ports {
+		summary, err := h.portIntel.Summary(p, 30)
+		if err != nil || summary == nil {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("  Port %d: %d hits over 30 days from %d unique IPs (last seen: %s)",
+			p, summary.TotalHits, summary.UniqueIPs, summary.LastSeen.Format("2006-01-02 15:04")))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "[PORT INTEL ADVISORY]\n" + strings.Join(lines, "\n")
+}
+
 func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []string) {
 	var sb strings.Builder
 	var ts triageState
@@ -560,8 +579,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		dstLabel string
 	}
 	var rows []evtRow
-
-	// hitRecords accumulates port hits to persist after the loop.
 	var hitRecords []portintel.HitRecord
 
 	for _, evtID := range c.RelatedEventIDs {
@@ -569,10 +586,8 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		if err != nil || evt == nil {
 			continue
 		}
-
 		key := strings.ToLower(evt.EventType)
 		evtTypeCount[key]++
-
 		dstLabel, isEdge := h.classifyDst(evt.DstIP, evt.EventType)
 		if !isEdge {
 			if dev, ok := deviceMap[evt.DstIP]; ok {
@@ -583,13 +598,11 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 			}
 			ts.hasWANForward = true
 		}
-
 		if evt.DstPort > 0 {
 			if _, seen := portSet[evt.DstPort]; !seen {
 				portSet[evt.DstPort] = struct{}{}
 				portsSeen = append(portsSeen, fmt.Sprintf("%d", evt.DstPort))
 			}
-			// Accumulate a hit record for portintel persistence.
 			if evt.SrcIP != "" {
 				hitRecords = append(hitRecords, portintel.HitRecord{
 					Port:      evt.DstPort,
@@ -598,7 +611,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 				})
 			}
 		}
-
 		rows = append(rows, evtRow{
 			evtType:  evt.EventType,
 			srcIP:    evt.SrcIP,
@@ -612,7 +624,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		}
 	}
 
-	// Persist port hits to the portintel store (fire-and-forget).
 	if len(hitRecords) > 0 {
 		go h.recordPortHits(hitRecords)
 	}
@@ -652,17 +663,15 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 	var threatFeedLines []string
 	if h.threat != nil && len(ips) > 0 {
 		scores := h.threat.LookupMany(ips)
-		if len(scores) > 0 {
-			for ip, s := range scores {
-				if tag := s.Tag(); tag != "" {
-					threatFeedLines = append(threatFeedLines, fmt.Sprintf("  %s → %s", ip, tag))
-				}
-				if s.IsConfirmedMalicious() || s.IsTorExit {
-					ts.logsConfirmMalicious = true
-				}
-				if tier := s.Tier(); tier > ts.ipsumTier {
-					ts.ipsumTier = tier
-				}
+		for ip, s := range scores {
+			if tag := s.Tag(); tag != "" {
+				threatFeedLines = append(threatFeedLines, fmt.Sprintf("  %s → %s", ip, tag))
+			}
+			if s.IsConfirmedMalicious() || s.IsTorExit {
+				ts.logsConfirmMalicious = true
+			}
+			if tier := s.Tier(); tier > ts.ipsumTier {
+				ts.ipsumTier = tier
 			}
 		}
 	}
@@ -692,17 +701,13 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 			"- Dst host in registry? [%s]\n"+
 			"- Event type(s)? [%s]\n"+
 			"- Ports targeted? [%s]%s\n",
-		ts.dstLabel,
-		ts.evtSummary,
-		strings.Join(portsSeen, ", "),
-		blacklistNote,
+		ts.dstLabel, ts.evtSummary, strings.Join(portsSeen, ", "), blacklistNote,
 	))
 
 	for _, r := range rows {
 		sb.WriteString(fmt.Sprintf("  evt type=%s src=%s dst=%s [%s] dport=%d proto=%s\n",
 			r.evtType, r.srcIP, r.dstIP, r.dstLabel, r.dstPort, r.proto))
 	}
-
 	for _, line := range threatLines {
 		sb.WriteString("\n" + line + "\n")
 	}
@@ -712,12 +717,9 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 			sb.WriteString(line + "\n")
 		}
 	}
-
-	// Inject port intel advisory if the portintel store is available.
 	if advisory := h.portIntelAdvisory(portsSeenInts(portSet)); advisory != "" {
 		sb.WriteString("\n" + advisory + "\n")
 	}
-
 	if len(ips) > 0 {
 		enriched := ipinfo.Enrich(ips)
 		sb.WriteString("\nIP intel:\n")
@@ -729,7 +731,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 	return sb.String(), ts, portsSeen
 }
 
-// portsSeenInts converts a port-set map to an []int slice.
 func portsSeenInts(portSet map[int]struct{}) []int {
 	out := make([]int, 0, len(portSet))
 	for p := range portSet {
@@ -738,7 +739,6 @@ func portsSeenInts(portSet map[int]struct{}) []int {
 	return out
 }
 
-// caseSrcIPs collects unique source IPs for a case (fast, no LLM).
 func (h *Handler) caseSrcIPs(c *db.Case) []string {
 	seen := make(map[string]struct{})
 	for _, evtID := range c.RelatedEventIDs {
@@ -782,75 +782,57 @@ func (h *Handler) cmdCases(channelID, userID string) {
 		h.postEphemeral(channelID, userID, "No cases found.")
 		return
 	}
-
 	counts := map[string]int{"high": 0, "medium": 0, "low": 0}
 	for _, c := range cases {
 		counts[strings.ToLower(c.Severity)]++
 	}
-
 	headerText := fmt.Sprintf(
-		"🔍  *ScanTrace — Active Cases*   %s %d HIGH  %s %d MED  %s %d LOW",
-		"🔴", counts["high"], "🟡", counts["medium"], "🟢", counts["low"],
+		"🔍  *ScanTrace — Active Cases*   🔴 %d HIGH  🟡 %d MED  🟢 %d LOW",
+		counts["high"], counts["medium"], counts["low"],
 	)
-
 	blocks := []slack.Block{
-		slack.NewHeaderBlock(
-			slack.NewTextBlockObject("plain_text", "ScanTrace — Active Cases", false, false),
-		),
-		slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", headerText, false, false),
-			nil, nil,
-		),
+		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "ScanTrace — Active Cases", false, false)),
+		slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", headerText, false, false), nil, nil),
 		slack.NewDividerBlock(),
 	}
-
 	for _, c := range cases {
 		sev := strings.ToUpper(c.Severity)
 		emoji := severityEmoji(c.Severity)
 		shortID := c.CaseID[:8]
 		conf := int(c.Confidence * 100)
 		evtCount := len(c.RelatedEventIDs)
-
 		filled := conf / 20
 		if filled > 5 {
 			filled = 5
 		}
 		bar := strings.Repeat("█", filled) + strings.Repeat("░", 5-filled)
 		confPill := fmt.Sprintf("`%s` %d%%", bar, conf)
-
 		srcIPs := h.caseSrcIPs(c)
 		badges := ipClassificationBadges(srcIPs)
 		badgeLine := ""
 		if len(badges) > 0 {
 			badgeLine = "\n>" + strings.Join(badges, "  ·  ")
 		}
-
 		statusTag := ""
 		if !strings.EqualFold(c.Status, "open") {
 			statusTag = fmt.Sprintf(" `%s`", strings.ToUpper(c.Status))
 		}
-
 		caseText := fmt.Sprintf(
 			"%s  *[%s]* `%s`%s\n>%s\n>Confidence: %s   Events: *%d*%s",
 			emoji, sev, shortID, statusTag, c.Title, confPill, evtCount, badgeLine,
 		)
-
 		reportBtn := slack.NewButtonBlockElement(
-			"scantrace_report_"+shortID,
-			shortID,
+			"scantrace_report_"+shortID, shortID,
 			slack.NewTextBlockObject("plain_text", "📋 Report", false, false),
 		)
-
 		blocks = append(blocks,
 			slack.NewSectionBlock(
 				slack.NewTextBlockObject("mrkdwn", caseText, false, false),
-				nil,
-				slack.NewAccessory(reportBtn),
+				nil, slack.NewAccessory(reportBtn),
 			),
 			slack.NewDividerBlock(),
 		)
 	}
-
 	blocks = append(blocks,
 		slack.NewContextBlock("",
 			slack.NewTextBlockObject("mrkdwn",
@@ -858,7 +840,6 @@ func (h *Handler) cmdCases(channelID, userID string) {
 				false, false),
 		),
 	)
-
 	h.postBlocks(channelID, "", blocks)
 }
 
@@ -889,10 +870,7 @@ func (h *Handler) cmdDevices(channelID, userID string) {
 	blocks := []slack.Block{
 		slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", "🖥️ Known Device Registry", false, false)),
 		slack.NewDividerBlock(),
-		slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", strings.Join(lines, "\n"), false, false),
-			nil, nil,
-		),
+		slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", strings.Join(lines, "\n"), false, false), nil, nil),
 	}
 	h.postBlocks(channelID, "", blocks)
 }
@@ -1028,17 +1006,16 @@ func trustEmoji(trust string) string {
 	case "suspicious":
 		return "⚠️"
 	default:
-		return "❔"
+		return "❓"
 	}
 }
 
-// extractFirstPort returns the first port string found in the report's Markdown,
-// or "" if none is present.
-func extractFirstPort(report *casebuilder.Report) string {
+// extractFirstPort scans the report Markdown for a "Port:" line and returns
+// the first value found, or "" if none is present.
+func extractFirstPort(report *casebuilder.CaseReport) string {
 	if report == nil {
 		return ""
 	}
-	// Scan the Markdown for a "Port:" line and return the first value found.
 	for _, line := range strings.Split(report.Markdown, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "Port:") {
@@ -1140,10 +1117,7 @@ func (h *Handler) postCaseBriefingWithActions(channel, shortID, text string) {
 		slack.NewTextBlockObject("plain_text", "📋 Report", false, false),
 	)
 	blocks := []slack.Block{
-		slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", text, false, false),
-			nil, nil,
-		),
+		slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", text, false, false), nil, nil),
 		slack.NewActionBlock("", closeBtn, reportBtn),
 	}
 	h.postBlocks(channel, "", blocks)
