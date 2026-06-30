@@ -4,6 +4,7 @@ package casebuilder
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,10 +27,10 @@ func New(store *db.DB) *Builder {
 }
 
 func (b *Builder) BuildReport(caseID string) (*CaseReport, error) {
-    cas, err := b.store.GetCase(caseID)
-    if err != nil || cas == nil {
-        return nil, fmt.Errorf("casebuilder: case not found: %s", caseID)
-    }
+	cas, err := b.store.GetCase(caseID)
+	if err != nil || cas == nil {
+		return nil, fmt.Errorf("casebuilder: case not found: %s", caseID)
+	}
 	var events []*db.Event
 	for _, eid := range cas.RelatedEventIDs {
 		evt, err := b.store.GetEvent(eid)
@@ -44,11 +45,11 @@ func (b *Builder) BuildReport(caseID string) (*CaseReport, error) {
 		for _, ent := range linkedEntities {
 			entities[ent.IP] = ent
 		}
-    }
+	}
 
-    report := &CaseReport{Case: cas, Events: events, Entities: entities}
-    report.Markdown = renderMarkdown(report)
-    return report, nil
+	report := &CaseReport{Case: cas, Events: events, Entities: entities}
+	report.Markdown = renderMarkdown(report)
+	return report, nil
 }
 
 func BuildReportFromCase(cas *db.Case, events []*db.Event, entities map[string]*db.Entity) *CaseReport {
@@ -98,44 +99,199 @@ func renderMarkdown(r *CaseReport) string {
 	return b.String()
 }
 
+// wellKnownPortLabel returns a short annotation for notable ports.
+// Returns empty string for unrecognised ports.
+func wellKnownPortLabel(port int) string {
+	switch port {
+	case 21:
+		return "FTP"
+	case 22:
+		return "SSH"
+	case 23:
+		return "Telnet"
+	case 25:
+		return "SMTP"
+	case 53:
+		return "DNS"
+	case 80:
+		return "HTTP"
+	case 110:
+		return "POP3"
+	case 143:
+		return "IMAP"
+	case 161:
+		return "SNMP"
+	case 443:
+		return "HTTPS"
+	case 445:
+		return "SMB"
+	case 1433:
+		return "MSSQL"
+	case 1723:
+		return "PPTP VPN"
+	case 3306:
+		return "MySQL"
+	case 3389:
+		return "RDP"
+	case 3388:
+		return "RDP-alt ⚠️"
+	case 5060:
+		return "SIP/VoIP"
+	case 5061:
+		return "SIP-TLS"
+	case 5432:
+		return "PostgreSQL"
+	case 5900:
+		return "VNC"
+	case 6379:
+		return "Redis"
+	case 8080:
+		return "HTTP-alt"
+	case 8443:
+		return "HTTPS-alt"
+	case 8728:
+		return "MikroTik Winbox"
+	case 8729:
+		return "MikroTik Winbox-TLS"
+	case 9200:
+		return "Elasticsearch"
+	case 27017:
+		return "MongoDB"
+	default:
+		return ""
+	}
+}
+
+// sysingestRE matches the boilerplate syslog-ingested summary lines so we can
+// strip them from the Slack snippet and avoid displaying redundant text.
+var sysingestRE = regexp.MustCompile(`(?i)syslog-ingested\s+drop\s+events?\s+from\s+\S+\s+targeting\s+port\s+\d+\.?\s*`)
+
+// alertSnippet returns a clean one-liner for the Slack alert body.
+// If the case summary is purely mechanical boilerplate, it returns a
+// generic fallback rather than repeating the header verbatim.
+func alertSnippet(summary string) string {
+	clean := strings.TrimSpace(sysingestRE.ReplaceAllString(summary, ""))
+	// After stripping, something useful might remain (analyst notes, etc.)
+	if clean != "" && len(clean) > 10 {
+		if len(clean) > 280 {
+			clean = clean[:280] + "\u2026"
+		}
+		return clean
+	}
+	return "_No additional analyst notes. Use `/scantrace report <id>` for full details._"
+}
+
+// extractAlertMeta pulls the first event's port, protocol, and source IP/subnet
+// from the event list for use in the alert header.
+func extractAlertMeta(events []*db.Event) (port int, proto string, srcSubnet string, firstSeenIP string) {
+	for _, e := range events {
+		if e == nil {
+			continue
+		}
+		if port == 0 && e.DstPort > 0 {
+			port = e.DstPort
+		}
+		if proto == "" && e.Protocol != "" {
+			proto = strings.ToUpper(e.Protocol)
+		}
+		if firstSeenIP == "" && e.SrcIP != "" {
+			firstSeenIP = e.SrcIP
+			// Coalesce to /24 subnet for display
+			parts := strings.Split(e.SrcIP, ".")
+			if len(parts) == 4 {
+				srcSubnet = parts[0] + "." + parts[1] + "." + parts[2] + ".0/24"
+			} else {
+				srcSubnet = e.SrcIP
+			}
+		}
+		if port > 0 && proto != "" && firstSeenIP != "" {
+			break
+		}
+	}
+	return
+}
+
 func (r *CaseReport) SlackBlock() map[string]interface{} {
 	c := r.Case
-	emoji := map[string]string{"high": "\U0001f534", "medium": "\U0001f7e1", "low": "\U0001f7e2"}[c.Severity]
+
+	severityEmoji := map[string]string{
+		"high":   "\U0001f534",
+		"medium": "\U0001f7e1",
+		"low":    "\U0001f7e2",
+	}
+	emoji := severityEmoji[strings.ToLower(c.Severity)]
 	if emoji == "" {
 		emoji = "\u26aa"
 	}
-	header := fmt.Sprintf("%s *%s* — %s", emoji, c.Title, strings.ToUpper(c.Severity))
-	entityLine := ""
+
+	port, proto, srcSubnet, firstSeenIP := extractAlertMeta(r.Events)
+
+	// Build a structured header: 🟢  DROP · port 3388/TCP · 45.142.193.0/24 — LOW
+	// Fall back to the case title when we can't extract event meta.
+	var headerParts []string
+	if port > 0 {
+		portStr := fmt.Sprintf("port %d", port)
+		if proto != "" {
+			portStr += "/" + proto
+		}
+		headerParts = append(headerParts, portStr)
+	}
+	if srcSubnet != "" {
+		headerParts = append(headerParts, srcSubnet)
+	}
+
+	var headerBody string
+	if len(headerParts) > 0 {
+		headerBody = "DROP · " + strings.Join(headerParts, " · ")
+	} else {
+		headerBody = c.Title
+	}
+	header := fmt.Sprintf("%s  *%s* — %s", emoji, headerBody, strings.ToUpper(c.Severity))
+
+	// Fields grid: Events / Confidence / Status / Case ID
+	fields := []map[string]string{
+		{"type": "mrkdwn", "text": fmt.Sprintf("*Events:*\n%d", len(r.Events))},
+		{"type": "mrkdwn", "text": fmt.Sprintf("*Confidence:*\n%.0f%%", c.Confidence*100)},
+		{"type": "mrkdwn", "text": fmt.Sprintf("*Status:*\n%s", strings.ToUpper(c.Status))},
+		{"type": "mrkdwn", "text": fmt.Sprintf("*Case ID:*\n`%s`", c.CaseID[:8])},
+	}
+
+	blocks := []map[string]interface{}{
+		{"type": "section", "text": map[string]string{"type": "mrkdwn", "text": header}},
+		{"type": "section", "fields": fields},
+	}
+
+	// Context line: port annotation + first-seen IP + entity enrichment
+	var contextParts []string
+	if port > 0 {
+		if label := wellKnownPortLabel(port); label != "" {
+			contextParts = append(contextParts, fmt.Sprintf("*%d* → %s", port, label))
+		}
+	}
+	if firstSeenIP != "" {
+		contextParts = append(contextParts, fmt.Sprintf("First seen: `%s`", firstSeenIP))
+	}
 	for ip, ent := range r.Entities {
 		if ent.ASName != "" {
-			entityLine = fmt.Sprintf("`%s` \u00b7 %s \u00b7 %s", ip, ent.ASName, ent.GeoCountry)
+			contextParts = append(contextParts, fmt.Sprintf("`%s` · %s · %s", ip, ent.ASName, ent.GeoCountry))
 		} else {
-			entityLine = fmt.Sprintf("`%s`", ip)
+			contextParts = append(contextParts, fmt.Sprintf("`%s`", ip))
 		}
 		break
 	}
-	snippet := c.Summary
-	if len(snippet) > 300 {
-		snippet = snippet[:300] + "\u2026"
-	}
-	blocks := []map[string]interface{}{
-		{"type": "section", "text": map[string]string{"type": "mrkdwn", "text": header}},
-		{"type": "section", "fields": []map[string]string{
-			{"type": "mrkdwn", "text": fmt.Sprintf("*Events:*\n%d", len(r.Events))},
-			{"type": "mrkdwn", "text": fmt.Sprintf("*Confidence:*\n%.0f%%", c.Confidence*100)},
-			{"type": "mrkdwn", "text": fmt.Sprintf("*Status:*\n%s", strings.ToUpper(c.Status))},
-			{"type": "mrkdwn", "text": fmt.Sprintf("*Case ID:*\n`%s`", c.CaseID[:8]+"\u2026")},
-		}},
-	}
-	if entityLine != "" {
+	if len(contextParts) > 0 {
 		blocks = append(blocks, map[string]interface{}{
 			"type":     "context",
-			"elements": []map[string]string{{"type": "mrkdwn", "text": entityLine}},
+			"elements": []map[string]string{{"type": "mrkdwn", "text": strings.Join(contextParts, "   ·   ")}},
 		})
 	}
+
+	// Summary block — stripped of mechanical boilerplate
+	snippet := alertSnippet(c.Summary)
 	blocks = append(blocks,
 		map[string]interface{}{"type": "section", "text": map[string]string{"type": "mrkdwn", "text": snippet}},
 		map[string]interface{}{"type": "divider"},
 	)
+
 	return map[string]interface{}{"blocks": blocks}
 }
