@@ -3,15 +3,23 @@ package handler
 import (
 	"fmt"
 	"strings"
+
+	"github.com/Risen24x7/scantrace/internal/db"
 )
 
 // cmdCloseCase handles: /scantrace close <id>
-// Marks the case status = "closed" and posts a confirmation.
 func (h *Handler) cmdCloseCase(channelID, userID, caseIDPrefix string) {
 	target := h.resolveCaseByPrefix(caseIDPrefix)
 	if target == nil {
 		h.postEphemeral(channelID, userID, fmt.Sprintf(
 			"Case `%s` not found. Try `/scantrace cases` to list active cases.", caseIDPrefix,
+		))
+		return
+	}
+
+	if strings.EqualFold(target.Status, "closed") {
+		h.postEphemeral(channelID, userID, fmt.Sprintf(
+			"Case `%s` is already closed.", target.CaseID[:8],
 		))
 		return
 	}
@@ -28,7 +36,6 @@ func (h *Handler) cmdCloseCase(channelID, userID, caseIDPrefix string) {
 }
 
 // cmdReopenCase handles: /scantrace reopen <id>
-// Marks the case status = "open".
 func (h *Handler) cmdReopenCase(channelID, userID, caseIDPrefix string) {
 	target := h.resolveCaseByPrefix(caseIDPrefix)
 	if target == nil {
@@ -49,9 +56,18 @@ func (h *Handler) cmdReopenCase(channelID, userID, caseIDPrefix string) {
 	))
 }
 
-// resolveCaseByPrefix finds the first case whose CaseID starts with caseIDPrefix
-// (case-insensitive). Returns nil if not found.
-func (h *Handler) resolveCaseByPrefix(caseIDPrefix string) interface{ GetCaseID() string } {
-	// resolveCaseByPrefix is inlined into callers below — kept here for clarity.
+// resolveCaseByPrefix finds the first case whose CaseID starts with prefix
+// (case-insensitive). Searches all cases regardless of status.
+func (h *Handler) resolveCaseByPrefix(prefix string) *db.Case {
+	cases, err := h.store.ListCases("", 100)
+	if err != nil {
+		return nil
+	}
+	lower := strings.ToLower(prefix)
+	for _, c := range cases {
+		if strings.HasPrefix(strings.ToLower(c.CaseID), lower) {
+			return c
+		}
+	}
 	return nil
 }
