@@ -127,8 +127,6 @@ func selectActionPlan(ts triageState) string {
 
 // buildTriageBlock returns the plain-text triage block that is injected
 // verbatim into the singleCasePromptTemplate %s[0] placeholder.
-// It must match what buildSingleCaseContext writes into the context string
-// so the LLM sees consistent data in both places.
 func buildTriageBlock(ts triageState, portsSeen []string) string {
 	blacklistNote := ""
 	switch {
@@ -184,13 +182,7 @@ func (h *Handler) subscribeRTS() {
 }
 
 // splitArgs splits a raw Slack command text string into tokens, respecting
-// double-quoted strings. For example:
-//
-//	adddevice 192.168.50.4 label="Media Server" trust=trusted
-//
-// becomes ["adddevice", "192.168.50.4", `label=Media Server`, "trust=trusted"].
-// Quotes are stripped from the result values so downstream key=value parsing
-// works correctly regardless of whether the user quotes their label or not.
+// double-quoted strings.
 func splitArgs(s string) []string {
 	var tokens []string
 	var cur strings.Builder
@@ -231,6 +223,18 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 			return
 		}
 		h.cmdReport(cmd.ChannelID, cmd.UserID, parts[1])
+	case "close":
+		if len(parts) < 2 {
+			h.postEphemeral(cmd.ChannelID, cmd.UserID, "Usage: `/scantrace close <case-id>`")
+			return
+		}
+		h.cmdCloseCase(cmd.ChannelID, cmd.UserID, parts[1])
+	case "reopen":
+		if len(parts) < 2 {
+			h.postEphemeral(cmd.ChannelID, cmd.UserID, "Usage: `/scantrace reopen <case-id>`")
+			return
+		}
+		h.cmdReopenCase(cmd.ChannelID, cmd.UserID, parts[1])
 	case "alert":
 		h.cmdPostLatestAlert(cmd.ChannelID)
 	case "devices":
@@ -260,10 +264,6 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 // cmdAddDevice handles:
 //
 //	/scantrace adddevice <ip> [label="My Device"] [trust=trusted|unknown|suspicious] [suppress=true]
-//
-// All fields except <ip> are optional and default to label="<ip>", trust=unknown, suppress=false.
-// The upsert is keyed on IP — running the command again updates an existing entry.
-// Args are pre-split by splitArgs so quoted labels arrive as single tokens.
 func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 	if len(args) == 0 {
 		h.postEphemeral(channelID, userID,
@@ -285,8 +285,6 @@ func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 	trustLabel := "unknown"
 	autoSuppress := false
 
-	// Parse key=value pairs from remaining args.
-	// splitArgs already stripped surrounding quotes, so val is clean.
 	for _, arg := range args[1:] {
 		kv := strings.SplitN(arg, "=", 2)
 		if len(kv) != 2 {
@@ -311,13 +309,12 @@ func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
 		}
 	}
 
-	// Check if this IP already exists so we can report add vs update.
 	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
 
 	now := time.Now().UTC()
 	deviceID := uuid.NewString()
 	if existing != nil {
-		deviceID = existing.DeviceID // keep stable ID on update
+		deviceID = existing.DeviceID
 	}
 
 	d := &db.KnownDevice{
@@ -460,25 +457,14 @@ func (h *Handler) cmdNext(channelID, userID string) {
 }
 
 // classifyDst resolves the destination label for a single event.
-//
-// Rules (in priority order):
-//  1. wan_new_connection → traffic never left the WAN interface, so the
-//     "destination" is always the gateway itself regardless of the dst IP field.
-//  2. wan_forward + dst == wanIP → same gateway IP but traffic was forwarded;
-//     label it as gateway-forwarded rather than a plain WAN-edge hit.
-//  3. wan_forward → look up dst in device registry; fall through to
-//     "unknown internal host" if not found.
 func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge bool) {
 	switch strings.ToLower(eventType) {
 	case "wan_new_connection":
-		// Packet was dropped at the WAN interface — never reached LAN.
 		return "WAN EDGE — gateway interface only", true
 	case "wan_forward":
 		if h.wanIP != "" && dstIP == h.wanIP {
-			// Forwarded but dst happens to be the gateway's own IP (hairpin/NAT).
 			return "WAN gateway IP (forwarded — check NAT rules)", false
 		}
-		// Fall through: registry and unknown-host logic handled in caller.
 		return "", false
 	default:
 		if h.wanIP != "" && dstIP == h.wanIP {
@@ -488,20 +474,12 @@ func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge 
 	}
 }
 
-// buildSingleCaseContext builds the LLM context string and simultaneously
-// evaluates the triageState so the caller can pre-select the action plan.
-// It now also returns portsSeen so callers can pass it to buildTriageBlock.
-//
-// Key ordering guarantee: threat-feed and benign-scanner checks run during
-// Pass 1 (alongside event classification) so ts.ipsumTier,
-// ts.logsConfirmMalicious, and ts.isBenignScanner are all resolved before
-// the Triage block is written. This ensures the LLM sees the blacklist
-// verdict inline in Triage rather than only discovering it later.
+// buildSingleCaseContext builds the LLM context string and evaluates triageState.
 func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []string) {
 	var sb strings.Builder
 	var ts triageState
 
-	evtTypeCount := make(map[string]int) // "wan_new_connection" → n, "wan_forward" → n
+	evtTypeCount := make(map[string]int)
 	var portsSeen []string
 	portSet := make(map[int]struct{})
 
@@ -526,7 +504,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 	sb.WriteString(fmt.Sprintf("Case: id=%s title=%q sev=%s conf=%.0f%% status=%s events=%d\n",
 		c.CaseID[:8], c.Title, c.Severity, c.Confidence*100, c.Status, len(c.RelatedEventIDs)))
 
-	// ── Pass 1: collect per-event data ───────────────────────────────────────
 	ipSet := make(map[string]struct{})
 	type evtRow struct {
 		evtType  string
@@ -547,10 +524,8 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		key := strings.ToLower(evt.EventType)
 		evtTypeCount[key]++
 
-		// Classify destination.
 		dstLabel, isEdge := h.classifyDst(evt.DstIP, evt.EventType)
 		if !isEdge {
-			// wan_forward: check registry.
 			if dev, ok := deviceMap[evt.DstIP]; ok {
 				dstLabel = fmt.Sprintf("registry: label=%q trust=%s", dev.Label, dev.TrustLabel)
 				ts.dstInRegistry = true
@@ -580,24 +555,20 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		}
 	}
 
-	// ── Compute triage flags ─────────────────────────────────────────────────
 	total := 0
 	for _, n := range evtTypeCount {
 		total += n
 	}
-	// isWANEdgeOnly only if every single event was wan_new_connection.
 	if total > 0 && evtTypeCount["wan_new_connection"] == total {
 		ts.isWANEdgeOnly = true
 	}
 
-	// Build human-readable event-type summary string.
 	var evtParts []string
 	for typ, n := range evtTypeCount {
 		evtParts = append(evtParts, fmt.Sprintf("%s (%d)", typ, n))
 	}
 	ts.evtSummary = strings.Join(evtParts, ", ")
 
-	// ── Resolve threat-feed + benign-scanner flags BEFORE writing Triage ─────
 	ips := make([]string, 0, len(ipSet))
 	for ip := range ipSet {
 		ips = append(ips, ip)
@@ -634,7 +605,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		}
 	}
 
-	// ── Build dst label for Triage ────────────────────────────────────────────
 	if ts.isWANEdgeOnly {
 		ts.dstLabel = "WAN EDGE — gateway interface only"
 	} else if ts.hasWANForward && ts.dstInRegistry {
@@ -645,7 +615,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		ts.dstLabel = "MIXED — see event list below"
 	}
 
-	// ── Triage block written into context string ──────────────────────────────
 	blacklistNote := ""
 	switch {
 	case ts.ipsumTier >= threat.TierBlacklisted:
@@ -667,13 +636,11 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		blacklistNote,
 	))
 
-	// ── Pass 2: write per-event lines ────────────────────────────────────────
 	for _, r := range rows {
 		sb.WriteString(fmt.Sprintf("  evt type=%s src=%s dst=%s [%s] dport=%d proto=%s\n",
 			r.evtType, r.srcIP, r.dstIP, r.dstLabel, r.dstPort, r.proto))
 	}
 
-	// ── Write pre-resolved threat-feed lines ─────────────────────────────────
 	for _, line := range threatLines {
 		sb.WriteString("\n" + line + "\n")
 	}
@@ -684,7 +651,6 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		}
 	}
 
-	// ── IPInfo geo/ASN enrichment ────────────────────────────────────────────
 	if len(ips) > 0 {
 		enriched := ipinfo.Enrich(ips)
 		sb.WriteString("\nIP intel:\n")
@@ -783,9 +749,14 @@ func (h *Handler) cmdCases(channelID, userID string) {
 			badgeLine = "\n>" + strings.Join(badges, "  ·  ")
 		}
 
+		statusTag := ""
+		if !strings.EqualFold(c.Status, "open") {
+			statusTag = fmt.Sprintf(" `%s`", strings.ToUpper(c.Status))
+		}
+
 		caseText := fmt.Sprintf(
-			"%s  *[%s]* `%s`\n>%s\n>Confidence: %s   Events: *%d*%s",
-			emoji, sev, shortID, c.Title, confPill, evtCount, badgeLine,
+			"%s  *[%s]* `%s`%s\n>%s\n>Confidence: %s   Events: *%d*%s",
+			emoji, sev, shortID, statusTag, c.Title, confPill, evtCount, badgeLine,
 		)
 
 		reportBtn := slack.NewButtonBlockElement(
@@ -807,7 +778,7 @@ func (h *Handler) cmdCases(channelID, userID string) {
 	blocks = append(blocks,
 		slack.NewContextBlock("",
 			slack.NewTextBlockObject("mrkdwn",
-				"Use `/scantrace report <id>` or `@ScanTrace case <id>` for a full briefing",
+				"Use `/scantrace report <id>` · `/scantrace close <id>` · `/scantrace reopen <id>` · `@ScanTrace case <id>`",
 				false, false),
 		),
 	)
@@ -971,8 +942,6 @@ func extractFirstPort(report *casebuilder.CaseReport) string {
 }
 
 // handleEvent dispatches EventsAPI inner events.
-// Only app_mention is handled — the "message" event is intentionally omitted
-// to prevent every channel message from being processed as a bot command.
 func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 	switch event.InnerEvent.Type {
 	case "app_mention":
@@ -1091,73 +1060,35 @@ func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool
 		}
 		h.postMessage(dest, "", fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
 	}()
-
 	return true
 }
 
+// buildLLMContext builds a brief context string for generic @mention Q&A.
 func (h *Handler) buildLLMContext() string {
-	var sb strings.Builder
-	cases, _ := h.store.ListCases("", 10)
-	if len(cases) > 0 {
-		sb.WriteString("Recent cases:\n")
-		for _, c := range cases {
-			sb.WriteString(fmt.Sprintf("  id=%s title=%q sev=%s conf=%.0f%%\n",
-				c.CaseID[:8], c.Title, c.Severity, c.Confidence*100))
-		}
+	cases, _ := h.store.ListCases("", 5)
+	if len(cases) == 0 {
+		return "No active cases."
 	}
-	devices, _ := h.store.ListKnownDevices("", 20)
-	if len(devices) > 0 {
-		sb.WriteString("Known devices:\n")
-		for _, d := range devices {
-			sb.WriteString(fmt.Sprintf("  %s trust=%s label=%q\n", d.IP, d.TrustLabel, d.Label))
-		}
+	var sb strings.Builder
+	sb.WriteString("Recent cases:\n")
+	for _, c := range cases {
+		sb.WriteString(fmt.Sprintf("  %s [%s] sev=%s conf=%.0f%% events=%d\n",
+			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100, len(c.RelatedEventIDs)))
 	}
 	return sb.String()
 }
 
-// blocksFromMap converts the map[string]interface{} returned by
-// report.SlackBlock() into a slice of typed slack.Block values.
-// It marshals the map to JSON internally so callers don't need to change.
-func blocksFromMap(raw map[string]interface{}) ([]slack.Block, error) {
-	data, err := json.Marshal(raw)
+// blocksFromMap deserialises a map[string]interface{} into slack.Blocks.
+func blocksFromMap(m map[string]interface{}) ([]slack.Block, error) {
+	b, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
 	}
-	var payload struct {
-		Blocks []json.RawMessage `json:"blocks"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
+	var blocks slack.Blocks
+	if err := json.Unmarshal(b, &blocks); err != nil {
 		return nil, err
 	}
-	blocks := make([]slack.Block, 0, len(payload.Blocks))
-	for _, b := range payload.Blocks {
-		var typed struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(b, &typed); err != nil {
-			continue
-		}
-		switch typed.Type {
-		case "header":
-			var v slack.HeaderBlock
-			if err := json.Unmarshal(b, &v); err == nil {
-				blocks = append(blocks, &v)
-			}
-		case "section":
-			var v slack.SectionBlock
-			if err := json.Unmarshal(b, &v); err == nil {
-				blocks = append(blocks, &v)
-			}
-		case "divider":
-			blocks = append(blocks, slack.NewDividerBlock())
-		case "context":
-			var v slack.ContextBlock
-			if err := json.Unmarshal(b, &v); err == nil {
-				blocks = append(blocks, &v)
-			}
-		}
-	}
-	return blocks, nil
+	return blocks.BlockSet, nil
 }
 
 func (h *Handler) postMessage(channelID, threadTS, text string) {
@@ -1171,15 +1102,8 @@ func (h *Handler) postMessage(channelID, threadTS, text string) {
 	}
 }
 
-// postEphemeral sends a message visible only to the target user.
-// Uses PostMessage with response_type=ephemeral via MsgOptionPostEphemeral
-// since PostEphemeralMessage is not available in slack-go v0.15.0 with MsgOption args.
 func (h *Handler) postEphemeral(channelID, userID, text string) {
-	_, _, err := h.api.PostMessage(
-		channelID,
-		slack.MsgOptionText(text, false),
-		slack.MsgOptionPostEphemeral(userID),
-	)
+	_, err := h.api.PostEphemeral(channelID, userID, slack.MsgOptionText(text, false))
 	if err != nil {
 		log.Printf("[handler] postEphemeral error channel=%s user=%s: %v", channelID, userID, err)
 	}
@@ -1219,21 +1143,19 @@ func trustEmoji(trust string) string {
 }
 
 func helpText() string {
-	return "*ScanTrace Commands*\n\n" +
-		"*Cases*\n" +
-		"• `/scantrace cases` — list active cases\n" +
-		"• `/scantrace report <id>` — static report for a case\n" +
-		"• `/scantrace next` — AI briefing of highest-priority case\n" +
-		"• `/scantrace review-all` — AI briefing of all open cases\n" +
-		"• `/scantrace alert` — repost latest case alert\n\n" +
-		"*Devices*\n" +
-		"• `/scantrace devices` — list known device registry\n" +
-		"• `/scantrace adddevice <ip> [label=\"Name\"] [trust=trusted|unknown|suspicious] [suppress=true]`\n" +
-		"• `/scantrace removedevice <ip>` — remove device from registry\n\n" +
-		"*Mentions*\n" +
-		"• `@ScanTrace case <id>` — AI briefing for a specific case\n" +
-		"• `@ScanTrace report <id>` — same as above\n" +
-		"• `@ScanTrace cases` — list active cases\n\n" +
-		"*Other*\n" +
-		"• `/scantrace mcp` — MCP server info"
+	return "*ScanTrace Commands*\n" +
+		"*/scantrace cases* — list active cases\n" +
+		"*/scantrace report <id>* — static block report for a case\n" +
+		"*/scantrace close <id>* — mark a case as closed\n" +
+		"*/scantrace reopen <id>* — reopen a closed case\n" +
+		"*/scantrace next* — LLM briefing for highest-priority open case\n" +
+		"*/scantrace review-all* — LLM briefing for all open cases\n" +
+		"*/scantrace alert* — repost latest case alert to #sec-alerts\n" +
+		"*/scantrace devices* — list known device registry\n" +
+		"*/scantrace adddevice <ip> [label=...] [trust=...] [suppress=true]* — add/update a device\n" +
+		"*/scantrace removedevice <ip>* — remove a device from registry\n" +
+		"*/scantrace mcp* — MCP server info\n" +
+		"*@ScanTrace case <id>* — full LLM briefing for a specific case\n" +
+		"*@ScanTrace cases* — list active cases\n" +
+		"*@ScanTrace <question>* — ask anything about current cases"
 }
