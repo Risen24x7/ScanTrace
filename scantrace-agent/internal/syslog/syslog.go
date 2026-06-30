@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,13 +42,13 @@ var (
 
 // parsedLine holds the fields extracted from one syslog message.
 type parsedLine struct {
-	iface    string
-	srcIP    string
-	dstIP    string
-	srcPort  int
-	dstPort  int
-	proto    string
-	rawLine  string
+	iface   string
+	srcIP   string
+	dstIP   string
+	srcPort int
+	dstPort int
+	proto   string
+	rawLine string
 }
 
 // caseKey groups events into a single case: same external source + same targeted port.
@@ -56,13 +57,43 @@ type caseKey struct {
 	dstPort int
 }
 
+// syslogSensorID is a stable UUID used for the syslog sensor row.
+// Derived from the well-known namespace + "syslog_udp" so it never
+// conflicts with CLI-registered sensors.
+const syslogSensorID = "00000000-5359-4c4f-4700-000000000001"
+
+// ensureSyslogSensor upserts the syslog sensor row so every event written by
+// this package satisfies the events.sensor_id FOREIGN KEY constraint.
+func ensureSyslogSensor(store *db.DB) error {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "router-syslog"
+	}
+	s := &db.Sensor{
+		SensorID:      syslogSensorID,
+		Hostname:      hostname,
+		Platform:      "linux",
+		Role:          "gateway",
+		CollectorType: "syslog_udp",
+		Version:       "1.0.0",
+		CreatedAt:     time.Now().UTC(),
+		UpdatedAt:     time.Now().UTC(),
+	}
+	return store.InsertSensor(s)
+}
+
 // Listen binds a UDP socket on addr (e.g. ":5140") and starts ingesting
 // syslog lines. It blocks until the socket fails.
 //
-//   - store  — ScanTrace SQLite DB
+//   - store   — ScanTrace SQLite DB
 //   - alerter — handler.Handler (or any Alerter); PostCaseAlert is called
 //     whenever a new case is opened or an existing case gains events.
 func Listen(addr string, store *db.DB, alerter Alerter) error {
+	// Ensure the syslog sensor row exists before any event is written.
+	if err := ensureSyslogSensor(store); err != nil {
+		log.Printf("[syslog] WARNING: could not upsert syslog sensor: %v", err)
+	}
+
 	conn, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return fmt.Errorf("syslog.Listen: bind %s: %w", addr, err)
@@ -154,6 +185,7 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		Timestamp:    now,
 		FirstSeen:    now,
 		LastSeen:     now,
+		SensorID:     syslogSensorID,
 		SourceType:   "syslog_udp",
 		DetectorType: "iptables_drop",
 		EventType:    evtType,
