@@ -101,6 +101,22 @@ var govASNs = []string{
 	"AS4323",  // CIA
 }
 
+// knownBulletproofASNs are ASNs explicitly identified as bulletproof or
+// shady hosting operators based on active threat-feed telemetry. These are
+// classified KnownBad regardless of what ip-api.com returns for the hosting
+// or proxy boolean flags, which may lag for small/new ASNs.
+var knownBulletproofASNs = []string{
+	"AS209334", // Modat B.V. — NL-registered, OVH-colocated; active origin for Docker API scans,
+	//             mass SSH brute-force, and RedTail miner botnet deployment per AbuseIPDB/ThreatFox/IPSum.
+}
+
+// knownBulletproofOrgKeywords are org/ISP substrings that reliably identify
+// bulletproof or shady hosting operators even when the hosting flag is false.
+var knownBulletproofOrgKeywords = []string{
+	"modat b.v.",
+	"modat bv",
+}
+
 // knownCloudKeywords identify major cloud/CDN providers that may be flagged as
 // hosting infrastructure but are generally considered legitimate traffic sources.
 // Checked BEFORE the generic hosting=true → KnownBad rule.
@@ -165,18 +181,31 @@ func (i *Info) Classify() Classification {
 		}
 	}
 
-	// 2. Hosting DC + Proxy together — bulletproof / C2 infra signal.
+	// 2. Explicitly known bulletproof ASNs — classified KnownBad regardless of
+	//    ip-api.com hosting/proxy flags, which may not yet cover small/new ASNs.
+	for _, asn := range knownBulletproofASNs {
+		if asUpper == asn {
+			return ClassKnownBad
+		}
+	}
+	for _, kw := range knownBulletproofOrgKeywords {
+		if strings.Contains(orgLower, kw) {
+			return ClassKnownBad
+		}
+	}
+
+	// 3. Hosting DC + Proxy together — bulletproof / C2 infra signal.
 	//    Even major cloud providers get KnownBad if proxy is also flagged.
 	if i.Hosting && i.Proxy {
 		return ClassKnownBad
 	}
 
-	// 3. Proxy/VPN without hosting — anonymised source.
+	// 4. Proxy/VPN without hosting — anonymised source.
 	if i.Proxy {
 		return ClassSuspicious
 	}
 
-	// 4. Major cloud/CDN flagged as hosting — legitimate infra, not hostile DC.
+	// 5. Major cloud/CDN flagged as hosting — legitimate infra, not hostile DC.
 	//    Must be checked BEFORE the generic hosting=true → KnownBad rule.
 	if i.Hosting {
 		for _, kw := range knownCloudKeywords {
@@ -188,7 +217,7 @@ func (i *Info) Classify() Classification {
 		return ClassKnownBad
 	}
 
-	// 5. Major CDN / carrier / big-tech (non-hosting) — benign.
+	// 6. Major CDN / carrier / big-tech (non-hosting) — benign.
 	for _, kw := range knownCloudKeywords {
 		if strings.Contains(orgLower, kw) {
 			return ClassKnownGood
