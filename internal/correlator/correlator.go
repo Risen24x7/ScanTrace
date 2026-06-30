@@ -21,6 +21,12 @@ const (
 	dedupWindow = 24 * time.Hour
 )
 
+// Enrich is the interface the correlator uses to enrich a src IP and link it
+// to a newly opened case. It is satisfied by *enricher.Enricher.
+type Enrich interface {
+	EnrichAndLink(caseID, ip string) (*db.Entity, error)
+}
+
 type Config struct {
 	Window    time.Duration
 	Threshold int
@@ -32,13 +38,26 @@ func DefaultConfig() Config {
 }
 
 type Correlator struct {
-	store  *db.DB
-	config Config
-	rules  []Rule
+	store    *db.DB
+	config   Config
+	rules    []Rule
+	enricher Enrich // optional; nil = no inline enrichment
 }
 
-func New(store *db.DB, cfg Config) *Correlator {
-	return &Correlator{store: store, config: cfg, rules: DefaultRules()}
+// WithEnricher wires an enricher into the correlator so that newly opened
+// cases are enriched and linked in the same call as case creation.
+// This eliminates the race where a first-seen IP has no entity in the DB
+// at the moment openCase fires.
+func WithEnricher(e Enrich) func(*Correlator) {
+	return func(c *Correlator) { c.enricher = e }
+}
+
+func New(store *db.DB, cfg Config, opts ...func(*Correlator)) *Correlator {
+	c := &Correlator{store: store, config: cfg, rules: DefaultRules()}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 type IPCluster struct {
@@ -233,10 +252,27 @@ func (c *Correlator) openCase(cl *IPCluster, match *RuleMatch) (*db.Case, error)
 		return nil, err
 	}
 
+	// Entity linking: try the fast-path (already in DB) first, then fall
+	// through to inline enrichment for first-seen IPs.
+	//
+	// The inline enricher path eliminates the race where openCase fires
+	// before the async enricher has had a chance to look up a brand-new IP,
+	// which previously resulted in cases with zero linked entities and
+	// therefore "unknown" Infrastructure Context in Slack reports.
 	if entity, err := c.store.GetEntityByIP(cl.SrcIP); err == nil && entity != nil {
+		// Fast path: entity already in DB from a previous enrichment run.
 		if linkErr := c.store.LinkEntityToCase(cas.CaseID, entity.EntityID); linkErr != nil {
-			log.Printf("[correlator] entity link failed for case %s / ip %s: %v",
+			log.Printf("[correlator] entity link (cached) failed case=%s ip=%s: %v",
 				cas.CaseID[:8], cl.SrcIP, linkErr)
+		}
+	} else if c.enricher != nil {
+		// Slow path: first-seen IP — enrich synchronously so the entity is
+		// present in the DB before the Slack alert fires.
+		if _, enrichErr := c.enricher.EnrichAndLink(cas.CaseID, cl.SrcIP); enrichErr != nil {
+			log.Printf("[correlator] inline enrich failed case=%s ip=%s: %v",
+				cas.CaseID[:8], cl.SrcIP, enrichErr)
+			// Non-fatal: case is still opened and alerted; entity data just
+			// won't be in the report for this one case.
 		}
 	}
 

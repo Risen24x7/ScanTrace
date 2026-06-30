@@ -30,7 +30,7 @@ type Enricher struct {
 type Option func(*Enricher)
 
 func WithToken(t string) Option { return func(e *Enricher) { e.token = t } }
-func WithTTL(d time.Duration) Option { return func(e *Enricher) { e.ttl = d } }
+func WithTTL(d time.Duration) Option  { return func(e *Enricher) { e.ttl = d } }
 
 func New(store *db.DB, opts ...Option) *Enricher {
 	e := &Enricher{
@@ -78,6 +78,21 @@ func (e *Enricher) EnrichIP(ip string) (*db.Entity, error) {
 		return entity, fmt.Errorf("enricher: upsert: %w", err)
 	}
 	return entity, nil
+}
+
+// EnrichAndLink enriches ip (fetching from ipinfo.io or returning a cached
+// entity if within TTL), then links the resulting entity to caseID.
+// It is safe to call even when the entity already exists — the link is
+// idempotent via LinkEntityToCase.
+func (e *Enricher) EnrichAndLink(caseID, ip string) (*db.Entity, error) {
+	ent, err := e.EnrichIP(ip)
+	if err != nil {
+		return nil, err
+	}
+	if linkErr := e.store.LinkEntityToCase(caseID, ent.EntityID); linkErr != nil {
+		log.Printf("[enricher] EnrichAndLink: link failed case=%s ip=%s: %v", caseID[:8], ip, linkErr)
+	}
+	return ent, nil
 }
 
 func (e *Enricher) EnrichEvents(events []*db.Event) map[string]*db.Entity {
