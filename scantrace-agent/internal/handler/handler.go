@@ -169,6 +169,14 @@ func (h *Handler) Dispatch(client *socketmode.Client, evt socketmode.Event) {
 		}
 		client.Ack(*evt.Request)
 		h.handleEvent(eventsAPI)
+	case socketmode.EventTypeInteractive:
+		interaction, ok := evt.Data.(slack.InteractionCallback)
+		if !ok {
+			client.Ack(*evt.Request)
+			return
+		}
+		client.Ack(*evt.Request)
+		h.handleBlockAction(interaction)
 	}
 }
 
@@ -258,6 +266,30 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 				"Connect any MCP host (Claude Desktop, Cursor) to `http://localhost:8765`")
 	default:
 		h.postEphemeral(cmd.ChannelID, cmd.UserID, helpText())
+	}
+}
+
+// handleBlockAction processes interactive button clicks from Slack Block Kit.
+// Action IDs follow the pattern: scantrace_close_<shortID> / scantrace_reopen_<shortID> / scantrace_report_<shortID>
+func (h *Handler) handleBlockAction(cb slack.InteractionCallback) {
+	for _, action := range cb.ActionCallback.BlockActions {
+		actionID := action.ActionID
+		channelID := cb.Channel.ID
+		userID := cb.User.ID
+
+		switch {
+		case strings.HasPrefix(actionID, "scantrace_close_"):
+			shortID := strings.TrimPrefix(actionID, "scantrace_close_")
+			h.cmdCloseCase(channelID, userID, shortID)
+
+		case strings.HasPrefix(actionID, "scantrace_reopen_"):
+			shortID := strings.TrimPrefix(actionID, "scantrace_reopen_")
+			h.cmdReopenCase(channelID, userID, shortID)
+
+		case strings.HasPrefix(actionID, "scantrace_report_"):
+			shortID := strings.TrimPrefix(actionID, "scantrace_report_")
+			h.cmdReport(channelID, userID, shortID)
+		}
 	}
 }
 
@@ -401,7 +433,7 @@ func (h *Handler) cmdReviewAll(channelID, userID string) {
 					"⚠️ Case %s — inference error: %v", c.CaseID[:8], err,
 				))
 			} else {
-				h.postMessage(dest, "", fmt.Sprintf(
+				h.postCaseBriefingWithActions(dest, c.CaseID[:8], fmt.Sprintf(
 					"*Case %d/%d — %s*\n%s", i+1, len(cases), c.CaseID[:8], answer,
 				))
 			}
@@ -452,7 +484,8 @@ func (h *Handler) cmdNext(channelID, userID string) {
 			))
 			return
 		}
-		h.postMessage(dest, "", fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
+		h.postCaseBriefingWithActions(dest, target.CaseID[:8],
+			fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
 	}()
 }
 
@@ -1058,9 +1091,39 @@ func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool
 			h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", target.CaseID[:8], err))
 			return
 		}
-		h.postMessage(dest, "", fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
+		h.postCaseBriefingWithActions(dest, target.CaseID[:8],
+			fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
 	}()
 	return true
+}
+
+// postCaseBriefingWithActions posts a case briefing as a Block Kit message
+// with ✅ Close and 🔓 Reopen action buttons appended.
+func (h *Handler) postCaseBriefingWithActions(channelID, shortID, briefingText string) {
+	closeBtn := slack.NewButtonBlockElement(
+		"scantrace_close_"+shortID,
+		shortID,
+		slack.NewTextBlockObject("plain_text", "✅ Close Case", false, false),
+	)
+	closeBtn.Style = "primary"
+
+	reopenBtn := slack.NewButtonBlockElement(
+		"scantrace_reopen_"+shortID,
+		shortID,
+		slack.NewTextBlockObject("plain_text", "🔓 Reopen Case", false, false),
+	)
+
+	blocks := []slack.Block{
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", briefingText, false, false),
+			nil, nil,
+		),
+		slack.NewActionBlock("",
+			closeBtn,
+			reopenBtn,
+		),
+	}
+	h.postBlocks(channelID, "", blocks)
 }
 
 // buildLLMContext builds a brief context string for generic @mention Q&A.
@@ -1155,7 +1218,7 @@ func helpText() string {
 		"*/scantrace adddevice <ip> [label=...] [trust=...] [suppress=true]* — add/update a device\n" +
 		"*/scantrace removedevice <ip>* — remove a device from registry\n" +
 		"*/scantrace mcp* — MCP server info\n" +
-		"*@ScanTrace case <id>* — full LLM briefing for a specific case\n" +
+		"*@ScanTrace case <id>* — full LLM briefing + Close/Reopen buttons\n" +
 		"*@ScanTrace cases* — list active cases\n" +
 		"*@ScanTrace <question>* — ask anything about current cases"
 }
