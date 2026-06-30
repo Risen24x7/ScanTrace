@@ -39,6 +39,16 @@ CREATE INDEX IF NOT EXISTS idx_port_hits_seen_at ON port_hits(seen_at);
 CREATE INDEX IF NOT EXISTS idx_port_hits_src_ip  ON port_hits(src_ip);
 `
 
+// HitRecord is a single observation tuple passed from handler to RecordHit.
+type HitRecord struct {
+	Port      int
+	SrcIP     string
+	SrcASN    string
+	SrcOrg    string
+	SrcCountry string
+	EventType string
+}
+
 // Store is a persistent port hit registry backed by SQLite.
 type Store struct {
 	db *sql.DB
@@ -78,15 +88,15 @@ func (s *Store) RecordHit(port int, srcIP, srcASN, srcOrg, srcCountry, eventType
 
 // PortSummary holds aggregated stats for a single port.
 type PortSummary struct {
-	Port        int
-	HitCount    int     // total raw hits in window
-	UniqueIPs   int     // distinct source IPs
-	UniqueASNs  int     // distinct ASNs (campaign breadth indicator)
-	FirstSeen   time.Time
-	LastSeen    time.Time
-	PrevHits    int     // hit count in prior window (for trend)
-	TrendPct    float64 // (HitCount - PrevHits) / max(PrevHits,1) * 100
-	TopOrgs     []string // up to 3 most common org names
+	Port       int
+	HitCount   int     // total raw hits in window
+	UniqueIPs  int     // distinct source IPs
+	UniqueASNs int     // distinct ASNs (campaign breadth indicator)
+	FirstSeen  time.Time
+	LastSeen   time.Time
+	PrevHits   int     // hit count in prior window (for trend)
+	TrendPct   float64 // (HitCount - PrevHits) / max(PrevHits,1) * 100
+	TopOrgs    []string // up to 3 most common org names
 }
 
 // TrendArrow returns a Slack-friendly trend indicator.

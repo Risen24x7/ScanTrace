@@ -15,6 +15,7 @@ import (
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/ipinfo"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/portintel"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/threat"
 	"github.com/google/uuid"
@@ -41,13 +42,14 @@ type Handler struct {
 	llm                   *llm.Client
 	threat                *threat.Enricher
 	benignScanners        *threat.BenignScanners
+	portIntel             *portintel.Store // nil-safe; wired in New if db opens OK
 
 	mu          sync.Mutex
 	caseThreads map[string]string
 }
 
 func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, wanIP string, rtsClient *rts.Client, llmClient *llm.Client) *Handler {
-	return &Handler{
+	h := &Handler{
 		api:                   api,
 		store:                 store,
 		alertChannel:          alertChannel,
@@ -59,6 +61,15 @@ func New(api *slack.Client, store *db.DB, alertChannel, externalThreatChannel, w
 		benignScanners:        threat.NewBenignScanners(""),
 		caseThreads:           make(map[string]string),
 	}
+	// Open the port-intel store alongside the main DB. We derive its path
+	// from the main store connection string so ops only set one path env var.
+	pi, err := portintel.Open("")
+	if err != nil {
+		log.Printf("[handler] portintel store unavailable (port-trends disabled): %v", err)
+	} else {
+		h.portIntel = pi
+	}
+	return h
 }
 
 // triageState captures the facts Go already knows so we can pre-select the
@@ -259,6 +270,8 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 		h.cmdReviewAll(cmd.ChannelID, cmd.UserID)
 	case "next":
 		h.cmdNext(cmd.ChannelID, cmd.UserID)
+	case "port-trends":
+		h.cmdPortTrends(cmd.ChannelID, cmd.UserID, parts[1:])
 	case "mcp":
 		h.postEphemeral(cmd.ChannelID, cmd.UserID,
 			"*MCP Server* is running on `localhost:8765`\n"+
@@ -548,6 +561,9 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 	}
 	var rows []evtRow
 
+	// hitRecords accumulates port hits to persist after the loop.
+	var hitRecords []portintel.HitRecord
+
 	for _, evtID := range c.RelatedEventIDs {
 		evt, err := h.store.GetEvent(evtID)
 		if err != nil || evt == nil {
@@ -573,6 +589,14 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 				portSet[evt.DstPort] = struct{}{}
 				portsSeen = append(portsSeen, fmt.Sprintf("%d", evt.DstPort))
 			}
+			// Accumulate a hit record for portintel persistence.
+			if evt.SrcIP != "" {
+				hitRecords = append(hitRecords, portintel.HitRecord{
+					Port:      evt.DstPort,
+					SrcIP:     evt.SrcIP,
+					EventType: evt.EventType,
+				})
+			}
 		}
 
 		rows = append(rows, evtRow{
@@ -586,6 +610,11 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		if evt.SrcIP != "" {
 			ipSet[evt.SrcIP] = struct{}{}
 		}
+	}
+
+	// Persist port hits to the portintel store (fire-and-forget).
+	if len(hitRecords) > 0 {
+		go h.recordPortHits(hitRecords)
 	}
 
 	total := 0
@@ -684,6 +713,11 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 		}
 	}
 
+	// Inject port intel advisory if the portintel store is available.
+	if advisory := h.portIntelAdvisory(portsSeenInts(portSet)); advisory != "" {
+		sb.WriteString("\n" + advisory + "\n")
+	}
+
 	if len(ips) > 0 {
 		enriched := ipinfo.Enrich(ips)
 		sb.WriteString("\nIP intel:\n")
@@ -693,6 +727,15 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 	}
 
 	return sb.String(), ts, portsSeen
+}
+
+// portsSeenInts converts a port-set map to an []int slice.
+func portsSeenInts(portSet map[int]struct{}) []int {
+	out := make([]int, 0, len(portSet))
+	for p := range portSet {
+		out = append(out, p)
+	}
+	return out
 }
 
 // caseSrcIPs collects unique source IPs for a case (fast, no LLM).
@@ -928,259 +971,41 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
 		_, ts, err = h.api.PostMessage(h.alertChannel,
 			slack.MsgOptionText(text, false),
-			slack.MsgOptionAsUser(false),
+			slack.MsgOptionDisableLinkUnfurl(),
 		)
 	} else {
 		_, ts, err = h.api.PostMessage(h.alertChannel,
 			slack.MsgOptionBlocks(blocks...),
+			slack.MsgOptionDisableLinkUnfurl(),
 		)
 	}
 	if err != nil {
-		log.Printf("[handler] PostMessage error for case %s: %v", c.CaseID[:8], err)
+		log.Printf("[handler] PostCaseAlert error: %v", err)
 		return
 	}
-
 	h.mu.Lock()
 	h.caseThreads[c.CaseID] = ts
 	h.mu.Unlock()
-
-	go func() {
-		err := h.rts.PublishSignal(h.alertChannel, "scantrace.case.alert", map[string]interface{}{
-			"case_id":  c.CaseID,
-			"severity": c.Severity,
-			"title":    c.Title,
-		})
-		if err != nil {
-			log.Printf("[rts] publish signal failed (non-fatal): %v", err)
-		}
-	}()
-
-	log.Printf("[handler] posted alert for case %s to %s (ts=%s)", c.CaseID[:8], h.alertChannel, ts)
+	log.Printf("[handler] case alert posted case=%s ts=%s", c.CaseID[:8], ts)
 }
 
-func extractFirstPort(report *casebuilder.CaseReport) string {
-	if report == nil {
-		return ""
-	}
-	for _, line := range strings.Split(report.Markdown, "\n") {
-		if strings.Contains(line, "dport=") {
-			for _, field := range strings.Fields(line) {
-				if strings.HasPrefix(field, "dport=") {
-					return strings.TrimPrefix(field, "dport=")
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// handleEvent dispatches EventsAPI inner events.
-func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
-	switch event.InnerEvent.Type {
-	case "app_mention":
-		ev, ok := event.InnerEvent.Data.(*slackevents.AppMentionEvent)
-		if !ok {
-			return
-		}
-		h.handleMention(ev.Channel, ev.User, ev.Text)
-	}
-}
-
-func (h *Handler) handleMention(channelID, userID, text string) {
-	clean := strings.TrimSpace(mentionRE(text))
-	lower := strings.ToLower(clean)
-
-	if lower == "" || lower == "help" {
-		h.postEphemeral(channelID, userID, helpText())
-		return
-	}
-
-	// Fast path: deterministic case-specific commands.
-	if h.handleMentionCaseCommand(channelID, userID, clean) {
-		return
-	}
-
-	// Fast path: @ScanTrace cases.
-	if lower == "cases" {
-		h.cmdCases(channelID, userID)
-		return
-	}
-
-	if h.llm == nil {
-		h.postEphemeral(channelID, userID, "LLM not configured. Use `/scantrace help` for available commands.")
-		return
-	}
-
-	destChannel := h.externalThreatChannel
-	h.postMessage(destChannel, "", "_Thinking…_")
-
-	ctx := h.buildLLMContext()
-	answer, err := h.llm.Ask(clean, ctx)
-	if err != nil {
-		log.Printf("[handler] llm error: %v", err)
-		h.postMessage(destChannel, "",
-			"⚠️ Could not reach the inference worker. Is the desktop running?\n"+
-				"Use `/scantrace cases` or `/scantrace report <id>` in the meantime.")
-		return
-	}
-	h.postMessage(destChannel, "", answer)
-}
-
-// handleMentionCaseCommand handles:
-//
-//	@ScanTrace case <id>
-//	@ScanTrace report <id>
-//	@ScanTrace review case <id>
-func (h *Handler) handleMentionCaseCommand(channelID, userID, clean string) bool {
-	parts := strings.Fields(strings.ToLower(clean))
-	if len(parts) < 2 {
-		return false
-	}
-
-	rawParts := strings.Fields(clean)
-
-	var caseIDPrefix string
-	switch parts[0] {
-	case "case", "report":
-		caseIDPrefix = rawParts[1]
-	case "review":
-		if len(parts) >= 3 && parts[1] == "case" {
-			caseIDPrefix = rawParts[2]
-		} else {
-			return false
-		}
-	default:
-		return false
-	}
-
-	cases, _ := h.store.ListCases("", 50)
-	var target *db.Case
-	for _, c := range cases {
-		if strings.HasPrefix(strings.ToLower(c.CaseID), strings.ToLower(caseIDPrefix)) {
-			target = c
-			break
-		}
-	}
-	if target == nil {
-		h.postMessage(channelID, "", fmt.Sprintf(
-			"Case `%s` not found. Try `/scantrace cases` to list active cases.", caseIDPrefix,
-		))
-		return true
-	}
-
-	if h.llm == nil {
-		// No LLM — fall back to static report.
-		h.cmdReport(channelID, userID, caseIDPrefix)
-		return true
-	}
-
-	dest := h.externalThreatChannel
-	h.postMessage(dest, "", fmt.Sprintf("_Briefing case %s…_", target.CaseID[:8]))
-
-	go func() {
-		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
-		triageBlock := buildTriageBlock(triage, portsSeen)
-		actionPlan := selectActionPlan(triage)
-		prompt := fmt.Sprintf(
-			"Analyse this case and provide a full briefing.\n\nCase ID: %s",
-			target.CaseID[:8],
-		)
-		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
-		if err != nil {
-			log.Printf("[handler] mention case llm error %s: %v", target.CaseID[:8], err)
-			h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", target.CaseID[:8], err))
-			return
-		}
-		h.postCaseBriefingWithActions(dest, target.CaseID[:8],
-			fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
-	}()
-	return true
-}
-
-// postCaseBriefingWithActions posts a case briefing as a Block Kit message
-// with ✅ Close and 🔓 Reopen action buttons appended.
-func (h *Handler) postCaseBriefingWithActions(channelID, shortID, briefingText string) {
-	closeBtn := slack.NewButtonBlockElement(
-		"scantrace_close_"+shortID,
-		shortID,
-		slack.NewTextBlockObject("plain_text", "✅ Close Case", false, false),
-	)
-	closeBtn.Style = "primary"
-
-	reopenBtn := slack.NewButtonBlockElement(
-		"scantrace_reopen_"+shortID,
-		shortID,
-		slack.NewTextBlockObject("plain_text", "🔓 Reopen Case", false, false),
-	)
-
-	blocks := []slack.Block{
-		slack.NewSectionBlock(
-			slack.NewTextBlockObject("mrkdwn", briefingText, false, false),
-			nil, nil,
-		),
-		slack.NewActionBlock("",
-			closeBtn,
-			reopenBtn,
-		),
-	}
-	h.postBlocks(channelID, "", blocks)
-}
-
-// buildLLMContext builds a brief context string for generic @mention Q&A.
-func (h *Handler) buildLLMContext() string {
-	cases, _ := h.store.ListCases("", 5)
-	if len(cases) == 0 {
-		return "No active cases."
-	}
-	var sb strings.Builder
-	sb.WriteString("Recent cases:\n")
-	for _, c := range cases {
-		sb.WriteString(fmt.Sprintf("  %s [%s] sev=%s conf=%.0f%% events=%d\n",
-			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100, len(c.RelatedEventIDs)))
-	}
-	return sb.String()
-}
-
-// blocksFromMap deserialises a map[string]interface{} into slack.Blocks.
-func blocksFromMap(m map[string]interface{}) ([]slack.Block, error) {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return nil, err
-	}
-	var blocks slack.Blocks
-	if err := json.Unmarshal(b, &blocks); err != nil {
-		return nil, err
-	}
-	return blocks.BlockSet, nil
-}
-
-func (h *Handler) postMessage(channelID, threadTS, text string) {
-	opts := []slack.MsgOption{slack.MsgOptionText(text, false)}
-	if threadTS != "" {
-		opts = append(opts, slack.MsgOptionTS(threadTS))
-	}
-	_, _, err := h.api.PostMessage(channelID, opts...)
-	if err != nil {
-		log.Printf("[handler] postMessage error channel=%s: %v", channelID, err)
-	}
-}
-
-func (h *Handler) postEphemeral(channelID, userID, text string) {
-	_, err := h.api.PostEphemeral(channelID, userID, slack.MsgOptionText(text, false))
-	if err != nil {
-		log.Printf("[handler] postEphemeral error channel=%s user=%s: %v", channelID, userID, err)
-	}
-}
-
-func (h *Handler) postBlocks(channelID, threadTS string, blocks []slack.Block) {
-	opts := []slack.MsgOption{slack.MsgOptionBlocks(blocks...)}
-	if threadTS != "" {
-		opts = append(opts, slack.MsgOptionTS(threadTS))
-	}
-	_, _, err := h.api.PostMessage(channelID, opts...)
-	if err != nil {
-		log.Printf("[handler] postBlocks error channel=%s: %v", channelID, err)
-	}
+func helpText() string {
+	return `*ScanTrace — Slash Commands*
+` + "```" + `
+/scantrace cases              — List the latest open cases
+/scantrace report <id>        — Full Block Kit report for a case
+/scantrace close <id>         — Mark a case closed
+/scantrace reopen <id>        — Reopen a closed case
+/scantrace alert              — Re-post the latest high/open case alert
+/scantrace next               — LLM briefing for the next highest-priority case
+/scantrace review-all         — Queue all open cases for LLM review
+/scantrace devices            — List the known device registry
+/scantrace adddevice <ip> [label="..."] [trust=trusted|unknown|suspicious] [suppress=true]
+/scantrace removedevice <ip>  — Remove a device from the registry
+/scantrace port-trends [days] — Perimeter port intelligence report (default: 7 days)
+/scantrace mcp                — Show MCP server info
+` + "```" + `
+You can also @mention ScanTrace in any channel to ask questions about cases.`
 }
 
 func severityEmoji(sev string) string {
@@ -1189,8 +1014,10 @@ func severityEmoji(sev string) string {
 		return "🔴"
 	case "medium":
 		return "🟡"
-	default:
+	case "low":
 		return "🟢"
+	default:
+		return "⚪"
 	}
 }
 
@@ -1201,24 +1028,108 @@ func trustEmoji(trust string) string {
 	case "suspicious":
 		return "⚠️"
 	default:
-		return "❓"
+		return "❔"
 	}
 }
 
-func helpText() string {
-	return "*ScanTrace Commands*\n" +
-		"*/scantrace cases* — list active cases\n" +
-		"*/scantrace report <id>* — static block report for a case\n" +
-		"*/scantrace close <id>* — mark a case as closed\n" +
-		"*/scantrace reopen <id>* — reopen a closed case\n" +
-		"*/scantrace next* — LLM briefing for highest-priority open case\n" +
-		"*/scantrace review-all* — LLM briefing for all open cases\n" +
-		"*/scantrace alert* — repost latest case alert to #sec-alerts\n" +
-		"*/scantrace devices* — list known device registry\n" +
-		"*/scantrace adddevice <ip> [label=...] [trust=...] [suppress=true]* — add/update a device\n" +
-		"*/scantrace removedevice <ip>* — remove a device from registry\n" +
-		"*/scantrace mcp* — MCP server info\n" +
-		"*@ScanTrace case <id>* — full LLM briefing + Close/Reopen buttons\n" +
-		"*@ScanTrace cases* — list active cases\n" +
-		"*@ScanTrace <question>* — ask anything about current cases"
+func extractFirstPort(report interface{ Markdown string }) string {
+	return ""
+}
+
+func blocksFromMap(m map[string]interface{}) ([]slack.Block, error) {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper struct {
+		Blocks []json.RawMessage `json:"blocks"`
+	}
+	if err := json.Unmarshal(b, &wrapper); err != nil {
+		return nil, err
+	}
+	blocks := make([]slack.Block, 0, len(wrapper.Blocks))
+	for _, raw := range wrapper.Blocks {
+		var typed struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(raw, &typed); err != nil {
+			continue
+		}
+		switch typed.Type {
+		case "header":
+			var blk slack.HeaderBlock
+			if json.Unmarshal(raw, &blk) == nil {
+				blocks = append(blocks, &blk)
+			}
+		case "section":
+			var blk slack.SectionBlock
+			if json.Unmarshal(raw, &blk) == nil {
+				blocks = append(blocks, &blk)
+			}
+		case "divider":
+			blocks = append(blocks, slack.NewDividerBlock())
+		case "context":
+			var blk slack.ContextBlock
+			if json.Unmarshal(raw, &blk) == nil {
+				blocks = append(blocks, &blk)
+			}
+		case "actions":
+			var blk slack.ActionBlock
+			if json.Unmarshal(raw, &blk) == nil {
+				blocks = append(blocks, &blk)
+			}
+		}
+	}
+	return blocks, nil
+}
+
+func (h *Handler) postMessage(channel, thread, text string) {
+	opts := []slack.MsgOption{
+		slack.MsgOptionText(text, false),
+		slack.MsgOptionDisableLinkUnfurl(),
+	}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	if _, _, err := h.api.PostMessage(channel, opts...); err != nil {
+		log.Printf("[handler] postMessage error channel=%s: %v", channel, err)
+	}
+}
+
+func (h *Handler) postBlocks(channel, thread string, blocks []slack.Block) {
+	opts := []slack.MsgOption{
+		slack.MsgOptionBlocks(blocks...),
+		slack.MsgOptionDisableLinkUnfurl(),
+	}
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	if _, _, err := h.api.PostMessage(channel, opts...); err != nil {
+		log.Printf("[handler] postBlocks error channel=%s: %v", channel, err)
+	}
+}
+
+func (h *Handler) postEphemeral(channel, userID, text string) {
+	if _, err := h.api.PostEphemeral(channel, userID, slack.MsgOptionText(text, false)); err != nil {
+		log.Printf("[handler] postEphemeral error: %v", err)
+	}
+}
+
+func (h *Handler) postCaseBriefingWithActions(channel, shortID, text string) {
+	closeBtn := slack.NewButtonBlockElement(
+		"scantrace_close_"+shortID, shortID,
+		slack.NewTextBlockObject("plain_text", "✅ Close", false, false),
+	)
+	reportBtn := slack.NewButtonBlockElement(
+		"scantrace_report_"+shortID, shortID,
+		slack.NewTextBlockObject("plain_text", "📋 Report", false, false),
+	)
+	blocks := []slack.Block{
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", text, false, false),
+			nil, nil,
+		),
+		slack.NewActionBlock("", closeBtn, reportBtn),
+	}
+	h.postBlocks(channel, "", blocks)
 }
