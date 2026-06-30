@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
@@ -15,6 +16,12 @@ import (
 )
 
 func main() {
+	// Load .env file automatically if it exists
+    if err := godotenv.Load(); err != nil {
+        // Don't crash if it's missing, since production might use raw environment variables
+        log.Println("No .env file found, falling back to system environment variables")
+    }
+	
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
 	alertChannel := mustEnv("ALERT_CHANNEL")
