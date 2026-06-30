@@ -11,7 +11,7 @@ Deliver a **live, working Slack-native security intelligence agent** that:
 
 ---
 
-## Stable Baseline (Achieved)
+## Stable Baseline (Achieved ✅)
 
 - [x] ASUS BE96U → UDP :5140 → ScanTrace syslog listener
 - [x] `WAN_NEW_ACCEPT` and `WAN_FWD` events parsed and normalised
@@ -19,22 +19,46 @@ Deliver a **live, working Slack-native security intelligence agent** that:
 - [x] Correlator groups events into cases every 5 minutes
 - [x] Block Kit alerts posted to `#sec-alerts` with thread updates for repeat hits
 - [x] LLM (Qwen3-30B) answers @mention queries in `#sec-intel-external`
-- [x] Recommended Actions block generated deterministically via `fmt.Sprintf` skeleton
+- [x] Recommended Actions block generated **deterministically** via `selectActionPlan()` Go switch — LLM cannot override or hallucinate action steps
 - [x] `EXTERNAL_THREAT_CHANNEL` separates LLM responses from raw alert noise
 - [x] Agent runs as non-root user with `cap_net_bind_service`
 - [x] Single binary, SQLite state, no external dependencies at runtime
+- [x] Threat-feed pre-classification (IPSum tiers: benign scanner / confirmed malicious / universally blacklisted) resolved in Go before LLM prompt is assembled
+- [x] Benign scanner suppression (Shodan, Censys, Shadowserver) via `benign-scanners.txt`
+- [x] IPInfo ASN/org/country enrichment on alert cards and in LLM context
+- [x] Known device registry — `/scantrace adddevice`, `/scantrace removedevice`, `/scantrace devices`
+- [x] Device trust labels (`trusted` / `unknown` / `suspicious`) injected into triage context
+- [x] Auto-suppress flag per device (low-severity cases for suppressed hosts silenced)
+- [x] Slash command suite: `cases`, `report`, `next`, `review-all`, `alert`, `devices`, `adddevice`, `removedevice`, `mcp`
+- [x] `@ScanTrace case <id>` / `@ScanTrace report <id>` / `@ScanTrace review case <id>` — deterministic mention routing, no LLM for case selection
+- [x] `@ScanTrace cases` — live case list via mention
+- [x] MCP tool server on `localhost:8765` — `list_cases`, `get_case`, `list_sensors`, `get_entity`, `list_known_devices`
+- [x] RTS (Real-Time Signal) pub/sub for external integrations
 
 ---
 
-## Stretch Goals
+## Architectural Wins
 
-See `Docs/STRETCH_GOALS.md` for the full list. Summary:
+| Layer | Responsibility |
+|---|---|
+| **Go (deterministic)** | Syslog parsing, event normalisation, case correlation, topology classification (WAN edge vs. LAN forward), registry lookup, threat-feed scoring, action plan selection |
+| **LLM (semantic only)** | Assessment prose, Summary narrative — fills a rigid `fmt.Sprintf` skeleton, cannot alter the action plan |
+| **Slack (UI)** | Block Kit alerts, slash commands, @mention routing, thread grouping |
+
+This split means the agent cannot hallucinate a recommended action. The LLM only writes the "why" — Go writes the "what to do".
+
+---
+
+## Remaining Stretch Goals
+
+See `Docs/STRETCH_GOALS.md` for the full list. Open items:
 
 - [ ] Suricata EVE JSON ingestion alongside live router syslog
-- [ ] IPInfo enrichment (ASN, org, country) on alert cards
-- [ ] Slack `/scantrace` slash command for on-demand case lookups
-- [ ] MCP tool server for external agent integrations
-- [ ] Automated suppression rules for known-benign IPs
+- [ ] DHCP / MAC monitoring and unknown device detection
+- [ ] Egress / data exfiltration detection
+- [ ] DB Auditor LLM (periodic read-only analysis)
+- [ ] DB Investigator LLM (versioned pattern recognition)
+- [ ] Schema-first LLM helpers (UnknownFormatManager, ModelRouter)
 
 ---
 
@@ -43,4 +67,4 @@ See `Docs/STRETCH_GOALS.md` for the full list. Summary:
 - Cloud deployment (local-first by design)
 - Multi-tenant / multi-router support
 - A web UI (Slack is the UI)
-- Replacing the LLM with a deterministic rule engine for the Assessment/Summary prose
+- Replacing the LLM with a deterministic rule engine for Assessment/Summary prose
