@@ -62,7 +62,7 @@ Before the prompt is built, the handler resolves:
 The Recommended Actions section is pre-populated via `fmt.Sprintf` before the prompt reaches the model:
 
 ```go
-actions := buildActions(eventType, proto, dstPort) // pure Go switch-case
+actions := selectActionPlan(triageState) // pure Go switch-case (A–F conditions)
 prompt := fmt.Sprintf(templateWithActions, ..., actions, ...)
 ```
 
@@ -72,6 +72,21 @@ The LLM receives a prompt where that section is already written. It cannot repla
 
 - `ALERT_CHANNEL` (`#sec-alerts`): raw case alerts, thread replies for repeated hits.
 - `EXTERNAL_THREAT_CHANNEL` (`#sec-intel-external`): LLM responses to @mention queries. Keeps signal/noise ratio high in `#sec-alerts`.
+
+### 4. @Mention Case Routing (Deterministic Fast Path)
+
+`handleMention` strips the `<@BOTID>` token and checks for case-specific commands **before** any LLM call:
+
+```
+@ScanTrace case <id>         → full LLM briefing for that case
+@ScanTrace report <id>       → same as above
+@ScanTrace review case <id>  → same as above
+@ScanTrace cases             → Block Kit case list (no LLM)
+@ScanTrace help              → ephemeral help text (no LLM)
+<anything else>              → generic LLM Q&A via llm.Ask()
+```
+
+Case ID matching is prefix-based and case-insensitive — `abc123` matches `abc12345-…`. If no match is found, the bot replies with `Case 'abc123' not found. Try /scantrace cases.` No LLM is called for the not-found path.
 
 ---
 
@@ -97,7 +112,8 @@ The LLM receives a prompt where that section is already written. It cannot repla
 The agent defaults to `http://192.168.50.250:11434` (desktop `ik_llama.cpp`) when `LLM_BASE_URL` is not set. Model is selected by `LLM_MODEL` env var.
 
 The LLM is only called for:
-1. `@mention` Q&A queries from users in Slack
-2. The Assessment and Summary blocks of a case alert (2–4 sentences each)
+1. `@mention` Q&A queries (generic chat path — fallthrough after fast-path checks)
+2. `@ScanTrace case <id>` / `review-all` / `next` — single-case or batch briefings
+3. The Assessment and Summary blocks of a case alert (2–4 sentences each)
 
-It is **never** called to decide actions, classify IPs, or route events.
+It is **never** called to decide actions, classify IPs, route events, or handle `cases` / `help` / `not-found` replies.
