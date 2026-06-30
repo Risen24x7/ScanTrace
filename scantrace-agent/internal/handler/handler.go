@@ -961,17 +961,14 @@ func extractFirstPort(report *casebuilder.CaseReport) string {
 	return ""
 }
 
+// handleEvent dispatches EventsAPI inner events.
+// Only app_mention is handled — the "message" event is intentionally omitted
+// to prevent every channel message from being processed as a bot command.
 func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 	switch event.InnerEvent.Type {
 	case "app_mention":
 		ev, ok := event.InnerEvent.Data.(*slackevents.AppMentionEvent)
 		if !ok {
-			return
-		}
-		h.handleMention(ev.Channel, ev.User, ev.Text)
-	case "message":
-		ev, ok := event.InnerEvent.Data.(*slackevents.MessageEvent)
-		if !ok || ev.BotID != "" {
 			return
 		}
 		h.handleMention(ev.Channel, ev.User, ev.Text)
