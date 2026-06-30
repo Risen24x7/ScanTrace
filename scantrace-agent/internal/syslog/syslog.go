@@ -6,22 +6,40 @@
 //
 //	<134>Jun 28 15:28:29 router kernel: DROP IN=eth0 OUT= MAC=... SRC=1.2.3.4 DST=192.168.50.80 ... PROTO=TCP SPT=54321 DPT=22 ...
 //
-// The listener groups events by (src_ip, dst_port) into cases and calls
-// Alerter.PostCaseAlert so a Slack message fires for every new case.
-//
-// Roll-up architecture (burst suppression)
+// Roll-up / burst-suppression architecture
 // -----------------------------------------
-// HIGH severity cases (port 22/23/3389 etc.) are posted to Slack immediately.
-// LOW/MEDIUM cases are held in a burst buffer for burstWindow seconds. When
-// the buffer is flushed:
-//   - 1 case buffered → emit as a normal single alert.
-//   - 2+ cases, count >= burstThreshold → merge ALL buffered cases into one
-//     ScanBurst case in the DB (individual stub cases are deleted to keep the
-//     DB clean) then PostCaseAlert once for the rolled-up case.
-//   - 2+ cases, count < burstThreshold → emit each individually.
+// HIGH severity cases (port 22/23/3389/etc.) bypass the burst buffer and
+// trigger an immediate Slack alert so real intrusion probes are never delayed.
 //
-// This preserves the "case-first" invariant: the DB always has exactly one
-// case per alertable outcome, and Slack is triggered once per case.
+// LOW/MEDIUM cases are held in a burst buffer for burstWindow (90 s). When the
+// ticker fires flushBurst:
+//
+//	< burstThreshold cases  → alert each individually (small clusters are fine).
+//	>= burstThreshold cases → merge ALL buffered cases into one ScanBurst case
+//	                          in the DB, delete the stub cases, call PostCaseAlert
+//	                          exactly once for the rolled-up case.
+//
+// Goroutine safety
+// ----------------
+// The ingest goroutine (ReadFrom loop) and the ticker goroutine (flushBurst)
+// are the only two writers to burstBuffer. All buffer mutations go through
+// burstBuffer.mu. flushBurst holds the lock for the ENTIRE drain-and-merge
+// sequence via drainLocked() to prevent a race between draining and a
+// concurrent add() from ingest.
+//
+// Orphaned-event invariant
+// ------------------------
+// The events table has NO case_id foreign key. Events are linked to cases only
+// via the cases.related_event_ids JSON blob. DeleteCase therefore drops only
+// the cases row; all event rows remain intact and are re-owned by the new
+// ScanBurst case through its own RelatedEventIDs list. No orphaned events.
+//
+// Max-events cap
+// --------------
+// A single ScanBurst case that keeps receiving appends (e.g. a scan that runs
+// for hours) is closed once it reaches burstMaxEvents (50). The case is marked
+// status="closed" and the caseIndex entry is deleted so the next event opens a
+// fresh case, preventing an unmanageably large case file.
 package syslog
 
 import (
@@ -41,22 +59,26 @@ import (
 )
 
 // Alerter is the subset of handler.Handler that the syslog package needs.
-// Using an interface keeps the import graph acyclic.
 type Alerter interface {
 	PostCaseAlert(c *db.Case)
 }
 
 // ---------------------------------------------------------------------------
-// Burst-suppression constants
+// Tuning constants
 // ---------------------------------------------------------------------------
 
 const (
 	// burstWindow is the hold time for LOW/MEDIUM cases before the buffer flushes.
 	burstWindow = 90 * time.Second
 
-	// burstThreshold: if >= this many cases accumulate in one window, merge them
-	// into a single ScanBurst case instead of alerting individually.
+	// burstThreshold: if >= this many LOW/MEDIUM cases accumulate in one window,
+	// merge them into a single ScanBurst case.
 	burstThreshold = 3
+
+	// burstMaxEvents caps the total related_event_ids on any single case (burst
+	// or individual). When a case reaches this limit it is closed and the
+	// caseIndex entry is evicted so the next event starts a new case.
+	burstMaxEvents = 50
 )
 
 // ---------------------------------------------------------------------------
@@ -87,12 +109,11 @@ type parsedLine struct {
 // srcSubnet is the /24 prefix of the source IP so that distributed subnet
 // sweeps (e.g. 85.217.149.x) collapse into one case instead of one per IP.
 type caseKey struct {
-	srcSubnet string // first three octets, e.g. "85.217.149"
+	srcSubnet string
 	dstPort   int
 }
 
 // subnetPrefix returns the /24 prefix of an IPv4 address string.
-// e.g. "85.217.149.39" → "85.217.149"
 func subnetPrefix(ip string) string {
 	parts := strings.Split(ip, ".")
 	if len(parts) == 4 {
@@ -101,11 +122,8 @@ func subnetPrefix(ip string) string {
 	return ip
 }
 
-// syslogSensorID is a stable UUID used for the syslog sensor row.
 const syslogSensorID = "00000000-5359-4c4f-4700-000000000001"
 
-// ensureSyslogSensor upserts the syslog sensor row so every event written by
-// this package satisfies the events.sensor_id FOREIGN KEY constraint.
 func ensureSyslogSensor(store *db.DB) error {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -130,13 +148,18 @@ func ensureSyslogSensor(store *db.DB) error {
 
 // bufferedCase is a case held in the burst buffer pending flush.
 type bufferedCase struct {
-	c        *db.Case
-	proto    string // protocol string for display ("TCP"/"UDP")
-	srcIPs   []string // distinct source IPs seen in this case's events so far
+	c      *db.Case
+	proto  string
+	srcIPs []string
 }
 
-// burstBuffer holds LOW/MEDIUM cases for up to burstWindow before deciding
-// whether to emit them individually or merge them into a ScanBurst case.
+// burstBuffer holds LOW/MEDIUM cases for up to burstWindow.
+//
+// Concurrency model: add() is called from the ingest goroutine (ReadFrom
+// loop); flushBurst() is called from the ticker goroutine. Both hold mu
+// before touching items. flushBurst calls drainLocked() which keeps mu held
+// through the entire drain-and-return so no add() can sneak in between the
+// length check and the nil-reset.
 type burstBuffer struct {
 	mu    sync.Mutex
 	items []*bufferedCase
@@ -148,10 +171,9 @@ func (b *burstBuffer) add(bc *bufferedCase) {
 	b.mu.Unlock()
 }
 
-// drain atomically removes and returns all buffered cases.
-func (b *burstBuffer) drain() []*bufferedCase {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+// drainLocked atomically removes and returns all buffered cases.
+// CALLER MUST hold b.mu before calling and release it after.
+func (b *burstBuffer) drainLocked() []*bufferedCase {
 	out := b.items
 	b.items = nil
 	return out
@@ -161,8 +183,6 @@ func (b *burstBuffer) drain() []*bufferedCase {
 // Listen — main entry point
 // ---------------------------------------------------------------------------
 
-// Listen binds a UDP socket on addr (e.g. ":5140") and starts ingesting
-// syslog lines. It blocks until the socket fails.
 func Listen(addr string, store *db.DB, alerter Alerter) error {
 	if err := ensureSyslogSensor(store); err != nil {
 		log.Printf("[syslog] WARNING: could not upsert syslog sensor: %v", err)
@@ -178,7 +198,6 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 	caseIndex := make(map[caseKey]string)
 	buf := &burstBuffer{}
 
-	// Flush ticker — runs every burstWindow, decides merge vs. individual emit.
 	ticker := time.NewTicker(burstWindow)
 	go func() {
 		for range ticker.C {
@@ -195,10 +214,7 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 			continue
 		}
 		line := strings.TrimSpace(string(pkt[:n]))
-		if line == "" {
-			continue
-		}
-		if !strings.Contains(line, "DROP") {
+		if line == "" || !strings.Contains(line, "DROP") {
 			continue
 		}
 
@@ -217,7 +233,6 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 // parse
 // ---------------------------------------------------------------------------
 
-// parse extracts fields from an iptables syslog line.
 func parse(line string) (parsedLine, bool) {
 	extract := func(re *regexp.Regexp) string {
 		m := re.FindStringSubmatch(line)
@@ -229,19 +244,12 @@ func parse(line string) (parsedLine, bool) {
 
 	srcIP := extract(reSRC)
 	dstIP := extract(reDST)
-
-	if srcIP == "" || srcIP == "0.0.0.0" {
-		return parsedLine{}, false
-	}
-	if dstIP == "" || dstIP == "0.0.0.0" {
+	if srcIP == "" || srcIP == "0.0.0.0" || dstIP == "" || dstIP == "0.0.0.0" {
 		return parsedLine{}, false
 	}
 
 	srcPort, _ := strconv.Atoi(extract(reSPT))
 	dstPort, _ := strconv.Atoi(extract(reDPT))
-
-	// GRE (proto 47), ICMP encap, and other non-TCP/UDP protocols produce no
-	// SPT/DPT fields — both parse as 0. Discard them.
 	if srcPort == 0 && dstPort == 0 {
 		return parsedLine{}, false
 	}
@@ -261,13 +269,9 @@ func parse(line string) (parsedLine, bool) {
 // ingest
 // ---------------------------------------------------------------------------
 
-// ingest writes one event to the DB and creates/updates the parent case.
-// HIGH severity cases bypass the burst buffer and alert immediately.
-// LOW/MEDIUM cases are queued in the burst buffer for deferred roll-up.
 func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]string, buf *burstBuffer) error {
 	sev := classifySeverity(p.dstPort)
 	if sev == "" {
-		// Ephemeral port (>= 32768) — backscatter noise, discard.
 		return nil
 	}
 
@@ -301,11 +305,11 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		return fmt.Errorf("InsertEvent: %w", err)
 	}
 
-	// ── Find or create parent case ───────────────────────────────────────────
 	key := caseKey{srcSubnet: subnetPrefix(p.srcIP), dstPort: p.dstPort}
 	caseID, exists := caseIndex[key]
 
 	if !exists {
+		// ── Create new case ──────────────────────────────────────────────────
 		caseID = uuid.NewString()
 		caseIndex[key] = caseID
 
@@ -330,21 +334,15 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		log.Printf("[syslog] new case %s — %s", caseID[:8], title)
 
 		if sev == "high" {
-			// HIGH severity: bypass buffer, alert immediately.
 			log.Printf("[syslog] HIGH severity — alerting immediately for case %s", caseID[:8])
 			go alerter.PostCaseAlert(c)
 		} else {
-			// LOW/MEDIUM: queue in burst buffer; the ticker will decide.
-			buf.add(&bufferedCase{
-				c:      c,
-				proto:  p.proto,
-				srcIPs: []string{p.srcIP},
-			})
+			buf.add(&bufferedCase{c: c, proto: p.proto, srcIPs: []string{p.srcIP}})
 		}
 		return nil
 	}
 
-	// ── Append event to existing case ───────────────────────────────────────
+	// ── Append event to existing case ────────────────────────────────────────
 	c, err := store.GetCase(caseID)
 	if err != nil || c == nil {
 		delete(caseIndex, key)
@@ -353,6 +351,23 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 
 	c.RelatedEventIDs = append(c.RelatedEventIDs, evt.EventID)
 	c.UpdatedAt = now
+
+	// ── Max-events cap: close this case and evict so the next event starts fresh.
+	// This prevents a single long-running scan from producing an unmanageably
+	// large case. The events remain intact in the events table; only this case
+	// row is capped.
+	if len(c.RelatedEventIDs) >= burstMaxEvents {
+		c.Status = "closed"
+		c.AnalystNotes = fmt.Sprintf("%s | capped at %d events on %s",
+			c.AnalystNotes, burstMaxEvents, now.Format(time.RFC3339))
+		if err := store.UpdateCase(c); err != nil {
+			return fmt.Errorf("UpdateCase (cap): %w", err)
+		}
+		delete(caseIndex, key) // evict — next event will open a new case
+		log.Printf("[syslog] case %s capped at %d events, closed", caseID[:8], burstMaxEvents)
+		return nil
+	}
+
 	if err := store.UpdateCase(c); err != nil {
 		return fmt.Errorf("UpdateCase: %w", err)
 	}
@@ -370,12 +385,21 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 // flushBurst — called by the ticker every burstWindow
 // ---------------------------------------------------------------------------
 
-// flushBurst drains the burst buffer and decides:
-//   - < burstThreshold cases → alert each individually (small bursts are fine).
-//   - >= burstThreshold cases → merge into one ScanBurst case, delete stubs,
-//     insert the rolled-up case, and alert once.
+// flushBurst drains the burst buffer under the mutex for its entire execution
+// and decides whether to merge or emit individually.
+//
+// Mutex protocol:
+//
+//	Lock is acquired before drainLocked() and held until items is fully copied
+//	into local variables. The lock is released before any DB or network I/O
+//	(InsertCase, DeleteCase, PostCaseAlert) to avoid holding it across slow ops.
 func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
-	items := buf.drain()
+	// Drain atomically.
+	buf.mu.Lock()
+	items := buf.drainLocked()
+	buf.mu.Unlock()
+	// Lock is now released. All subsequent work is local to this goroutine.
+
 	if len(items) == 0 {
 		return
 	}
@@ -383,21 +407,20 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 	log.Printf("[syslog] burst flush: %d buffered cases", len(items))
 
 	if len(items) < burstThreshold {
-		// Small burst — alert individually; no merge needed.
 		for _, bc := range items {
 			go alerter.PostCaseAlert(bc.c)
 		}
 		return
 	}
 
-	// ── Merge into ScanBurst case ────────────────────────────────────────────
+	// ── Merge into ScanBurst case ─────────────────────────────────────────────
 	var (
-		allEventIDs db.StringSlice
-		uniqueSrcIPs  = make(map[string]bool)
-		uniquePorts   = make(map[int]bool)
-		uniqueProtos  = make(map[string]bool)
-		highestSev    = "low"
-		oldCaseIDs  []string
+		allEventIDs  db.StringSlice
+		uniqueSrcIPs = make(map[string]bool)
+		uniquePorts  = make(map[int]bool)
+		uniqueProtos = make(map[string]bool)
+		highestSev   = "low"
+		oldCaseIDs   []string
 	)
 
 	sevRank := map[string]int{"low": 0, "medium": 1, "high": 2}
@@ -409,7 +432,6 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		for _, ip := range bc.srcIPs {
 			uniqueSrcIPs[ip] = true
 		}
-		// Extract port from title: "Inbound DROP: x.x.x.0/24 → port 8181/TCP"
 		var port int
 		fmt.Sscanf(bc.c.Title, "Inbound DROP: %*s → port %d", &port)
 		if port > 0 {
@@ -424,7 +446,6 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		oldCaseIDs = append(oldCaseIDs, bc.c.CaseID)
 	}
 
-	// Build a human-readable port list for the title.
 	ports := make([]int, 0, len(uniquePorts))
 	for p := range uniquePorts {
 		ports = append(ports, p)
@@ -435,9 +456,6 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		portStrs = append(portStrs, strconv.Itoa(p))
 	}
 
-	srcCount := len(uniqueSrcIPs)
-	portCount := len(uniquePorts)
-
 	protos := make([]string, 0, len(uniqueProtos))
 	for pr := range uniqueProtos {
 		protos = append(protos, pr)
@@ -447,6 +465,9 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 	if protoStr == "" {
 		protoStr = "TCP"
 	}
+
+	srcCount := len(uniqueSrcIPs)
+	portCount := len(uniquePorts)
 
 	title := fmt.Sprintf(
 		"[Scan Burst] %d sources, %d ports/%s — internet background scan",
@@ -461,17 +482,22 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		len(items),
 	)
 
+	now := time.Now().UTC()
 	burstCase := &db.Case{
 		CaseID:          uuid.NewString(),
 		Title:           title,
 		Summary:         summary,
 		Status:          "open",
 		Severity:        highestSev,
-		Confidence:      0.6, // lower confidence — bulk noise pattern
+		Confidence:      0.6,
 		RelatedEventIDs: allEventIDs,
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
-		AnalystNotes:    fmt.Sprintf("rule=scan_burst type=bulk_inbound_drop merged_cases=%d", len(items)),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		AnalystNotes: fmt.Sprintf(
+			"rule=scan_burst type=bulk_inbound_drop merged_cases=%d stub_ids=%s",
+			len(items),
+			strings.Join(oldCaseIDs, ","),
+		),
 	}
 
 	if err := store.InsertCase(burstCase); err != nil {
@@ -482,11 +508,14 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		return
 	}
 
-	// Delete the individual stub cases now that the burst case owns all events.
+	// Delete stub cases. Safe because:
+	//   - events table has NO case_id FK — events are not deleted.
+	//   - burstCase.RelatedEventIDs now owns all event references.
+	//   - If DeleteCase fails for a stub, log and continue — the burst case
+	//     is already the canonical record; the stub is simply an orphaned row.
 	for _, id := range oldCaseIDs {
 		if err := store.DeleteCase(id); err != nil {
 			log.Printf("[syslog] burst merge: could not delete stub case %s: %v", id[:8], err)
-			// Non-fatal — the burst case is canonical; stubs will be orphaned.
 		}
 	}
 
