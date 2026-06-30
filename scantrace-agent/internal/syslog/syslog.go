@@ -397,7 +397,7 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		uniquePorts   = make(map[int]bool)
 		uniqueProtos  = make(map[string]bool)
 		highestSev    = "low"
-		old CaseIDs  []string
+		oldCaseIDs  []string
 	)
 
 	sevRank := map[string]int{"low": 0, "medium": 1, "high": 2}
@@ -421,7 +421,7 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		if sevRank[bc.c.Severity] > sevRank[highestSev] {
 			highestSev = bc.c.Severity
 		}
-		old CaseIDs = append(old CaseIDs, bc.c.CaseID)
+		oldCaseIDs = append(oldCaseIDs, bc.c.CaseID)
 	}
 
 	// Build a human-readable port list for the title.
