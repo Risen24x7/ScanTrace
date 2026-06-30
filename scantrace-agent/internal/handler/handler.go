@@ -1171,8 +1171,15 @@ func (h *Handler) postMessage(channelID, threadTS, text string) {
 	}
 }
 
+// postEphemeral sends a message visible only to the target user.
+// Uses PostMessage with response_type=ephemeral via MsgOptionPostEphemeral
+// since PostEphemeralMessage is not available in slack-go v0.15.0 with MsgOption args.
 func (h *Handler) postEphemeral(channelID, userID, text string) {
-	_, err := h.api.PostEphemeralMessage(channelID, userID, slack.MsgOptionText(text, false))
+	_, _, err := h.api.PostMessage(
+		channelID,
+		slack.MsgOptionText(text, false),
+		slack.MsgOptionPostEphemeral(userID),
+	)
 	if err != nil {
 		log.Printf("[handler] postEphemeral error channel=%s user=%s: %v", channelID, userID, err)
 	}
