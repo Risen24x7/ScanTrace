@@ -1,13 +1,16 @@
-// Package threat provides local threat-feed lookups for ScanTrace.
+// Package threat provides local threat-feed lookups and live AbuseIPDB
+// enrichment for ScanTrace.
 //
-// It loads feed files on startup (refreshed nightly by cron):
+// Local feeds loaded on startup (refreshed every 12h by background goroutine):
 //
-//	/opt/scantrace/ipsum.txt          — stamparm/ipsum aggregated blocklist (scored)
-//	/opt/scantrace/tor-exits.txt      — Tor Project bulk exit list
+//	/opt/scantrace/ipsum.txt           — stamparm/ipsum aggregated blocklist
+//	/opt/scantrace/tor-exits.txt       — Tor Project bulk exit list
 //	/opt/scantrace/benign-scanners.txt — known research scanner IPs/CIDRs (optional)
 //
-// Files are reloaded every 12 hours automatically. If a file is absent the
-// lookup for that feed gracefully returns a zero score.
+// Live enrichment:
+//
+//	AbuseIPDB /api/v2/check — called per-IP at case-build time.
+//	Requires ABUSEIPDB_API_KEY env var. Gracefully no-ops if unset.
 package threat
 
 import (
@@ -27,33 +30,34 @@ const (
 	DefaultBenignScannersPath = "/opt/scantrace/benign-scanners.txt"
 
 	// MaliciousThreshold is the minimum IPSum score to label a source IP as
-	// confirmed malicious. IPSum scores reflect how many independent blocklists
-	// flagged the IP (max ~30). Score >= 5 means at least 5 separate feeds agree.
+	// confirmed malicious.
 	MaliciousThreshold = 5
 
-	// BlacklistThreshold is the score above which an IP is considered
-	// universally blacklisted across the majority of threat-feed sources.
+	// BlacklistThreshold is the score above which an IP is universally
+	// blacklisted across the majority of threat-feed sources.
 	BlacklistThreshold = 6
 
 	reloadInterval = 12 * time.Hour
 )
 
-// IPSum score tiers — maps feed consensus weight to operational priority.
+// IPSum score tiers.
 const (
-	TierClean       = 0 // not listed in any feed
-	TierNoise       = 1 // score 1-2: internet background noise
-	TierScanner     = 2 // score 3-5: confirmed aggressive scanner / brute-forcer
-	TierBlacklisted = 3 // score 6+: universally blacklisted infrastructure
+	TierClean       = 0
+	TierNoise       = 1
+	TierScanner     = 2
+	TierBlacklisted = 3
 )
 
-// Score holds the result of a threat-feed lookup for a single IP.
+// Score holds the combined result of all threat-feed lookups for a single IP.
 type Score struct {
-	IPSumScore      int  // 0 = not listed; >=MaliciousThreshold = confirmed malicious
-	IsTorExit       bool // true if the IP is an active Tor exit node
-	IsBenignScanner bool // true if the IP belongs to a known research scanner (Shodan, Censys, etc.)
+	IPSumScore      int
+	IsTorExit       bool
+	IsBenignScanner bool
+	// AbuseIPDB live enrichment — zero if API key unset or lookup failed.
+	Abuse AbuseResult
 }
 
-// Tier returns the IPSum consensus tier for this score.
+// Tier returns the IPSum consensus tier.
 func (s Score) Tier() int {
 	switch {
 	case s.IPSumScore >= BlacklistThreshold:
@@ -67,17 +71,16 @@ func (s Score) Tier() int {
 	}
 }
 
-// IsConfirmedMalicious returns true when the IPSum score meets the threshold.
+// IsConfirmedMalicious returns true when either IPSum or AbuseIPDB
+// independently confirm this IP as malicious.
 func (s Score) IsConfirmedMalicious() bool {
-	return s.IPSumScore >= MaliciousThreshold
+	return s.IPSumScore >= MaliciousThreshold || s.Abuse.IsConfirmedMaliciousAbuse()
 }
 
-// Tag returns a short human-readable label for use in triage context.
-// Benign scanner detection takes precedence over IPSum tiers — a known
-// research scanner hitting the feed is normal internet behaviour, not an
-// active threat, even if it appears in some blocklists.
+// Tag returns the highest-priority human-readable label for this score.
+// AbuseIPDB confirmed malicious overrides all IPSum tiers.
 func (s Score) Tag() string {
-	// Benign scanner overrides all other tags — these are expected sources.
+	// Benign scanner always wins — demote regardless of other signals.
 	if s.IsBenignScanner {
 		if s.IPSumScore >= MaliciousThreshold {
 			return "🔬 BENIGN SCANNER — known research scanner (IPSum score: " + itoa(s.IPSumScore) + "/30 — expected, demote to LOW)"
@@ -85,6 +88,33 @@ func (s Score) Tag() string {
 		return "🔬 BENIGN SCANNER — known research scanner (Shodan / Censys / Shadowserver — demote to LOW)"
 	}
 
+	// AbuseIPDB confirmed malicious takes priority over IPSum tiers.
+	if s.Abuse.IsConfirmedMaliciousAbuse() {
+		base := "🚨 ABUSEIPDB CONFIRMED MALICIOUS (score: " + itoa(s.Abuse.AbuseScore) + "/100, " +
+			itoa(s.Abuse.TotalReports) + " reports, last: " + s.Abuse.LastReportedAt + ")"
+		if s.IsTorExit {
+			base += " + TOR EXIT"
+		}
+		if s.IPSumScore >= MaliciousThreshold {
+			base += " | IPSum: " + itoa(s.IPSumScore) + "/30"
+		}
+		return base
+	}
+
+	// AbuseIPDB suspicious (30-74) — surface alongside IPSum.
+	if s.Abuse.AbuseScore >= 30 {
+		base := "⚠️  ABUSEIPDB SUSPICIOUS (score: " + itoa(s.Abuse.AbuseScore) + "/100, " +
+			itoa(s.Abuse.TotalReports) + " reports)"
+		if s.IPSumScore >= MaliciousThreshold {
+			base += " | IPSum: " + itoa(s.IPSumScore) + "/30 feeds"
+		}
+		if s.IsTorExit {
+			base += " + TOR EXIT"
+		}
+		return base
+	}
+
+	// Fall back to IPSum tiers.
 	switch {
 	case s.IPSumScore >= BlacklistThreshold && s.IsTorExit:
 		return "☠️ UNIVERSALLY BLACKLISTED + TOR EXIT (IPSum score: " + itoa(s.IPSumScore) + "/30 feeds)"
@@ -101,27 +131,29 @@ func (s Score) Tag() string {
 	case s.IsTorExit:
 		return "🧅 TOR EXIT NODE — anonymized source"
 	default:
+		if s.Abuse.AbuseScore > 0 {
+			return s.Abuse.Tag()
+		}
 		return ""
 	}
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
-// Enricher holds in-memory copies of the threat feeds and refreshes them
-// periodically from disk.
+// Enricher holds in-memory copies of the threat feeds.
 type Enricher struct {
 	ipSumPath   string
 	torExitPath string
 
 	mu       sync.RWMutex
-	ipsum    map[string]int  // ip -> score
-	torExits map[string]bool // ip -> true
+	ipsum    map[string]int
+	torExits map[string]bool
 
-	benign *BenignScanners // known research scanner registry
+	benign *BenignScanners
 }
 
 // New creates an Enricher, loads all feed files immediately, and starts the
-// background reload ticker. Missing files are logged as warnings, not errors.
+// background reload ticker.
 func New(ipSumPath, torExitPath string) *Enricher {
 	if ipSumPath == "" {
 		ipSumPath = DefaultIPSumPath
@@ -134,38 +166,48 @@ func New(ipSumPath, torExitPath string) *Enricher {
 		torExitPath: torExitPath,
 		ipsum:       make(map[string]int),
 		torExits:    make(map[string]bool),
-		benign:      NewBenignScanners(""), // loads defaults + /opt/scantrace/benign-scanners.txt
+		benign:      NewBenignScanners(""),
 	}
 	e.reload()
 	go e.reloadLoop()
+
+	if os.Getenv("ABUSEIPDB_API_KEY") != "" {
+		log.Printf("[threat] AbuseIPDB enrichment enabled")
+	} else {
+		log.Printf("[threat] AbuseIPDB enrichment disabled (ABUSEIPDB_API_KEY not set)")
+	}
+
 	return e
 }
 
-// Lookup returns the threat score for a given IP.
+// Lookup returns the threat score for a given IP, including a live AbuseIPDB check.
 func (e *Enricher) Lookup(ip string) Score {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return Score{
+	s := Score{
 		IPSumScore:      e.ipsum[ip],
 		IsTorExit:       e.torExits[ip],
 		IsBenignScanner: e.benign.IsBenignScanner(ip),
 	}
+	e.mu.RUnlock()
+	s.Abuse = CheckAbuse(ip)
+	return s
 }
 
-// LookupMany returns scores for a slice of IPs. Only IPs with a non-zero score
-// or a positive flag are included in the result map.
+// LookupMany returns scores for a slice of IPs, including live AbuseIPDB checks.
+// Only IPs with a non-zero score, positive flag, or abuse data are included.
 func (e *Enricher) LookupMany(ips []string) map[string]Score {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
 	out := make(map[string]Score, len(ips))
 	for _, ip := range ips {
+		e.mu.RLock()
 		isBenign := e.benign.IsBenignScanner(ip)
 		s := Score{
 			IPSumScore:      e.ipsum[ip],
 			IsTorExit:       e.torExits[ip],
 			IsBenignScanner: isBenign,
 		}
-		if s.IPSumScore > 0 || s.IsTorExit || s.IsBenignScanner {
+		e.mu.RUnlock()
+		s.Abuse = CheckAbuse(ip)
+		if s.IPSumScore > 0 || s.IsTorExit || s.IsBenignScanner || s.Abuse.AbuseScore > 0 {
 			out[ip] = s
 		}
 	}
@@ -192,10 +234,6 @@ func (e *Enricher) reload() {
 	log.Printf("[threat] feeds loaded: ipsum=%d IPs, tor-exits=%d IPs", len(ipsum), len(tor))
 }
 
-// loadIPSum parses stamparm/ipsum format:
-//
-//	# comment
-//	<ip>\t<score>
 func loadIPSum(path string) map[string]int {
 	out := make(map[string]int)
 	f, err := os.Open(path)
@@ -226,7 +264,6 @@ func loadIPSum(path string) map[string]int {
 	return out
 }
 
-// loadTorExits parses the Tor Project bulk exit list — one IP per line.
 func loadTorExits(path string) map[string]bool {
 	out := make(map[string]bool)
 	f, err := os.Open(path)
@@ -244,7 +281,6 @@ func loadTorExits(path string) map[string]bool {
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "ExitAddress") {
 			continue
 		}
-		// Tor bulk list format: "ExitAddress <ip> <date>" OR just bare IP
 		fields := strings.Fields(line)
 		out[fields[0]] = true
 	}
@@ -252,13 +288,7 @@ func loadTorExits(path string) map[string]bool {
 }
 
 // ── Benign Scanner Registry ───────────────────────────────────────────────────
-//
-// BenignScanners holds the IPs and CIDRs of well-known research scanners that
-// should be auto-demoted to LOW priority regardless of event count.
-// Sources: Shodan, Censys, Shadowserver, Binaryedge, GreyNoise, Google, Bing.
 
-// defaultBenignIPs contains known static IPs for common research scanners.
-// This list is a starting point — supplement with /opt/scantrace/benign-scanners.txt.
 var defaultBenignIPs = []string{
 	// Shodan
 	"198.20.69.74", "198.20.69.75", "198.20.70.114", "198.20.70.115",
@@ -271,30 +301,24 @@ var defaultBenignIPs = []string{
 	// Shadowserver
 	"184.105.139.66", "184.105.139.67", "184.105.139.68",
 	"184.105.247.195", "184.105.247.196",
-	// GreyNoise RIOT (benign)
+	// GreyNoise RIOT
 	"45.83.66.65", "45.83.67.65",
 	// Binaryedge
 	"185.93.3.110",
-	// Internet Archive / Wayback
+	// Internet Archive
 	"208.70.31.0",
 }
 
-// defaultBenignCIDRs contains CIDR ranges for research scanner infrastructure.
 var defaultBenignCIDRs = []string{
-	// Censys ZMap scan ranges
 	"162.142.125.0/24",
 	"167.248.133.0/24",
-	// Google crawl/scan infrastructure
 	"66.249.64.0/19",
-	// Bing crawl
 	"40.77.167.0/24",
-	// Shodan broader range
 	"198.20.69.0/24",
 	"198.20.70.0/24",
 	"198.20.99.0/24",
 }
 
-// BenignScanners holds the compiled lookup structures for research scanner detection.
 type BenignScanners struct {
 	mu    sync.RWMutex
 	ips   map[string]bool
@@ -302,8 +326,6 @@ type BenignScanners struct {
 	path  string
 }
 
-// NewBenignScanners creates a BenignScanners instance, loads the optional
-// override file, and merges with the hardcoded defaults.
 func NewBenignScanners(path string) *BenignScanners {
 	if path == "" {
 		path = DefaultBenignScannersPath
@@ -318,7 +340,6 @@ func NewBenignScanners(path string) *BenignScanners {
 	return bs
 }
 
-// IsBenignScanner returns true if the IP belongs to a known research scanner.
 func (bs *BenignScanners) IsBenignScanner(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
