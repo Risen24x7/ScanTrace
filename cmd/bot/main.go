@@ -77,7 +77,7 @@ func main() {
 	case "ingest":
 		cmdIngest(store, sensorID, ipinfoToken)
 	case "correlate":
-		cmdCorrelate(store, slackWebhook)
+		cmdCorrelate(store, ipinfoToken, slackWebhook)
 	case "cases":
 		cmdCases(store)
 	case "report":
@@ -162,9 +162,10 @@ func cmdIngestAsus(store *db.DB, filePath string) {
 // correlate
 // ---------------------------------------------------------------------------
 
-func cmdCorrelate(store *db.DB, slackWebhook string) {
+func cmdCorrelate(store *db.DB, ipinfoToken, slackWebhook string) {
+	enr := enricher.New(store, enricher.WithToken(ipinfoToken))
 	cfg := correlator.DefaultConfig()
-	corr := correlator.New(store, cfg)
+	corr := correlator.New(store, cfg, correlator.WithEnricher(enr))
 	cases, err := corr.Run()
 	if err != nil {
 		log.Fatalf("correlate error: %v", err)
@@ -281,15 +282,16 @@ func cmdServe(store *db.DB, sensorID, ipinfoToken, slackWebhook string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	runCycle(store, slackWebhook)
+	runCycle(store, ipinfoToken, slackWebhook)
 	for range ticker.C {
-		runCycle(store, slackWebhook)
+		runCycle(store, ipinfoToken, slackWebhook)
 	}
 }
 
-func runCycle(store *db.DB, slackWebhook string) {
+func runCycle(store *db.DB, ipinfoToken, slackWebhook string) {
+	enr := enricher.New(store, enricher.WithToken(ipinfoToken))
 	cfg := correlator.DefaultConfig()
-	corr := correlator.New(store, cfg)
+	corr := correlator.New(store, cfg, correlator.WithEnricher(enr))
 	cases, err := corr.Run()
 	if err != nil {
 		log.Printf("[serve] correlate error: %v", err)
