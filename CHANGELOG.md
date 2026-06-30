@@ -2,6 +2,28 @@
 
 All notable changes to ScanTrace – Dead Reckoning Edition will be documented in this file.
 
+---
+
+## [2026-06-29] Port Intel + WAN-Edge Override
+
+### New Features
+- **Port Intelligence store** (`portintel/portintel.go`) — `HitRecord` struct + SQLite-backed `Store` tracks `(src_ip, dst_port, proto, count, first_seen, last_seen)` across cases; enables trend analysis across incidents.
+- **`/scantrace port-trends`** slash command — queries the port intel store and surfaces the top repeatedly-hit ports across all cases, formatted as a Block Kit table in Slack.
+- **Port intel advisory in LLM context** — `buildSingleCaseContext()` accumulates `HitRecord`s per event and injects a `[PORT INTEL ADVISORY]` block into the prompt when a port has been hit more than once across sessions, giving the model persistence-aware context without any DB writes in the LLM path.
+- **`manifest.json`** updated — `port-trends` usage hint and description added to slash command entry.
+
+### Bug Fixes
+- **WAN-edge dst label override** (`fix/wan-edge-dst-override`, now merged) — `classifyDst()` now returns the authoritative WAN EDGE label for all three branches: `wan_new_connection`, `wan_forward` when `dst == wanIP`, and the default fallback when `dst == wanIP`. The LLM can no longer misread the operator's own WAN IP as a remote threat target.
+- **WAN IP excluded from enrichment** — `buildSingleCaseContext()` skips adding `h.wanIP` to `ipSet`, so `ipinfo.Enrich()` never produces an ISP/org attribution line for the operator's own interface IP.
+- **Event row format made explicit** — `sb.WriteString(fmt.Sprintf(...))` now always includes `dstLabel` in the event row sent to the LLM, so WAN EDGE hits are visibly annotated inline.
+
+### Handler Internals
+- `Handler` struct gains `portIntel *portintel.Store` field; `New()` calls `portintel.Open("")` and wires the store (nil-safe — logs a warning on DB open failure, port-trends degrades gracefully).
+- `handleSlashCommand()` routes `port-trends` → `cmdPortTrends()`.
+- `helpText()` lists `port-trends`.
+
+---
+
 ## [2026-06-29] Deterministic Orchestration — Stable
 
 ### Architecture

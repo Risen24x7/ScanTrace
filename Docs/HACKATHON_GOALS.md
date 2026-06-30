@@ -16,6 +16,8 @@ Deliver a **live, working Slack-native security intelligence agent** that:
 - [x] ASUS BE96U → UDP :5140 → ScanTrace syslog listener
 - [x] `WAN_NEW_ACCEPT` and `WAN_FWD` events parsed and normalised
 - [x] WAN edge IP correctly classified (`WAN EDGE — gateway interface only`) — no false internal escalations
+- [x] `classifyDst()` override forces WAN EDGE label on all three branches (`wan_new_connection`, `wan_forward` dst-match, default dst-match) — LLM can no longer misread operator WAN IP as remote threat target
+- [x] WAN IP excluded from `ipSet` — `ipinfo.Enrich()` never produces ISP/org attribution for the operator's own interface IP
 - [x] Correlator groups events into cases every 5 minutes
 - [x] Block Kit alerts posted to `#sec-alerts` with thread updates for repeat hits
 - [x] LLM (Qwen3-30B) answers @mention queries in `#sec-intel-external`
@@ -29,11 +31,14 @@ Deliver a **live, working Slack-native security intelligence agent** that:
 - [x] Known device registry — `/scantrace adddevice`, `/scantrace removedevice`, `/scantrace devices`
 - [x] Device trust labels (`trusted` / `unknown` / `suspicious`) injected into triage context
 - [x] Auto-suppress flag per device (low-severity cases for suppressed hosts silenced)
-- [x] Slash command suite: `cases`, `report`, `next`, `review-all`, `alert`, `devices`, `adddevice`, `removedevice`, `mcp`
+- [x] Slash command suite: `cases`, `report`, `next`, `review-all`, `alert`, `devices`, `adddevice`, `removedevice`, `mcp`, `port-trends`
 - [x] `@ScanTrace case <id>` / `@ScanTrace report <id>` / `@ScanTrace review case <id>` — deterministic mention routing, no LLM for case selection
 - [x] `@ScanTrace cases` — live case list via mention
 - [x] MCP tool server on `localhost:8765` — `list_cases`, `get_case`, `list_sensors`, `get_entity`, `list_known_devices`
 - [x] RTS (Real-Time Signal) pub/sub for external integrations
+- [x] **Port Intelligence store** — SQLite-backed `HitRecord` tracking `(src_ip, dst_port, proto, count, first_seen, last_seen)` across cases
+- [x] **`/scantrace port-trends`** — top repeatedly-hit ports surfaced as Block Kit table in Slack
+- [x] **Port intel advisory in LLM context** — persistence-aware port-hit count injected into prompt for repeat-hit ports
 
 ---
 
@@ -41,7 +46,7 @@ Deliver a **live, working Slack-native security intelligence agent** that:
 
 | Layer | Responsibility |
 |---|---|
-| **Go (deterministic)** | Syslog parsing, event normalisation, case correlation, topology classification (WAN edge vs. LAN forward), registry lookup, threat-feed scoring, action plan selection |
+| **Go (deterministic)** | Syslog parsing, event normalisation, case correlation, topology classification (WAN edge vs. LAN forward), registry lookup, threat-feed scoring, action plan selection, port intel accumulation |
 | **LLM (semantic only)** | Assessment prose, Summary narrative — fills a rigid `fmt.Sprintf` skeleton, cannot alter the action plan |
 | **Slack (UI)** | Block Kit alerts, slash commands, @mention routing, thread grouping |
 
