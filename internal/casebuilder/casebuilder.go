@@ -143,6 +143,10 @@ func wellKnownPortLabel(port int) string {
 		return "PostgreSQL"
 	case 5900:
 		return "VNC"
+	case 5985:
+		return "WinRM HTTP"
+	case 5986:
+		return "WinRM HTTPS"
 	case 6379:
 		return "Redis"
 	case 8080:
@@ -162,16 +166,23 @@ func wellKnownPortLabel(port int) string {
 	}
 }
 
-// sysingestRE matches the boilerplate syslog-ingested summary lines so we can
-// strip them from the Slack snippet and avoid displaying redundant text.
-var sysingestRE = regexp.MustCompile(`(?i)syslog-ingested\s+drop\s+events?\s+from\s+\S+\s+targeting\s+port\s+\d+\.?\s*`)
+// boilerplateRE strips the full mechanical syslog summary boilerplate in one
+// pass, covering both the main sentence and the trailing "First seen from X."
+// sentence that the syslog ingestor appends.
+//
+// Pattern covers:
+//
+//	"Syslog-ingested DROP event(s) from <subnet> targeting port <n>."
+//	"First seen from <ip>."
+var boilerplateRE = regexp.MustCompile(
+	`(?i)(?:syslog-ingested\s+drop\s+events?\s+from\s+\S+\s+targeting\s+port\s+\d+\.?\s*|first\s+seen\s+from\s+\S+\.?\s*)`,
+)
 
-// alertSnippet returns a clean one-liner for the Slack alert body.
-// If the case summary is purely mechanical boilerplate, it returns a
-// generic fallback rather than repeating the header verbatim.
+// alertSnippet returns a clean body for the Slack alert snippet.
+// All mechanical boilerplate is stripped. If nothing meaningful remains,
+// a prompt to use /scantrace report is returned instead.
 func alertSnippet(summary string) string {
-	clean := strings.TrimSpace(sysingestRE.ReplaceAllString(summary, ""))
-	// After stripping, something useful might remain (analyst notes, etc.)
+	clean := strings.TrimSpace(boilerplateRE.ReplaceAllString(summary, ""))
 	if clean != "" && len(clean) > 10 {
 		if len(clean) > 280 {
 			clean = clean[:280] + "\u2026"
@@ -211,23 +222,29 @@ func extractAlertMeta(events []*db.Event) (port int, proto string, srcSubnet str
 	return
 }
 
+// severityEmojiFor returns the severity dot emoji for any casing of sev.
+func severityEmojiFor(sev string) string {
+	switch strings.ToLower(strings.TrimSpace(sev)) {
+	case "high":
+		return "\U0001f534"
+	case "medium":
+		return "\U0001f7e1"
+	case "low":
+		return "\U0001f7e2"
+	default:
+		return "\u26aa"
+	}
+}
+
 func (r *CaseReport) SlackBlock() map[string]interface{} {
 	c := r.Case
 
-	severityEmoji := map[string]string{
-		"high":   "\U0001f534",
-		"medium": "\U0001f7e1",
-		"low":    "\U0001f7e2",
-	}
-	emoji := severityEmoji[strings.ToLower(c.Severity)]
-	if emoji == "" {
-		emoji = "\u26aa"
-	}
+	emoji := severityEmojiFor(c.Severity)
 
 	port, proto, srcSubnet, firstSeenIP := extractAlertMeta(r.Events)
 
 	// Build a structured header: 🟢  DROP · port 3388/TCP · 45.142.193.0/24 — LOW
-	// Fall back to the case title when we can't extract event meta.
+	// Falls back to the case title when event meta is unavailable.
 	var headerParts []string
 	if port > 0 {
 		portStr := fmt.Sprintf("port %d", port)
@@ -286,7 +303,7 @@ func (r *CaseReport) SlackBlock() map[string]interface{} {
 		})
 	}
 
-	// Summary block — stripped of mechanical boilerplate
+	// Summary block — all mechanical boilerplate stripped
 	snippet := alertSnippet(c.Summary)
 	blocks = append(blocks,
 		map[string]interface{}{"type": "section", "text": map[string]string{"type": "mrkdwn", "text": snippet}},
