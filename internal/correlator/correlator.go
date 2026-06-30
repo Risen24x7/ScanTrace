@@ -57,6 +57,19 @@ func New(store *db.DB, cfg Config, opts ...func(*Correlator)) *Correlator {
 	for _, o := range opts {
 		o(c)
 	}
+	// Wire the ASN lookup into CloudSuppressRule now that the store is set.
+	// This allows the suppressor to resolve entity ASNs from the DB.
+	for _, rule := range c.rules {
+		if csr, ok := rule.(*CloudSuppressRule); ok {
+			csr.LookupASN = func(ip string) (string, bool) {
+				ent, err := c.store.GetEntityByIP(ip)
+				if err != nil || ent == nil || ent.ASN == "" {
+					return "", false
+				}
+				return ent.ASN, true
+			}
+		}
+	}
 	return c
 }
 
@@ -116,6 +129,8 @@ func (c *IPCluster) Severity() string {
 
 // Run clusters events in the window, evaluates rules, and opens Cases only
 // when no open case for the same srcIP+ruleType exists within dedupWindow.
+// Clusters matching a suppression rule (RuleType=="suppressed") are skipped
+// entirely — no case is opened and no Slack alert is posted.
 func (c *Correlator) Run() ([]*db.Case, error) {
 	since := time.Now().UTC().Add(-c.config.Window)
 	events, err := c.store.ListEvents(c.config.MaxEvents)
@@ -150,6 +165,13 @@ func (c *Correlator) Run() ([]*db.Case, error) {
 				match = m
 				break
 			}
+		}
+
+		// Suppression sentinel: CloudSuppressRule (or any future suppressor)
+		// returns RuleType=="suppressed". Skip case creation entirely.
+		if match != nil && match.RuleType == "suppressed" {
+			log.Printf("[correlator] suppressed %s — %s", cl.SrcIP, match.Description)
+			continue
 		}
 
 		ruleType := "generic_scan"
