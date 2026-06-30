@@ -8,8 +8,9 @@
 //
 // Roll-up / burst-suppression architecture
 // -----------------------------------------
-// HIGH severity cases (port 22/23/3389/etc.) bypass the burst buffer and
-// trigger an immediate Slack alert so real intrusion probes are never delayed.
+// HIGH severity cases (port 22/23/3389/5938/8080/8088/etc.) bypass the burst
+// buffer and trigger an immediate Slack alert so real intrusion probes are
+// never delayed.
 //
 // LOW/MEDIUM cases are held in a burst buffer for burstWindow (90 s). When the
 // ticker fires flushBurst:
@@ -19,13 +20,21 @@
 //	                          in the DB, delete the stub cases, call PostCaseAlert
 //	                          exactly once for the rolled-up case.
 //
+// INFO suppression (Gemini threshold-based alerting)
+// ---------------------------------------------------
+// A merged ScanBurst that touches NO port in knownPorts (the union of high+
+// medium sets derived from the router's actual port-forwarding table) is
+// classified severity="info" and NOT posted to Slack. It is still written to
+// the DB for audit completeness. This eliminates pure background radiation
+// (e.g. scanners hitting random high ports you don't forward) from the Slack
+// channel entirely.
+//
 // Goroutine safety
 // ----------------
 // The ingest goroutine (ReadFrom loop) and the ticker goroutine (flushBurst)
 // are the only two writers to burstBuffer. All buffer mutations go through
-// burstBuffer.mu. flushBurst holds the lock for the ENTIRE drain-and-merge
-// sequence via drainLocked() to prevent a race between draining and a
-// concurrent add() from ingest.
+// burstBuffer.mu. flushBurst calls drainLocked() which keeps mu held through
+// the entire drain-and-return so no add() can sneak in mid-drain.
 //
 // Orphaned-event invariant
 // ------------------------
@@ -36,10 +45,9 @@
 //
 // Max-events cap
 // --------------
-// A single ScanBurst case that keeps receiving appends (e.g. a scan that runs
-// for hours) is closed once it reaches burstMaxEvents (50). The case is marked
-// status="closed" and the caseIndex entry is deleted so the next event opens a
-// fresh case, preventing an unmanageably large case file.
+// A single case that keeps receiving appends is closed once it reaches
+// burstMaxEvents (50). The caseIndex entry is evicted so the next event opens
+// a fresh case, preventing unbounded case growth during long-running scans.
 package syslog
 
 import (
@@ -68,18 +76,103 @@ type Alerter interface {
 // ---------------------------------------------------------------------------
 
 const (
-	// burstWindow is the hold time for LOW/MEDIUM cases before the buffer flushes.
-	burstWindow = 90 * time.Second
-
-	// burstThreshold: if >= this many LOW/MEDIUM cases accumulate in one window,
-	// merge them into a single ScanBurst case.
+	burstWindow    = 90 * time.Second
 	burstThreshold = 3
-
-	// burstMaxEvents caps the total related_event_ids on any single case (burst
-	// or individual). When a case reaches this limit it is closed and the
-	// caseIndex entry is evicted so the next event starts a new case.
 	burstMaxEvents = 50
 )
+
+// ---------------------------------------------------------------------------
+// Port classification — derived from router port-forwarding table
+// ---------------------------------------------------------------------------
+
+// highPorts are forwarded/sensitive services that bypass the burst buffer
+// entirely and trigger an immediate Slack alert.
+var highPorts = map[int]bool{
+	22:   true, // SSH
+	23:   true, // Telnet
+	3389: true, // RDP
+	5900: true, // VNC
+	5901: true, // VNC alt
+	5938: true, // TeamViewer (forwarded on BOTH TCP+UDP → .250)
+	4444: true, // Reverse shell / Metasploit
+	8080: true, // HTTP alt / Kalen service (forwarded → .11)
+	8088: true, // Open WebUI — LLM interface (forwarded → .253)
+	8443: true, // HTTPS alt
+	9001: true, // Tor / misc high-value
+}
+
+// mediumPorts are services that are active on this network but less
+// immediately exploitable. They enter the burst buffer and are merged
+// if a flood occurs.
+var mediumPorts = map[int]bool{
+	21:    true, // FTP
+	25:    true, // SMTP
+	53:    true, // DNS
+	80:    true, // HTTP (forwarded → .4)
+	110:   true, // POP3
+	143:   true, // IMAP
+	443:   true, // HTTPS (forwarded → .4)
+	445:   true, // SMB
+	3306:  true, // MySQL
+	3724:  true, // forwarded TCP service (→ .6)
+	5432:  true, // PostgreSQL
+	6379:  true, // Redis
+	8085:  true, // forwarded service (→ .6)
+	8096:  true, // Jellyfin (forwarded → .4)
+	15636: true, // forwarded BOTH-protocol service (→ .8)
+	15637: true, // forwarded BOTH-protocol service (→ .8)
+	24454: true, // forwarded TCP service (→ .10)
+	25565: true, // Minecraft (forwarded → .10)
+	2456:  true, // Valheim (forwarded → .7)
+	2457:  true, // Valheim
+	2458:  true, // Valheim
+	27017: true, // MongoDB
+}
+
+// knownPorts is the union of high+medium — used to decide whether a ScanBurst
+// touches any real service. Bursts that miss all known ports are INFO-tagged
+// and suppressed from Slack (pure background radiation).
+var knownPorts = func() map[int]bool {
+	m := make(map[int]bool, len(highPorts)+len(mediumPorts))
+	for p := range highPorts {
+		m[p] = true
+	}
+	for p := range mediumPorts {
+		m[p] = true
+	}
+	return m
+}()
+
+// classifySeverity maps a destination port to a severity label.
+//
+//	high   → immediate alert, bypass burst buffer
+//	medium → enters burst buffer
+//	low    → enters burst buffer
+//	""     → ephemeral port (>= 32768) or backscatter, discard entirely
+func classifySeverity(dport int) string {
+	if dport >= 32768 {
+		return ""
+	}
+	if highPorts[dport] {
+		return "high"
+	}
+	if mediumPorts[dport] {
+		return "medium"
+	}
+	return "low"
+}
+
+// burstSeverity determines the final severity for a merged ScanBurst case.
+// If none of the targeted ports appear in knownPorts, returns "info" so the
+// case is written to DB but suppressed from Slack (pure background radiation).
+func burstSeverity(ports map[int]bool, highest string) string {
+	for p := range ports {
+		if knownPorts[p] {
+			return highest // at least one real service targeted — use inherited sev
+		}
+	}
+	return "info" // no known port hit → background radiation, suppress Slack
+}
 
 // ---------------------------------------------------------------------------
 // Field extraction regexes — compiled once.
@@ -94,7 +187,6 @@ var (
 	rePROTO = regexp.MustCompile(`\bPROTO=(\S+)`)
 )
 
-// parsedLine holds the fields extracted from one syslog message.
 type parsedLine struct {
 	iface   string
 	srcIP   string
@@ -105,15 +197,12 @@ type parsedLine struct {
 	rawLine string
 }
 
-// caseKey groups events into a single case.
-// srcSubnet is the /24 prefix of the source IP so that distributed subnet
-// sweeps (e.g. 85.217.149.x) collapse into one case instead of one per IP.
+// caseKey groups events into a single case by /24 source subnet + dst port.
 type caseKey struct {
 	srcSubnet string
 	dstPort   int
 }
 
-// subnetPrefix returns the /24 prefix of an IPv4 address string.
 func subnetPrefix(ip string) string {
 	parts := strings.Split(ip, ".")
 	if len(parts) == 4 {
@@ -129,7 +218,7 @@ func ensureSyslogSensor(store *db.DB) error {
 	if hostname == "" {
 		hostname = "router-syslog"
 	}
-	s := &db.Sensor{
+	return store.InsertSensor(&db.Sensor{
 		SensorID:      syslogSensorID,
 		Hostname:      hostname,
 		Platform:      "linux",
@@ -138,8 +227,7 @@ func ensureSyslogSensor(store *db.DB) error {
 		Version:       "1.0.0",
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
-	}
-	return store.InsertSensor(s)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -147,19 +235,15 @@ func ensureSyslogSensor(store *db.DB) error {
 // ---------------------------------------------------------------------------
 
 // bufferedCase is a case held in the burst buffer pending flush.
+// dstPort is stored directly (not re-parsed from Title) to avoid
+// UTF-8 arrow parsing bugs in fmt.Sscanf.
 type bufferedCase struct {
-	c      *db.Case
-	proto  string
-	srcIPs []string
+	c       *db.Case
+	proto   string
+	srcIPs  []string
+	dstPort int // the actual destination port for this case
 }
 
-// burstBuffer holds LOW/MEDIUM cases for up to burstWindow.
-//
-// Concurrency model: add() is called from the ingest goroutine (ReadFrom
-// loop); flushBurst() is called from the ticker goroutine. Both hold mu
-// before touching items. flushBurst calls drainLocked() which keeps mu held
-// through the entire drain-and-return so no add() can sneak in between the
-// length check and the nil-reset.
 type burstBuffer struct {
 	mu    sync.Mutex
 	items []*bufferedCase
@@ -172,7 +256,7 @@ func (b *burstBuffer) add(bc *bufferedCase) {
 }
 
 // drainLocked atomically removes and returns all buffered cases.
-// CALLER MUST hold b.mu before calling and release it after.
+// CALLER MUST hold b.mu before calling.
 func (b *burstBuffer) drainLocked() []*bufferedCase {
 	out := b.items
 	b.items = nil
@@ -180,7 +264,7 @@ func (b *burstBuffer) drainLocked() []*bufferedCase {
 }
 
 // ---------------------------------------------------------------------------
-// Listen — main entry point
+// Listen
 // ---------------------------------------------------------------------------
 
 func Listen(addr string, store *db.DB, alerter Alerter) error {
@@ -217,12 +301,10 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 		if line == "" || !strings.Contains(line, "DROP") {
 			continue
 		}
-
 		p, ok := parse(line)
 		if !ok {
 			continue
 		}
-
 		if err := ingest(p, store, alerter, caseIndex, buf); err != nil {
 			log.Printf("[syslog] ingest error: %v", err)
 		}
@@ -309,12 +391,11 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 	caseID, exists := caseIndex[key]
 
 	if !exists {
-		// ── Create new case ──────────────────────────────────────────────────
 		caseID = uuid.NewString()
 		caseIndex[key] = caseID
 
 		subnet := key.srcSubnet + ".0/24"
-		title := fmt.Sprintf("Inbound DROP: %s → port %d/%s", subnet, p.dstPort, p.proto)
+		title := fmt.Sprintf("Inbound DROP: %s -> port %d/%s", subnet, p.dstPort, p.proto)
 
 		c := &db.Case{
 			CaseID:          caseID,
@@ -331,18 +412,19 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 			return fmt.Errorf("InsertCase: %w", err)
 		}
 
-		log.Printf("[syslog] new case %s — %s", caseID[:8], title)
+		log.Printf("[syslog] new case %s -- %s", caseID[:8], title)
 
 		if sev == "high" {
-			log.Printf("[syslog] HIGH severity — alerting immediately for case %s", caseID[:8])
+			log.Printf("[syslog] HIGH severity -- alerting immediately for case %s", caseID[:8])
 			go alerter.PostCaseAlert(c)
 		} else {
-			buf.add(&bufferedCase{c: c, proto: p.proto, srcIPs: []string{p.srcIP}})
+			// dstPort stored directly — no title re-parsing needed in flushBurst.
+			buf.add(&bufferedCase{c: c, proto: p.proto, srcIPs: []string{p.srcIP}, dstPort: p.dstPort})
 		}
 		return nil
 	}
 
-	// ── Append event to existing case ────────────────────────────────────────
+	// Append event to existing case.
 	c, err := store.GetCase(caseID)
 	if err != nil || c == nil {
 		delete(caseIndex, key)
@@ -352,10 +434,7 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 	c.RelatedEventIDs = append(c.RelatedEventIDs, evt.EventID)
 	c.UpdatedAt = now
 
-	// ── Max-events cap: close this case and evict so the next event starts fresh.
-	// This prevents a single long-running scan from producing an unmanageably
-	// large case. The events remain intact in the events table; only this case
-	// row is capped.
+	// Max-events cap: close and evict when a case gets too large.
 	if len(c.RelatedEventIDs) >= burstMaxEvents {
 		c.Status = "closed"
 		c.AnalystNotes = fmt.Sprintf("%s | capped at %d events on %s",
@@ -363,7 +442,7 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		if err := store.UpdateCase(c); err != nil {
 			return fmt.Errorf("UpdateCase (cap): %w", err)
 		}
-		delete(caseIndex, key) // evict — next event will open a new case
+		delete(caseIndex, key)
 		log.Printf("[syslog] case %s capped at %d events, closed", caseID[:8], burstMaxEvents)
 		return nil
 	}
@@ -382,23 +461,13 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 }
 
 // ---------------------------------------------------------------------------
-// flushBurst — called by the ticker every burstWindow
+// flushBurst
 // ---------------------------------------------------------------------------
 
-// flushBurst drains the burst buffer under the mutex for its entire execution
-// and decides whether to merge or emit individually.
-//
-// Mutex protocol:
-//
-//	Lock is acquired before drainLocked() and held until items is fully copied
-//	into local variables. The lock is released before any DB or network I/O
-//	(InsertCase, DeleteCase, PostCaseAlert) to avoid holding it across slow ops.
 func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
-	// Drain atomically.
 	buf.mu.Lock()
 	items := buf.drainLocked()
 	buf.mu.Unlock()
-	// Lock is now released. All subsequent work is local to this goroutine.
 
 	if len(items) == 0 {
 		return
@@ -413,7 +482,7 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		return
 	}
 
-	// ── Merge into ScanBurst case ─────────────────────────────────────────────
+	// Merge into ScanBurst case.
 	var (
 		allEventIDs  db.StringSlice
 		uniqueSrcIPs = make(map[string]bool)
@@ -432,10 +501,9 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		for _, ip := range bc.srcIPs {
 			uniqueSrcIPs[ip] = true
 		}
-		var port int
-		fmt.Sscanf(bc.c.Title, "Inbound DROP: %*s → port %d", &port)
-		if port > 0 {
-			uniquePorts[port] = true
+		// Use stored dstPort — no fmt.Sscanf title re-parsing (fixes port=0 bug).
+		if bc.dstPort > 0 {
+			uniquePorts[bc.dstPort] = true
 		}
 		if bc.proto != "" {
 			uniqueProtos[bc.proto] = true
@@ -469,18 +537,25 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 	srcCount := len(uniqueSrcIPs)
 	portCount := len(uniquePorts)
 
+	// Determine final severity — suppress to "info" if no known port targeted.
+	finalSev := burstSeverity(uniquePorts, highestSev)
+
 	title := fmt.Sprintf(
-		"[Scan Burst] %d sources, %d ports/%s — internet background scan",
+		"[Scan Burst] %d sources, %d ports/%s -- internet background scan",
 		srcCount, portCount, protoStr,
 	)
 	summary := fmt.Sprintf(
 		"Rolled-up scan burst: %d distinct source IPs across %d unique ports (%s) in a %s window. "+
-			"Ports targeted: %s. Individual cases merged: %d. This is internet background radiation — "+
-			"no action required unless a specific source appears in threat intelligence.",
+			"Ports targeted: %s. Individual cases merged: %d.",
 		srcCount, portCount, protoStr, burstWindow,
 		strings.Join(portStrs, ", "),
 		len(items),
 	)
+	if finalSev == "info" {
+		summary += " No forwarded/known ports targeted -- pure internet background radiation, Slack suppressed."
+	} else {
+		summary += " At least one known service port targeted -- review recommended."
+	}
 
 	now := time.Now().UTC()
 	burstCase := &db.Case{
@@ -488,59 +563,44 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		Title:           title,
 		Summary:         summary,
 		Status:          "open",
-		Severity:        highestSev,
+		Severity:        finalSev,
 		Confidence:      0.6,
 		RelatedEventIDs: allEventIDs,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 		AnalystNotes: fmt.Sprintf(
-			"rule=scan_burst type=bulk_inbound_drop merged_cases=%d stub_ids=%s",
+			"rule=scan_burst type=bulk_inbound_drop merged_cases=%d stub_ids=%s slack_suppressed=%v",
 			len(items),
 			strings.Join(oldCaseIDs, ","),
+			finalSev == "info",
 		),
 	}
 
 	if err := store.InsertCase(burstCase); err != nil {
-		log.Printf("[syslog] burst merge: InsertCase failed: %v — falling back to individual alerts", err)
+		log.Printf("[syslog] burst merge: InsertCase failed: %v -- falling back to individual alerts", err)
 		for _, bc := range items {
 			go alerter.PostCaseAlert(bc.c)
 		}
 		return
 	}
 
-	// Delete stub cases. Safe because:
-	//   - events table has NO case_id FK — events are not deleted.
-	//   - burstCase.RelatedEventIDs now owns all event references.
-	//   - If DeleteCase fails for a stub, log and continue — the burst case
-	//     is already the canonical record; the stub is simply an orphaned row.
+	// Delete stub cases.
+	// Safe: events table has NO case_id FK. DeleteCase drops only the cases row.
+	// burstCase.RelatedEventIDs owns all event references going forward.
 	for _, id := range oldCaseIDs {
 		if err := store.DeleteCase(id); err != nil {
 			log.Printf("[syslog] burst merge: could not delete stub case %s: %v", id[:8], err)
 		}
 	}
 
-	log.Printf("[syslog] burst merged %d cases → %s (%s, %d sources, ports: %s)",
-		len(items), burstCase.CaseID[:8], highestSev, srcCount, strings.Join(portStrs, ","))
+	if finalSev == "info" {
+		// Pure background radiation — written to DB for audit, not posted to Slack.
+		log.Printf("[syslog] burst INFO (no known ports): %s suppressed from Slack", burstCase.CaseID[:8])
+		return
+	}
+
+	log.Printf("[syslog] burst merged %d cases -> %s (%s, %d sources, ports: %s)",
+		len(items), burstCase.CaseID[:8], finalSev, srcCount, strings.Join(portStrs, ","))
 
 	go alerter.PostCaseAlert(burstCase)
-}
-
-// ---------------------------------------------------------------------------
-// classifySeverity
-// ---------------------------------------------------------------------------
-
-// classifySeverity maps destination port to a severity label.
-// Returns "" for ephemeral ports (>= 32768) — backscatter noise, discard.
-func classifySeverity(dport int) string {
-	if dport >= 32768 {
-		return ""
-	}
-	switch dport {
-	case 22, 23, 3389, 5900, 5901, 4444, 8080, 8443, 9001:
-		return "high"
-	case 21, 25, 53, 110, 143, 443, 445, 3306, 5432, 6379, 27017:
-		return "medium"
-	default:
-		return "low"
-	}
 }
