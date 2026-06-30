@@ -525,18 +525,21 @@ func (h *Handler) cmdNext(channelID, userID string) {
 	}()
 }
 
+// classifyDst determines whether the destination is the WAN edge interface.
+// When it is, the label explicitly notes that provider/org attribution for the
+// destination IP should be ignored — it belongs to the operator's own perimeter.
 func (h *Handler) classifyDst(dstIP, eventType string) (label string, isWANEdge bool) {
 	switch strings.ToLower(eventType) {
 	case "wan_new_connection":
-		return "WAN EDGE — gateway interface only", true
+		return "WAN EDGE — gateway interface only (destination is your perimeter, ignore ISP/org attribution)", true
 	case "wan_forward":
 		if h.wanIP != "" && dstIP == h.wanIP {
-			return "WAN gateway IP (forwarded — check NAT rules)", false
+			return "WAN EDGE — gateway interface only (destination is your perimeter, ignore ISP/org attribution)", true
 		}
 		return "", false
 	default:
 		if h.wanIP != "" && dstIP == h.wanIP {
-			return "WAN EDGE — gateway interface only", true
+			return "WAN EDGE — gateway interface only (destination is your perimeter, ignore ISP/org attribution)", true
 		}
 		return "", false
 	}
@@ -621,8 +624,15 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 			proto:    evt.Protocol,
 			dstLabel: dstLabel,
 		})
+		// Always collect the source IP for enrichment.
+		// Only collect the destination IP for enrichment when it is NOT the WAN
+		// edge interface — the WAN IP belongs to the operator and would produce
+		// misleading ISP/org attribution in the LLM context.
 		if evt.SrcIP != "" {
 			ipSet[evt.SrcIP] = struct{}{}
+		}
+		if evt.DstIP != "" && evt.DstIP != h.wanIP {
+			ipSet[evt.DstIP] = struct{}{}
 		}
 	}
 
@@ -707,6 +717,10 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 	))
 
 	for _, r := range rows {
+		// dstLabel is authoritative: for WAN-edge events it always reads
+		// "WAN EDGE — gateway interface only (destination is your perimeter,
+		// ignore ISP/org attribution)" which prevents the LLM from treating
+		// the operator's own WAN IP as a remote target.
 		sb.WriteString(fmt.Sprintf("  evt type=%s src=%s dst=%s [%s] dport=%d proto=%s\n",
 			r.evtType, r.srcIP, r.dstIP, r.dstLabel, r.dstPort, r.proto))
 	}
