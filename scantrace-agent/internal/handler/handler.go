@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,14 @@ import (
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
+
+// mentionRE strips all <@UXXXXXXXX> mention tokens from a Slack message so
+// that handleMention receives only the user's actual command text.
+var mentionPattern = regexp.MustCompile(`<@[A-Z0-9]+>`)
+
+func mentionRE(text string) string {
+	return mentionPattern.ReplaceAllString(text, "")
+}
 
 type Handler struct {
 	api                   *slack.Client
@@ -860,7 +869,7 @@ func (h *Handler) cmdReport(channelID, userID, caseIDPrefix string) {
 		h.postEphemeral(channelID, userID, fmt.Sprintf("Error building report: %v", err))
 		return
 	}
-	blocks, err := blocksFromRaw(report.SlackBlock())
+	blocks, err := blocksFromMap(report.SlackBlock())
 	if err != nil {
 		h.postMessage(channelID, "", report.Markdown)
 		return
@@ -907,7 +916,7 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 		return
 	}
 
-	blocks, err := blocksFromRaw(report.SlackBlock())
+	blocks, err := blocksFromMap(report.SlackBlock())
 	var ts string
 	if err != nil {
 		text := fmt.Sprintf("%s *[%s] Case %s* — %s\nseverity=%s confidence=%.0f%%",
@@ -1106,11 +1115,18 @@ func (h *Handler) buildLLMContext() string {
 	return sb.String()
 }
 
-func blocksFromRaw(raw string) ([]slack.Block, error) {
+// blocksFromMap converts the map[string]interface{} returned by
+// report.SlackBlock() into a slice of typed slack.Block values.
+// It marshals the map to JSON internally so callers don't need to change.
+func blocksFromMap(raw map[string]interface{}) ([]slack.Block, error) {
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
 	var payload struct {
 		Blocks []json.RawMessage `json:"blocks"`
 	}
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, err
 	}
 	blocks := make([]slack.Block, 0, len(payload.Blocks))
