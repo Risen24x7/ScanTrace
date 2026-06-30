@@ -51,15 +51,26 @@ type parsedLine struct {
 	rawLine string
 }
 
-// caseKey groups events into a single case: same external source + same targeted port.
+// caseKey groups events into a single case.
+// srcSubnet is the /24 prefix of the source IP so that distributed subnet
+// sweeps (e.g. 85.217.149.x) collapse into one case instead of one per IP.
 type caseKey struct {
-	srcIP   string
-	dstPort int
+	srcSubnet string // first three octets, e.g. "85.217.149"
+	dstPort   int
+}
+
+// subnetPrefix returns the /24 prefix of an IPv4 address string.
+// e.g. "85.217.149.39" → "85.217.149"
+// Falls back to the full IP if it cannot be parsed.
+func subnetPrefix(ip string) string {
+	parts := strings.Split(ip, ".")
+	if len(parts) == 4 {
+		return strings.Join(parts[:3], ".")
+	}
+	return ip
 }
 
 // syslogSensorID is a stable UUID used for the syslog sensor row.
-// Derived from the well-known namespace + "syslog_udp" so it never
-// conflicts with CLI-registered sensors.
 const syslogSensorID = "00000000-5359-4c4f-4700-000000000001"
 
 // ensureSyslogSensor upserts the syslog sensor row so every event written by
@@ -84,12 +95,7 @@ func ensureSyslogSensor(store *db.DB) error {
 
 // Listen binds a UDP socket on addr (e.g. ":5140") and starts ingesting
 // syslog lines. It blocks until the socket fails.
-//
-//   - store   — ScanTrace SQLite DB
-//   - alerter — handler.Handler (or any Alerter); PostCaseAlert is called
-//     whenever a new case is opened or an existing case gains events.
 func Listen(addr string, store *db.DB, alerter Alerter) error {
-	// Ensure the syslog sensor row exists before any event is written.
 	if err := ensureSyslogSensor(store); err != nil {
 		log.Printf("[syslog] WARNING: could not upsert syslog sensor: %v", err)
 	}
@@ -101,8 +107,6 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 	defer conn.Close()
 	log.Printf("[syslog] listening on UDP %s", addr)
 
-	// In-memory case index: caseKey → caseID.  Avoids a DB round-trip on every
-	// packet while still persisting to SQLite for the Slack commands.
 	caseIndex := make(map[caseKey]string)
 
 	buf := make([]byte, 4096)
@@ -116,8 +120,6 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 		if line == "" {
 			continue
 		}
-
-		// Only handle iptables DROP lines.
 		if !strings.Contains(line, "DROP") {
 			continue
 		}
@@ -134,8 +136,9 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 }
 
 // parse extracts fields from an iptables syslog line.
-// Returns (result, true) on success, (zero, false) if required fields are absent
-// or the packet is broadcast/malformed noise.
+// Returns (result, true) on success, (zero, false) when the packet is noise:
+//   - missing or unspecified SRC/DST (0.0.0.0)
+//   - non-TCP/UDP protocols where both SPT and DPT are absent (GRE, proto 47, etc.)
 func parse(line string) (parsedLine, bool) {
 	extract := func(re *regexp.Regexp) string {
 		m := re.FindStringSubmatch(line)
@@ -148,7 +151,6 @@ func parse(line string) (parsedLine, bool) {
 	srcIP := extract(reSRC)
 	dstIP := extract(reDST)
 
-	// Discard broadcast, unspecified, and malformed addresses.
 	if srcIP == "" || srcIP == "0.0.0.0" {
 		return parsedLine{}, false
 	}
@@ -156,11 +158,14 @@ func parse(line string) (parsedLine, bool) {
 		return parsedLine{}, false
 	}
 
-	sptStr := extract(reSPT)
-	dptStr := extract(reDPT)
+	srcPort, _ := strconv.Atoi(extract(reSPT))
+	dstPort, _ := strconv.Atoi(extract(reDPT))
 
-	srcPort, _ := strconv.Atoi(sptStr)
-	dstPort, _ := strconv.Atoi(dptStr)
+	// GRE (proto 47), ICMP encap, and other non-TCP/UDP protocols produce no
+	// SPT/DPT fields — both parse as 0. Discard them.
+	if srcPort == 0 && dstPort == 0 {
+		return parsedLine{}, false
+	}
 
 	return parsedLine{
 		iface:   extract(reIN),
@@ -174,25 +179,19 @@ func parse(line string) (parsedLine, bool) {
 }
 
 // ingest writes one event to the DB and creates/updates the parent case.
-// Returns nil without writing anything if classifySeverity marks the port
-// as noise (empty string return).
+// Silently discards the event when classifySeverity returns "" (ephemeral noise).
 func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]string) error {
-	// Discard ephemeral-port backscatter before touching the DB.
 	if classifySeverity(p.dstPort) == "" {
 		return nil
 	}
 
 	now := time.Now().UTC()
 
-	// ── 1. Classify event type based on interface ──────────────────────────
-	// wan_new_connection  → packet hit WAN interface, no port-forward matched
-	// wan_forward         → packet was forwarded toward an internal host
 	evtType := "wan_new_connection"
 	if p.iface != "" && !strings.HasPrefix(p.iface, "eth") && !strings.HasPrefix(p.iface, "wan") {
 		evtType = "wan_forward"
 	}
 
-	// ── 2. Store the raw event ─────────────────────────────────────────────
 	evt := &db.Event{
 		EventID:      uuid.NewString(),
 		Timestamp:    now,
@@ -216,23 +215,23 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		return fmt.Errorf("InsertEvent: %w", err)
 	}
 
-	// ── 3. Find or create parent case ──────────────────────────────────────
-	key := caseKey{srcIP: p.srcIP, dstPort: p.dstPort}
+	// ── Find or create parent case ───────────────────────────────────────────────
+	// Key on /24 subnet so distributed sweeps from the same subnet
+	// (e.g. 85.217.149.x hitting different ports) coalesce into one case.
+	key := caseKey{srcSubnet: subnetPrefix(p.srcIP), dstPort: p.dstPort}
 	caseID, exists := caseIndex[key]
 
 	if !exists {
 		caseID = uuid.NewString()
 		caseIndex[key] = caseID
 
-		title := fmt.Sprintf("Inbound DROP: %s → port %d/%s", p.srcIP, p.dstPort, p.proto)
-		if p.dstPort == 0 {
-			title = fmt.Sprintf("Inbound DROP: %s (%s)", p.srcIP, p.proto)
-		}
+		subnet := key.srcSubnet + ".0/24"
+		title := fmt.Sprintf("Inbound DROP: %s → port %d/%s", subnet, p.dstPort, p.proto)
 
 		c := &db.Case{
 			CaseID:          caseID,
 			Title:           title,
-			Summary:         fmt.Sprintf("Syslog-ingested DROP event from %s targeting port %d.", p.srcIP, p.dstPort),
+			Summary:         fmt.Sprintf("Syslog-ingested DROP events from %s targeting port %d. First seen from %s.", subnet, p.dstPort, p.srcIP),
 			Status:          "open",
 			Severity:        classifySeverity(p.dstPort),
 			Confidence:      0.8,
@@ -247,10 +246,9 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		return nil
 	}
 
-	// ── 4. Append event to existing case ───────────────────────────────────
+	// Append event to existing case.
 	c, err := store.GetCase(caseID)
 	if err != nil || c == nil {
-		// Race: case was deleted externally; rebuild it.
 		delete(caseIndex, key)
 		return ingest(p, store, alerter, caseIndex)
 	}
@@ -260,7 +258,6 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		return fmt.Errorf("UpdateCase: %w", err)
 	}
 
-	// Alert on significant growth milestones (5, 10, 25, 50, 100 …)
 	n := len(c.RelatedEventIDs)
 	if n == 5 || n == 10 || (n > 0 && n%25 == 0) {
 		log.Printf("[syslog] case %s milestone: %d events", caseID[:8], n)
@@ -271,12 +268,8 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 }
 
 // classifySeverity maps destination port to a severity label.
-//
-// Returns "" for ephemeral/high ports (>= 32768) — these are almost always
-// backscatter from spoofed SYNs or return traffic to closed ports and are
-// not worth creating cases for.
+// Returns "" for ephemeral ports (>= 32768) — backscatter noise, discard.
 func classifySeverity(dport int) string {
-	// Ephemeral range — backscatter noise, discard silently.
 	if dport >= 32768 {
 		return ""
 	}
