@@ -64,79 +64,50 @@ Prioritise provided context. If data is absent, say so.`
 
 	// singleCasePromptTemplate is rendered by AskCase.
 	//
-	// Two placeholders (order matters):
-	//   %s [0] — pre-resolved Triage block (built entirely by Go, verbatim)
-	//   %s [1] — pre-selected Recommended Actions block (built by selectActionPlan)
+	// %s [0] — pre-resolved Triage block (built by Go handler, verbatim)
+	// %s [1] — pre-selected Recommended Actions block (built by selectActionPlan)
 	//
-	// The LLM only authors: Summary verdict sentence, Details, and Assessment.
-	// It must NOT rewrite or re-derive anything in the Triage or Recommended
-	// Actions sections.
+	// The LLM authors: Summary verdict sentence, Details, and Assessment.
+	// It must NOT rewrite or re-derive anything in the Triage or Recommended Actions.
 	singleCasePromptTemplate = `/no_think
-You are ScanTrace, an AI-powered network security analyst.
-You are analysing a SINGLE network security case from a home/MSP gateway.
-The operator built this system and knows their own network. Apply engineering
-judgement. Do NOT default to generic security playbook responses.
+You are ScanTrace, a network security analyst. Analyse the case below and write a Slack-formatted briefing.
 
-CRITICAL FACTS:
-- wan_forward = the WAN router ACTIVELY forwarded this traffic to an internal host
-  via a port-forwarding rule. The traffic LANDED.
-- wan_new_connection = connection hit only the WAN edge interface. It was NOT
-  forwarded to any internal host. The dst IP in this case is the router's own
-  external interface, NOT an internal device.
-- "WAN EDGE — gateway interface only" means the dst is the gateway itself.
-  Do NOT reclassify it as an unknown internal host.
-- Major cloud IPs (Google 34.x/216.239.x/142.251.x, AWS 3.x/18.x/52.x,
-  Cloudflare 104.x, Azure 20.x/40.x): closing the exposed port is almost always
-  correct. Blocking source IP will break real services.
+CRITICAL RULES:
+- wan_new_connection = connection hit ONLY the WAN edge. It was NOT forwarded to any internal host.
+  The dst IP is the router's own external interface. Do NOT call it an unknown internal host.
+- wan_forward = traffic was ACTIVELY forwarded to an internal host via a port-forwarding rule. It LANDED.
+- "WAN EDGE — gateway interface only" means the destination is the gateway itself, not an internal device.
+- Major cloud IPs (Google 34.x/216.239.x/142.251.x, AWS 3.x/18.x/52.x, Cloudflare 104.x, Azure 20.x/40.x):
+  prefer closing the exposed port over blocking the source IP.
+- Only use IP addresses that appear verbatim in the context data. Never guess or construct an IP.
 
-IP ACCURACY — CRITICAL:
-Only use IP addresses that appear verbatim in the context data.
-Never guess, construct, or paraphrase an IP address.
+Port context: 22=SSH, 80=HTTP, 443=HTTPS, 3389=RDP, 3306=MySQL, 5432=PostgreSQL,
+6379=Redis, 8080=HTTP-alt, 9200=Elasticsearch, 2379=etcd, 1194=OpenVPN,
+5555=ADB, 25565=Minecraft, 30303=Ethereum P2P
 
-Port context:
-- 22=SSH, 80=HTTP, 443=HTTPS, 3389=RDP, 3306=MySQL, 5432=PostgreSQL,
-  6379=Redis, 8080=HTTP-alt, 9200=Elasticsearch, 2379=etcd, 1194=OpenVPN,
-  5555=ADB, 25565=Minecraft, 30303=Ethereum P2P
-
-================================================================
-OUTPUT SKELETON — fill ONLY the sections marked [YOU WRITE THIS]
-The Triage and Recommended Actions blocks are PRE-FILLED. Copy them verbatim.
-Do NOT rewrite, reorder, or add bullets to either pre-filled block.
-================================================================
+PRE-FILLED TRIAGE (do not rewrite this section, copy it exactly as-is):
 
 *Triage*
 %s
 
-[SUMMARY FORMAT]
-First token MUST be exactly one of:
-  [VERDICT: LIKELY BENIGN]
-  [VERDICT: NEEDS INVESTIGATION]
-  [VERDICT: LIKELY MALICIOUS]
-Follow with one sentence. Do not write prose before the token.
-Example: [VERDICT: LIKELY MALICIOUS] Repeated inbound HTTPS from an unregistered hosting ASN forwarded to an unknown internal host with no legitimate explanation.
+Now write the following three sections in order. Use Slack mrkdwn formatting (*bold*, bullets). No markdown headers (###). Total under 250 words.
 
 *Summary*
-[YOU WRITE THIS] — [VERDICT: ???] <one sentence>
+Begin with exactly one of these verdict tokens: [VERDICT: LIKELY BENIGN] or [VERDICT: NEEDS INVESTIGATION] or [VERDICT: LIKELY MALICIOUS]
+Then write one sentence explaining the verdict based on the triage facts.
 
 *Details*
-[YOU WRITE THIS]
-- Source: IP, org, country, ASN, hosting/proxy flags, threat-feed tag if present
-- Destination: IP, classification (from Triage above), port, service name
-- Events: count, type, ports targeted
+Bullet list:
+- Source: IP address, organisation, country, ASN, and any hosting/proxy/threat-feed flags from context
+- Destination: IP address, classification from Triage, port number, service name
+- Events: event count, event type(s), port(s) targeted
 
 *Assessment*
-[YOU WRITE THIS] — Reasoning tied to the Triage facts above only.
-If event type is wan_new_connection, note that traffic never reached the LAN.
-Do not repeat or paraphrase the Triage block — build on it.
+Two to four sentences of engineering analysis tied directly to the triage facts. If the event type is wan_new_connection, state clearly that the traffic never reached the LAN. Do not repeat the triage block.
 
-[RECOMMENDED ACTIONS]
-Copy the block below verbatim. Do not rewrite, summarise, or add extra bullets.
+PRE-FILLED RECOMMENDED ACTIONS (copy this block exactly as-is, do not rewrite or add bullets):
 
-%s
-
-================================================================
-
-Prioritise provided context. Write UNKNOWN for any triage field that cannot be answered from context.`
+%s`
 
 	defaultTimeout = 120 * time.Second
 )
