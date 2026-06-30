@@ -175,19 +175,28 @@ func (h *Handler) handleEvent(event slackevents.EventsAPIEvent) {
 		inner := event.InnerEvent
 		switch ev := inner.Data.(type) {
 		case *slackevents.AppMentionEvent:
-			go h.handleMention(ev.Channel, ev.TimeStamp, mentionRE(ev.Text))
+			go h.handleMention(ev.Channel, ev.TimeStamp, ev.ThreadTimeStamp, mentionRE(ev.Text))
 		}
 	}
 }
 
 // handleMention processes @ScanTrace mentions.
-func (h *Handler) handleMention(channel, thread, text string) {
+//
+// Routing rules:
+//   - "case <id>"  → full Block Kit report, posted top-level in the alert channel
+//   - general Q&A → LLM answer posted as a reply in the existing case thread if
+//     the mention itself arrived inside a case thread; otherwise top-level reply
+//     in the channel where the mention was received.
+func (h *Handler) handleMention(channel, ts, threadTS, text string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
-		h.postMessage(channel, thread, "Hi! Ask me about a case: `@ScanTrace case <id>` or just ask a question.")
+		h.postMessage(channel, ts, "Hi! Ask me about a case: `@ScanTrace case <id>` or just ask a question.")
 		return
 	}
+
 	lower := strings.ToLower(text)
+
+	// Explicit "case <id>" — post a full report top-level.
 	if strings.HasPrefix(lower, "case ") {
 		parts := strings.Fields(text)
 		if len(parts) >= 2 {
@@ -195,23 +204,57 @@ func (h *Handler) handleMention(channel, thread, text string) {
 			return
 		}
 	}
+
 	if h.llm == nil {
-		h.postMessage(channel, thread, "LLM not configured — I can't answer questions right now.")
+		h.postMessage(channel, ts, "LLM not configured — I can't answer questions right now.")
 		return
 	}
-	cases, _ := h.store.ListCases("", 5)
-	var ctxLines []string
-	for _, c := range cases {
-		ctxLines = append(ctxLines, fmt.Sprintf("case id=%s title=%q sev=%s status=%s",
-			c.CaseID[:8], c.Title, c.Severity, c.Status))
+
+	// Determine the reply thread.
+	// If the mention arrived inside an existing thread, reply there.
+	// Otherwise reply in-thread under the mention message itself.
+	replyThread := threadTS
+	if replyThread == "" {
+		replyThread = ts
 	}
-	answer, err := h.llm.AskCase(text, strings.Join(ctxLines, "\n"), "", "")
+
+	// Try to resolve case context from the thread we're in.
+	var caseCtx string
+	h.mu.Lock()
+	for caseID, caseTS := range h.caseThreads {
+		if caseTS == replyThread {
+			// We're inside this case's thread — load its context.
+			cases, _ := h.store.ListCases("", 50)
+			for _, c := range cases {
+				if strings.HasPrefix(c.CaseID, caseID) {
+					ctx, _, _ := h.buildSingleCaseContext(c)
+					caseCtx = ctx
+					break
+				}
+			}
+			break
+		}
+	}
+	h.mu.Unlock()
+
+	// Fall back to a summary of recent cases if no specific case thread matched.
+	if caseCtx == "" {
+		cases, _ := h.store.ListCases("", 5)
+		var ctxLines []string
+		for _, c := range cases {
+			ctxLines = append(ctxLines, fmt.Sprintf("case id=%s title=%q sev=%s status=%s",
+				c.CaseID[:8], c.Title, c.Severity, c.Status))
+		}
+		caseCtx = strings.Join(ctxLines, "\n")
+	}
+
+	answer, err := h.llm.AskCase(text, caseCtx, "", "")
 	if err != nil {
 		log.Printf("[handler] mention llm error: %v", err)
-		h.postMessage(channel, thread, fmt.Sprintf("⚠️ Inference error: %v", err))
+		h.postMessage(channel, replyThread, fmt.Sprintf("⚠️ Inference error: %v", err))
 		return
 	}
-	h.postMessage(channel, thread, answer)
+	h.postMessage(channel, replyThread, answer)
 }
 
 func (h *Handler) subscribeRTS() {
