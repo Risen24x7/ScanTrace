@@ -1032,7 +1032,22 @@ func trustEmoji(trust string) string {
 	}
 }
 
-func extractFirstPort(report interface{ Markdown string }) string {
+// extractFirstPort returns the first port string found in the report's Markdown,
+// or "" if none is present.
+func extractFirstPort(report *casebuilder.Report) string {
+	if report == nil {
+		return ""
+	}
+	// Scan the Markdown for a "Port:" line and return the first value found.
+	for _, line := range strings.Split(report.Markdown, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Port:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
 	return ""
 }
 
