@@ -134,7 +134,8 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 }
 
 // parse extracts fields from an iptables syslog line.
-// Returns (result, true) on success, (zero, false) if required fields are absent.
+// Returns (result, true) on success, (zero, false) if required fields are absent
+// or the packet is broadcast/malformed noise.
 func parse(line string) (parsedLine, bool) {
 	extract := func(re *regexp.Regexp) string {
 		m := re.FindStringSubmatch(line)
@@ -146,7 +147,12 @@ func parse(line string) (parsedLine, bool) {
 
 	srcIP := extract(reSRC)
 	dstIP := extract(reDST)
-	if srcIP == "" || dstIP == "" {
+
+	// Discard broadcast, unspecified, and malformed addresses.
+	if srcIP == "" || srcIP == "0.0.0.0" {
+		return parsedLine{}, false
+	}
+	if dstIP == "" || dstIP == "0.0.0.0" {
 		return parsedLine{}, false
 	}
 
@@ -168,10 +174,17 @@ func parse(line string) (parsedLine, bool) {
 }
 
 // ingest writes one event to the DB and creates/updates the parent case.
+// Returns nil without writing anything if classifySeverity marks the port
+// as noise (empty string return).
 func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]string) error {
+	// Discard ephemeral-port backscatter before touching the DB.
+	if classifySeverity(p.dstPort) == "" {
+		return nil
+	}
+
 	now := time.Now().UTC()
 
-	// ── 1. Classify event type based on interface and dst ──────────────────
+	// ── 1. Classify event type based on interface ──────────────────────────
 	// wan_new_connection  → packet hit WAN interface, no port-forward matched
 	// wan_forward         → packet was forwarded toward an internal host
 	evtType := "wan_new_connection"
@@ -208,7 +221,6 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 	caseID, exists := caseIndex[key]
 
 	if !exists {
-		// New case
 		caseID = uuid.NewString()
 		caseIndex[key] = caseID
 
@@ -259,8 +271,15 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 }
 
 // classifySeverity maps destination port to a severity label.
-// Sensitive remote-access and management ports → high; everything else → low.
+//
+// Returns "" for ephemeral/high ports (>= 32768) — these are almost always
+// backscatter from spoofed SYNs or return traffic to closed ports and are
+// not worth creating cases for.
 func classifySeverity(dport int) string {
+	// Ephemeral range — backscatter noise, discard silently.
+	if dport >= 32768 {
+		return ""
+	}
 	switch dport {
 	case 22, 23, 3389, 5900, 5901, 4444, 8080, 8443, 9001:
 		return "high"
