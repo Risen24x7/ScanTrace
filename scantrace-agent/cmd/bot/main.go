@@ -5,23 +5,23 @@ import (
 	"os"
 	"strings"
 
-	"github.com/joho/godotenv"
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/syslog"
+	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/socketmode"
 )
 
 func main() {
 	// Load .env file automatically if it exists
-    if err := godotenv.Load(); err != nil {
-        // Don't crash if it's missing, since production might use raw environment variables
-        log.Println("No .env file found, falling back to system environment variables")
-    }
-	
+	if err := godotenv.Load(); err != nil {
+		// Don't crash if it's missing, since production might use raw environment variables
+		log.Println("No .env file found, falling back to system environment variables")
+	}
+
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
 	alertChannel := mustEnv("ALERT_CHANNEL")
@@ -56,7 +56,7 @@ func main() {
 	// LLM configuration: expects an Ollama-compatible endpoint.
 	// For local development, defaults to localhost:11434.
 	// For production or remote LLM services, set LLM_BASE_URL explicitly.
-	llmBase := envOrDefault("LLM_BASE_URL", "http://localhost:11434")
+	llmBase := envOrDefault("LLM_BASE_URL", "http://192.168.50.250:11434")
 	llmModel := os.Getenv("LLM_MODEL")
 	llmClient := llm.New(llmBase, llmModel)
 	log.Printf("[main] LLM endpoint: %s (model=%q)", llmBase, llmModel)
