@@ -96,6 +96,12 @@ func (db *DB) RunMigrations() error {
     // Apply schema (CREATE TABLE IF NOT EXISTS is idempotent).
     for _, stmt := range splitStatements(DDL) {
         if _, err = tx.Exec(stmt); err != nil {
+            // Skip errors for ALTER TABLE ADD COLUMN if column already exists (idempotent migration)
+            errMsg := err.Error()
+            if strings.Contains(stmt, "ALTER TABLE") && 
+               (strings.Contains(errMsg, "duplicate column") || strings.Contains(errMsg, "already exists")) {
+                continue
+            }
             return fmt.Errorf("RunMigrations: %w\nStatement: %s", err, stmt)
         }
     }

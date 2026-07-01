@@ -122,6 +122,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_known_devices_ip  ON known_devices(ip)  WH
 CREATE UNIQUE INDEX IF NOT EXISTS idx_known_devices_mac ON known_devices(mac) WHERE mac != '';
 CREATE INDEX        IF NOT EXISTS idx_known_devices_trust ON known_devices(trust_label);
 
+-- Migration: Add missing columns to existing cases table (v2 → v3 upgrade)
+ALTER TABLE cases ADD COLUMN rule_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE cases ADD COLUMN src_ip TEXT NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS idx_cases_severity   ON cases(severity);
 CREATE INDEX IF NOT EXISTS idx_cases_status     ON cases(status);
 CREATE INDEX IF NOT EXISTS idx_cases_created_at ON cases(created_at);
