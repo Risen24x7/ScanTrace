@@ -78,108 +78,7 @@ type Alerter interface {
 const (
 	burstWindow    = 90 * time.Second
 	burstThreshold = 3
-<<<<<<< HEAD
-
-	// maxConcurrentAlerts limits the number of concurrent goroutines posting alerts
-	// to prevent resource exhaustion if the alerter (Slack) is slow.
-	maxConcurrentAlerts = 10
-=======
-	burstMaxEvents = 50
->>>>>>> 79f7629e1eef62d98897fe1b42819fbbdb7fdc8d
 )
-
-// ---------------------------------------------------------------------------
-// Port classification — derived from router port-forwarding table
-// ---------------------------------------------------------------------------
-
-// highPorts are forwarded/sensitive services that bypass the burst buffer
-// entirely and trigger an immediate Slack alert.
-var highPorts = map[int]bool{
-	22:   true, // SSH
-	23:   true, // Telnet
-	3389: true, // RDP
-	5900: true, // VNC
-	5901: true, // VNC alt
-	5938: true, // TeamViewer (forwarded on BOTH TCP+UDP → .250)
-	4444: true, // Reverse shell / Metasploit
-	8080: true, // HTTP alt / Kalen service (forwarded → .11)
-	8088: true, // Open WebUI — LLM interface (forwarded → .253)
-	8443: true, // HTTPS alt
-	9001: true, // Tor / misc high-value
-}
-
-// mediumPorts are services that are active on this network but less
-// immediately exploitable. They enter the burst buffer and are merged
-// if a flood occurs.
-var mediumPorts = map[int]bool{
-	21:    true, // FTP
-	25:    true, // SMTP
-	53:    true, // DNS
-	80:    true, // HTTP (forwarded → .4)
-	110:   true, // POP3
-	143:   true, // IMAP
-	443:   true, // HTTPS (forwarded → .4)
-	445:   true, // SMB
-	3306:  true, // MySQL
-	3724:  true, // forwarded TCP service (→ .6)
-	5432:  true, // PostgreSQL
-	6379:  true, // Redis
-	8085:  true, // forwarded service (→ .6)
-	8096:  true, // Jellyfin (forwarded → .4)
-	15636: true, // forwarded BOTH-protocol service (→ .8)
-	15637: true, // forwarded BOTH-protocol service (→ .8)
-	24454: true, // forwarded TCP service (→ .10)
-	25565: true, // Minecraft (forwarded → .10)
-	2456:  true, // Valheim (forwarded → .7)
-	2457:  true, // Valheim
-	2458:  true, // Valheim
-	27017: true, // MongoDB
-}
-
-// knownPorts is the union of high+medium — used to decide whether a ScanBurst
-// touches any real service. Bursts that miss all known ports are INFO-tagged
-// and suppressed from Slack (pure background radiation).
-var knownPorts = func() map[int]bool {
-	m := make(map[int]bool, len(highPorts)+len(mediumPorts))
-	for p := range highPorts {
-		m[p] = true
-	}
-	for p := range mediumPorts {
-		m[p] = true
-	}
-	return m
-}()
-
-// classifySeverity maps a destination port to a severity label.
-//
-//	high   → immediate alert, bypass burst buffer
-//	medium → enters burst buffer
-//	low    → enters burst buffer
-//	""     → ephemeral port (>= 32768) or backscatter, discard entirely
-func classifySeverity(dport int) string {
-	if dport >= 32768 {
-		return ""
-	}
-	if highPorts[dport] {
-		return "high"
-	}
-	if mediumPorts[dport] {
-		return "medium"
-	}
-	return "low"
-}
-
-// burstSeverity determines the final severity for a merged ScanBurst case.
-// If none of the targeted ports appear in knownPorts, returns "info" so the
-// case is written to DB but suppressed from Slack (pure background radiation).
-func burstSeverity(ports map[int]bool, highest string) string {
-	for p := range ports {
-		if knownPorts[p] {
-			return highest // at least one real service targeted — use inherited sev
-		}
-	}
-	return "info" // no known port hit → background radiation, suppress Slack
-}
 
 // ---------------------------------------------------------------------------
 // Field extraction regexes — compiled once.
@@ -299,13 +198,9 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 	caseIndex := make(map[caseKey]string)
 	buf := &burstBuffer{}
 
-<<<<<<< HEAD
 	// alertSem limits concurrent alert goroutines to prevent resource exhaustion
 	alertSem := make(chan struct{}, maxConcurrentAlerts)
 
-	// Flush ticker — runs every burstWindow, decides merge vs. individual emit.
-=======
->>>>>>> 79f7629e1eef62d98897fe1b42819fbbdb7fdc8d
 	ticker := time.NewTicker(burstWindow)
 	go func() {
 		for range ticker.C {
@@ -333,12 +228,8 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 		if !ok {
 			continue
 		}
-<<<<<<< HEAD
 
-		if err := ingest(p, store, alerter, caseIndex, buf, alertSem); err != nil {
-=======
 		if err := ingest(p, store, alerter, caseIndex, buf); err != nil {
->>>>>>> 79f7629e1eef62d98897fe1b42819fbbdb7fdc8d
 			log.Printf("[syslog] ingest error: %v", err)
 		}
 	}
@@ -384,14 +275,10 @@ func parse(line string) (parsedLine, bool) {
 // ingest
 // ---------------------------------------------------------------------------
 
-<<<<<<< HEAD
 // ingest writes one event to the DB and creates/updates the parent case.
 // HIGH severity cases bypass the burst buffer and alert immediately.
 // LOW/MEDIUM cases are queued in the burst buffer for deferred roll-up.
-func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]string, buf *burstBuffer, alertSem chan struct{}) error {
-=======
 func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]string, buf *burstBuffer) error {
->>>>>>> 79f7629e1eef62d98897fe1b42819fbbdb7fdc8d
 	sev := classifySeverity(p.dstPort)
 	if sev == "" {
 		return nil
@@ -457,14 +344,9 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		log.Printf("[syslog] new case %s -- %s", caseID[:8], title)
 
 		if sev == "high" {
-<<<<<<< HEAD
 			// HIGH severity: bypass buffer, alert immediately.
 			log.Printf("[syslog] HIGH severity — alerting immediately for case %s", caseID[:8])
-			postAlertWithSem(alertSem, alerter, c)
-=======
-			log.Printf("[syslog] HIGH severity -- alerting immediately for case %s", caseID[:8])
 			go alerter.PostCaseAlert(c)
->>>>>>> 79f7629e1eef62d98897fe1b42819fbbdb7fdc8d
 		} else {
 			// dstPort stored directly — no title re-parsing needed in flushBurst.
 			buf.add(&bufferedCase{c: c, proto: p.proto, srcIPs: []string{p.srcIP}, dstPort: p.dstPort})
@@ -512,20 +394,12 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 // flushBurst
 // ---------------------------------------------------------------------------
 
-<<<<<<< HEAD
 // flushBurst drains the burst buffer and decides:
 //   - < burstThreshold cases → alert each individually (small bursts are fine).
 //   - >= burstThreshold cases → merge into one ScanBurst case, delete stubs,
 //     insert the rolled-up case, and alert once.
-func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer, alertSem chan struct{}) {
-	items := buf.drain()
-=======
 func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
-	buf.mu.Lock()
-	items := buf.drainLocked()
-	buf.mu.Unlock()
-
->>>>>>> 79f7629e1eef62d98897fe1b42819fbbdb7fdc8d
+	items := buf.drain()
 	if len(items) == 0 {
 		return
 	}
@@ -623,22 +497,9 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		Severity:        finalSev,
 		Confidence:      0.6,
 		RelatedEventIDs: allEventIDs,
-<<<<<<< HEAD
 		CreatedAt:       time.Now().UTC(),
 		UpdatedAt:       time.Now().UTC(),
 		AnalystNotes:    fmt.Sprintf("rule=scan_burst type=bulk_inbound_drop merged_cases=%d", len(items)),
-		RuleType:        "bulk_inbound_drop",
-		SrcIP:           items[0].c.SrcIP,
-=======
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		AnalystNotes: fmt.Sprintf(
-			"rule=scan_burst type=bulk_inbound_drop merged_cases=%d stub_ids=%s slack_suppressed=%v",
-			len(items),
-			strings.Join(oldCaseIDs, ","),
-			finalSev == "info",
-		),
->>>>>>> 79f7629e1eef62d98897fe1b42819fbbdb7fdc8d
 	}
 
 	if err := store.InsertCase(burstCase); err != nil {
