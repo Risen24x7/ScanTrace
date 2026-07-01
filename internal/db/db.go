@@ -171,7 +171,9 @@ func marshalStringSlice(ss StringSlice) string {
 
 func unmarshalStringSlice(s string) StringSlice {
 	var out StringSlice
-	_ = json.Unmarshal([]byte(s), &out)
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		log.Printf("[db] WARNING: failed to unmarshal StringSlice from %q: %v", s, err)
+	}
 	return out
 }
 

@@ -199,9 +199,9 @@ func (c *Correlator) Run() ([]*db.Case, error) {
 
 // isDuplicate returns true if recentCases has an open case for the given
 // srcIP and ruleType created within the last window duration.
+// Uses exact field matching on rule_type and src_ip for proper deduplication.
 func isDuplicate(cases []*db.Case, srcIP, ruleType string, window time.Duration) bool {
 	cutoff := time.Now().UTC().Add(-window)
-	needle := fmt.Sprintf("type=%s", ruleType)
 	for _, c := range cases {
 		if c.Status != "open" {
 			continue
@@ -209,7 +209,8 @@ func isDuplicate(cases []*db.Case, srcIP, ruleType string, window time.Duration)
 		if c.CreatedAt.Before(cutoff) {
 			continue
 		}
-		if strings.Contains(c.Title, srcIP) && strings.Contains(c.AnalystNotes, needle) {
+		// Use exact field matching instead of string containment
+		if c.SrcIP == srcIP && c.RuleType == ruleType {
 			return true
 		}
 	}
@@ -269,6 +270,8 @@ func (c *Correlator) openCase(cl *IPCluster, match *RuleMatch) (*db.Case, error)
 		UpdatedAt:       time.Now().UTC(),
 		RelatedEventIDs: eventIDs,
 		AnalystNotes:    fmt.Sprintf("rule=%s type=%s", ruleName, ruleType),
+		RuleType:        ruleType,
+		SrcIP:           cl.SrcIP,
 	}
 	if err := c.store.InsertCase(cas); err != nil {
 		return nil, err

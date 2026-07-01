@@ -48,13 +48,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("[main] db.Open: %v", err)
 	}
+	defer store.Close()
 
 	rtsURL := os.Getenv("RTS_BASE_URL")
 	rtsClient := rts.New(rtsURL)
 
-	// Default to the desktop inference endpoint so the agent works without
-	// explicitly setting LLM_BASE_URL in the environment.
-	llmBase := envOrDefault("LLM_BASE_URL", "http://192.168.50.250:11434")
+	// LLM configuration: expects an Ollama-compatible endpoint.
+	// For local development, defaults to localhost:11434.
+	// For production or remote LLM services, set LLM_BASE_URL explicitly.
+	llmBase := envOrDefault("LLM_BASE_URL", "http://localhost:11434")
 	llmModel := os.Getenv("LLM_MODEL")
 	llmClient := llm.New(llmBase, llmModel)
 	log.Printf("[main] LLM endpoint: %s (model=%q)", llmBase, llmModel)

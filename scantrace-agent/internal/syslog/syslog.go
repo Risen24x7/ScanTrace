@@ -57,6 +57,10 @@ const (
 	// burstThreshold: if >= this many cases accumulate in one window, merge them
 	// into a single ScanBurst case instead of alerting individually.
 	burstThreshold = 3
+
+	// maxConcurrentAlerts limits the number of concurrent goroutines posting alerts
+	// to prevent resource exhaustion if the alerter (Slack) is slow.
+	maxConcurrentAlerts = 10
 )
 
 // ---------------------------------------------------------------------------
@@ -124,6 +128,16 @@ func ensureSyslogSensor(store *db.DB) error {
 	return store.InsertSensor(s)
 }
 
+// postAlertWithSem acquires the semaphore, launches a goroutine to post the alert,
+// and releases the semaphore when done. This bounds concurrent alert goroutines.
+func postAlertWithSem(alertSem chan struct{}, alerter Alerter, c *db.Case) {
+	go func() {
+		alertSem <- struct{}{}
+		defer func() { <-alertSem }()
+		alerter.PostCaseAlert(c)
+	}()
+}
+
 // ---------------------------------------------------------------------------
 // Burst buffer
 // ---------------------------------------------------------------------------
@@ -178,21 +192,28 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 	caseIndex := make(map[caseKey]string)
 	buf := &burstBuffer{}
 
+	// alertSem limits concurrent alert goroutines to prevent resource exhaustion
+	alertSem := make(chan struct{}, maxConcurrentAlerts)
+
 	// Flush ticker — runs every burstWindow, decides merge vs. individual emit.
 	ticker := time.NewTicker(burstWindow)
 	go func() {
 		for range ticker.C {
-			flushBurst(store, alerter, buf)
+			flushBurst(store, alerter, buf, alertSem)
 		}
 	}()
 	defer ticker.Stop()
 
-	pkt := make([]byte, 4096)
+	pkt := make([]byte, 65536)
 	for {
 		n, _, err := conn.ReadFrom(pkt)
 		if err != nil {
 			log.Printf("[syslog] read error: %v", err)
 			continue
+		}
+		// Warn if packet is close to buffer size (possible truncation)
+		if n > 65520 {
+			log.Printf("[syslog] WARNING: packet size %d bytes near buffer limit, possible truncation", n)
 		}
 		line := strings.TrimSpace(string(pkt[:n]))
 		if line == "" {
@@ -207,7 +228,7 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 			continue
 		}
 
-		if err := ingest(p, store, alerter, caseIndex, buf); err != nil {
+		if err := ingest(p, store, alerter, caseIndex, buf, alertSem); err != nil {
 			log.Printf("[syslog] ingest error: %v", err)
 		}
 	}
@@ -264,7 +285,7 @@ func parse(line string) (parsedLine, bool) {
 // ingest writes one event to the DB and creates/updates the parent case.
 // HIGH severity cases bypass the burst buffer and alert immediately.
 // LOW/MEDIUM cases are queued in the burst buffer for deferred roll-up.
-func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]string, buf *burstBuffer) error {
+func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]string, buf *burstBuffer, alertSem chan struct{}) error {
 	sev := classifySeverity(p.dstPort)
 	if sev == "" {
 		// Ephemeral port (>= 32768) — backscatter noise, discard.
@@ -322,6 +343,8 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 			RelatedEventIDs: db.StringSlice{evt.EventID},
 			CreatedAt:       now,
 			UpdatedAt:       now,
+			RuleType:        "syslog_drop",
+			SrcIP:           p.srcIP,
 		}
 		if err := store.InsertCase(c); err != nil {
 			return fmt.Errorf("InsertCase: %w", err)
@@ -332,7 +355,7 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 		if sev == "high" {
 			// HIGH severity: bypass buffer, alert immediately.
 			log.Printf("[syslog] HIGH severity — alerting immediately for case %s", caseID[:8])
-			go alerter.PostCaseAlert(c)
+			postAlertWithSem(alertSem, alerter, c)
 		} else {
 			// LOW/MEDIUM: queue in burst buffer; the ticker will decide.
 			buf.add(&bufferedCase{
@@ -348,7 +371,7 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 	c, err := store.GetCase(caseID)
 	if err != nil || c == nil {
 		delete(caseIndex, key)
-		return ingest(p, store, alerter, caseIndex, buf)
+		return ingest(p, store, alerter, caseIndex, buf, alertSem)
 	}
 
 	c.RelatedEventIDs = append(c.RelatedEventIDs, evt.EventID)
@@ -360,7 +383,7 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 	n := len(c.RelatedEventIDs)
 	if n == 5 || n == 10 || (n > 0 && n%25 == 0) {
 		log.Printf("[syslog] case %s milestone: %d events", caseID[:8], n)
-		go alerter.PostCaseAlert(c)
+		postAlertWithSem(alertSem, alerter, c)
 	}
 
 	return nil
@@ -374,7 +397,7 @@ func ingest(p parsedLine, store *db.DB, alerter Alerter, caseIndex map[caseKey]s
 //   - < burstThreshold cases → alert each individually (small bursts are fine).
 //   - >= burstThreshold cases → merge into one ScanBurst case, delete stubs,
 //     insert the rolled-up case, and alert once.
-func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
+func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer, alertSem chan struct{}) {
 	items := buf.drain()
 	if len(items) == 0 {
 		return
@@ -385,7 +408,7 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 	if len(items) < burstThreshold {
 		// Small burst — alert individually; no merge needed.
 		for _, bc := range items {
-			go alerter.PostCaseAlert(bc.c)
+			postAlertWithSem(alertSem, alerter, bc.c)
 		}
 		return
 	}
@@ -472,6 +495,8 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 		CreatedAt:       time.Now().UTC(),
 		UpdatedAt:       time.Now().UTC(),
 		AnalystNotes:    fmt.Sprintf("rule=scan_burst type=bulk_inbound_drop merged_cases=%d", len(items)),
+		RuleType:        "bulk_inbound_drop",
+		SrcIP:           items[0].c.SrcIP,
 	}
 
 	if err := store.InsertCase(burstCase); err != nil {
@@ -493,7 +518,7 @@ func flushBurst(store *db.DB, alerter Alerter, buf *burstBuffer) {
 	log.Printf("[syslog] burst merged %d cases → %s (%s, %d sources, ports: %s)",
 		len(items), burstCase.CaseID[:8], highestSev, srcCount, strings.Join(portStrs, ","))
 
-	go alerter.PostCaseAlert(burstCase)
+	postAlertWithSem(alertSem, alerter, burstCase)
 }
 
 // ---------------------------------------------------------------------------

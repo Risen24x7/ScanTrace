@@ -689,7 +689,7 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 	}
 
 	if ts.isWANEdgeOnly {
-		ts.dstLabel = "WAN EDGE — gateway interface only"
+		ts.dstLabel = fmt.Sprintf("%s [WAN EDGE — gateway interface only]", h.wanIP)
 	} else if ts.hasWANForward && ts.dstInRegistry {
 		ts.dstLabel = "YES — registered internal device"
 	} else if ts.hasWANForward {

@@ -411,7 +411,7 @@ func syslogPortFromEnv() int {
 }
 
 func getLocalIP() string {
-	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 80})
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53})
 	if err != nil {
 		return "<this-host>"
 	}

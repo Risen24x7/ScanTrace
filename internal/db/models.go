@@ -146,4 +146,6 @@ type Case struct {
 	Artifacts        string      `json:"artifacts"          db:"artifacts"`
 	AnalystNotes     string      `json:"analyst_notes"      db:"analyst_notes"`
 	ReportExports    StringSlice `json:"report_exports"     db:"report_exports"`
+	RuleType         string      `json:"rule_type"          db:"rule_type"`
+	SrcIP            string      `json:"src_ip"             db:"src_ip"`
 }

@@ -20,6 +20,28 @@ const (
 	ipinfoBaseURL = "https://ipinfo.io"
 )
 
+// privateNetworks caches the parsed private IP ranges to avoid reparsing on each call.
+var privateNetworks []*net.IPNet
+
+func init() {
+	// Pre-parse private IP CIDR blocks for efficient checking.
+	cidrs := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+	}
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Printf("[enricher] failed to parse private CIDR %s: %v", cidr, err)
+			continue
+		}
+		privateNetworks = append(privateNetworks, network)
+	}
+}
+
 type Enricher struct {
 	store  *db.DB
 	client *http.Client
@@ -173,8 +195,7 @@ func isPrivate(ipStr string) bool {
 	if ip == nil {
 		return false
 	}
-	for _, cidr := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"} {
-		_, network, _ := net.ParseCIDR(cidr)
+	for _, network := range privateNetworks {
 		if network.Contains(ip) {
 			return true
 		}

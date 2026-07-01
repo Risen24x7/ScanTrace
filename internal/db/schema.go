@@ -85,7 +85,9 @@ CREATE TABLE IF NOT EXISTS cases (
     timeline            TEXT NOT NULL DEFAULT '{}',
     artifacts           TEXT NOT NULL DEFAULT '{}',
     analyst_notes       TEXT NOT NULL DEFAULT '',
-    report_exports      TEXT NOT NULL DEFAULT '{}'
+    report_exports      TEXT NOT NULL DEFAULT '{}',
+    rule_type           TEXT NOT NULL DEFAULT '',
+    src_ip              TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS case_entities (
@@ -123,10 +125,12 @@ CREATE INDEX        IF NOT EXISTS idx_known_devices_trust ON known_devices(trust
 CREATE INDEX IF NOT EXISTS idx_cases_severity   ON cases(severity);
 CREATE INDEX IF NOT EXISTS idx_cases_status     ON cases(status);
 CREATE INDEX IF NOT EXISTS idx_cases_created_at ON cases(created_at);
+CREATE INDEX IF NOT EXISTS idx_cases_rule_type  ON cases(rule_type);
+CREATE INDEX IF NOT EXISTS idx_cases_src_ip     ON cases(src_ip);
 CREATE INDEX IF NOT EXISTS idx_case_entities_case   ON case_entities(case_id);
 CREATE INDEX IF NOT EXISTS idx_case_entities_entity ON case_entities(entity_id);
 `
 
 // SchemaVersion is incremented whenever the DDL changes.
 // The migration runner checks this before applying statements.
-const SchemaVersion = 2
+const SchemaVersion = 3
