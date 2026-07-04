@@ -1,5 +1,21 @@
 # ScanTrace — Troubleshooting
 
+Hackathon additions: mode-specific checks and links
+
+Mode-specific
+- Direct agent :5140 — verify router sends to 5140; tcpdump -n udp port 5140
+- rsyslog :514 relay — verify /etc/rsyslog.conf enables UDP 514 and file sink; then pipe to agent :5140
+
+Common checks
+- getcap ./bin/scantrace shows cap_net_bind_service=ep
+- sqlite3 scantrace.db "SELECT count(*) FROM events;" increases during scans
+
+Links
+- INSTALL.md — env and port defaults
+- docs/router-logging-setup.md — firewall logging and validation
+
+---
+
 ## Agent Won't Start
 
 ### `LLM not configured`

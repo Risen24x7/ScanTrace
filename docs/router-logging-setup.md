@@ -1,72 +1,35 @@
 # Router Logging Setup for External Scan Detection
 
-ScanTrace detects external port scans by parsing **iptables LOG target** entries
-from your router's syslog. Without this, only DHCP and Wi-Fi events are visible
-and external scans will go undetected.
+ScanTrace detects external port scans by parsing iptables LOG target entries from your router's syslog.
 
-## Asus Router (ASUSWRT / Merlin) — Enable Firewall Logging
+Port alignment note
+- Router typically forwards syslog to UDP 514
+- ScanTrace agent default listens on UDP 5140 (env: SCANTRACE_SYSLOG_PORT)
+- Align one side: either forward router to 5140, or run rsyslog on 514 and forward to agent 5140
 
-### Step 1: Enable syslog forwarding
+Asus Router (ASUSWRT / Merlin)
+1) Enable syslog forwarding (Administration → System → Syslog)
+   - Enable: Yes
+   - Server IP: <ScanTrace host>
+   - Port: 514 or 5140 (see note above)
+   - See INSTALL.md for port/env details
+2) Enable iptables DROP logging
+   - Create /jffs/scripts/firewall-start (Merlin only):
+     #!/bin/sh
+     iptables -I INPUT -j LOG --log-prefix "DROP " --log-level 4 --log-tcp-options
+     iptables -I FORWARD -i eth0 -j LOG --log-prefix "DROP " --log-level 4
+   - chmod +x /jffs/scripts/firewall-start
+   - service restart_firewall
+3) Verify log output
+   - tcpdump -i any udp port 514 or 5140 -A | grep DROP
+   - You should see lines with DROP ... DPT=<port>
 
-In the router admin panel: **Administration → System → Syslog**
-- Enable: `Yes`
-- Syslog server IP: `<IP of your ScanTrace host>`
-- Port: `514` (UDP)
+End-to-end validation
+1) Generate a couple of external connection attempts to your WAN IP (e.g., nmap from LTE)
+2) Confirm ScanTrace stored netfilter_drop events:
+   sqlite3 scantrace.db "SELECT event_type, src_ip, dst_port, timestamp FROM events WHERE event_type='netfilter_drop' ORDER BY timestamp DESC LIMIT 10;"
+3) If empty, re-check port alignment and that firewall logging is enabled
 
-### Step 2: Enable iptables DROP logging
-
-SSH into the router and add persistent logging rules via a post-firewall script.
-
-Create `/jffs/scripts/firewall-start` (Merlin only):
-```bash
-#!/bin/sh
-# Log all inbound DROP packets — feeds ScanTrace external scan detection
-iptables -I INPUT -j LOG --log-prefix "DROP " --log-level 4 --log-tcp-options
-iptables -I FORWARD -i eth0 -j LOG --log-prefix "DROP " --log-level 4
-```
-
-Make it executable:
-```bash
-chmod +x /jffs/scripts/firewall-start
-```
-
-Restart the firewall:
-```bash
-service restart_firewall
-```
-
-### Step 3: Verify log output
-
-From the ScanTrace host:
-```bash
-tcpdump -i any udp port 514 -A | grep DROP
-```
-
-You should see lines like:
-```
-Jun 28 15:01:22 kernel: DROP IN=eth0 OUT= SRC=24.20.77.75 DST=192.168.50.1 LEN=44 TTL=50 PROTO=TCP SPT=54321 DPT=22 SYN
-```
-
-If you see these, ScanTrace will ingest them as `netfilter_drop` events and the
-correlator's `ExternalScanRule` will fire when 3+ distinct ports are probed
-from the same external IP.
-
-## What ScanTrace does with these events
-
-| Syslog line | Event type | Correlator rule |
-|---|---|---|
-| `DROP IN=eth0 SRC=<external>` | `netfilter_drop` | `inbound_scan` |
-| `REJECT IN=eth0 SRC=<external>` | `netfilter_reject` | `inbound_scan` |
-| `[CONN] NEW SRC=<external>` | `conn_attempt` | `inbound_scan` |
-| `DHCPACK 192.168.x.x` | `dhcp_dhcpack` | `new_device` |
-| `wlceventd: fe:... Associated` | `wifi_associated` | `new_device` |
-
-Once iptables logging is enabled and ScanTrace receives the drops, the Slack
-bot will answer questions like *"what IPs have been scanning my network?"*
-with real external scan data.
-
-## Threshold defaults
-
-- `ExternalScanRule.MinPorts = 3` — fires after 3 distinct ports probed from same external IP
-- `RepeatedDropRule.MinDrops = 3` — fires after 3 drop events from same IP (even single-port)
-- Both can be tuned in `correlator.DefaultRules()`
+More
+- See INSTALL.md for env and capability steps
+- See Docs/TROUBLESHOOTING.md for router/port-mode tips
