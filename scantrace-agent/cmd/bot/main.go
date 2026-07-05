@@ -50,7 +50,7 @@ func main() {
 	}
 	defer store.Close()
 
-	// RTS authenticates with the Slack bot token (Authorization: Bearer <token>).
+	// RTS client uses the bot token for Authorization: Bearer <token>
 	rtsClient := rts.New(botToken)
 
 	// LLM configuration: expects an Ollama-compatible endpoint.
@@ -69,7 +69,7 @@ func main() {
 
 	h := handler.New(api, store, alertChannel, externalThreatChannel, wanIP, rtsClient, llmClient)
 
-	// ── Syslog UDP ingest ───────────────────────────────────────────────────────────────
+	// ── Syslog UDP ingest ──────────────────────────────────────────────────
 	// Binds to SCANTRACE_SYSLOG_PORT (default 5140) and parses iptables DROP
 	// lines forwarded from the gateway router into ScanTrace events + cases.
 	syslogPort := envOrDefault("SCANTRACE_SYSLOG_PORT", "5140")
@@ -80,7 +80,7 @@ func main() {
 	}()
 	log.Printf("[main] syslog ingest started on UDP :%s", syslogPort)
 
-	// ── Slack Socket Mode ─────────────────────────────────────────────────────────────────
+	// ── Slack Socket Mode ──────────────────────────────────────────────────
 	go func() {
 		for evt := range client.Events {
 			h.Dispatch(client, evt)

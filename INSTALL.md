@@ -36,8 +36,8 @@ ALERT_CHANNEL=C0BBP1EP68P
 EXTERNAL_THREAT_CHANNEL=C0BCYSW3KNC   # channel for LLM Q&A replies (defaults to ALERT_CHANNEL)
 LLM_BASE_URL=http://192.168.50.250:11434  # ik_llama.cpp endpoint; works without if omitted
 LLM_MODEL=Qwen3-30B-A3B-UD-Q3_K_XL
-DB_PATH=../scantrace.db
-WAN_IP=                                # leave blank; agent auto-detects from syslog
+DB_PATH=/opt/scantrace/scantrace.db      # RECOMMENDED: absolute path
+WAN_IP=                                    # set explicitly (e.g., 24.20.77.75) or leave blank to auto-detect from syslog
 SCANTRACE_SYSLOG_PORT=5140
 ```
 
@@ -130,3 +130,9 @@ sqlite3 scantrace.db "SELECT event_type, src_ip, dst_port, timestamp FROM events
 | Agent exits immediately | Missing `SLACK_BOT_TOKEN` or `SLACK_APP_TOKEN` | Check `.env` has both |
 | No alerts in Slack | Wrong `ALERT_CHANNEL` ID | Must be channel ID (`C0...`), not name |
 | WAN traffic shows as internal threat | Old binary without WAN_IP pre-classification | Rebuild from current `main` |
+
+---
+
+## 9. Quick status
+
+Run `/scantrace status` in Slack for liveness: DB OK, case counts, syslog port, WAN IP, LLM config, and alert channel.
