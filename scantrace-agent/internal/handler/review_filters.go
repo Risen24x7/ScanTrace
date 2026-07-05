@@ -9,112 +9,61 @@ import (
 	"github.com/Risen24x7/scantrace/internal/db"
 )
 
-// reviewAllUsage is the short usage string appended to parse errors.
-const reviewAllUsage = "Usage: `/scantrace review-all [--limit N] [--since 24h] [--severity red,yellow] [--exclude-wan-only] [--dedupe]`"
-
-// severityColors lists the canonical severity colours in display order.
-var severityColors = []string{"red", "yellow", "green"}
-
-// reviewAllFlags captures the parsed flag state for /scantrace review-all.
-// The *Set fields record whether the caller supplied the flag so that absent
-// flags preserve the pre-existing default behaviour.
-type reviewAllFlags struct {
+// reviewAllOpts holds the parsed flags for `/scantrace review-all`.
+type reviewAllOpts struct {
 	limit          int
 	limitSet       bool
 	since          time.Duration
-	sinceRaw       string
 	sinceSet       bool
-	severities     map[string]bool
+	sinceRaw       string
+	severities     map[string]bool // normalized to high/medium/low
 	severitySet    bool
+	severityRaw    string
 	excludeWANOnly bool
 	dedupe         bool
 }
 
-// colorForSeverity maps the stored severity label (high/medium/low) onto the
-// red/yellow/green colour scheme used by the review filters. Values already in
-// colour form are passed through unchanged.
-func colorForSeverity(sev string) string {
-	switch strings.ToLower(strings.TrimSpace(sev)) {
-	case "high", "red":
-		return "red"
-	case "medium", "yellow":
-		return "yellow"
-	case "low", "green":
-		return "green"
-	default:
-		return ""
+// filterSummary renders a short human-readable description of the active
+// filters, used when zero cases remain after filtering.
+func (o reviewAllOpts) filterSummary() string {
+	var parts []string
+	if o.severitySet {
+		parts = append(parts, "severity="+o.severityRaw)
 	}
+	if o.sinceSet {
+		parts = append(parts, "since="+o.sinceRaw)
+	}
+	if o.excludeWANOnly {
+		parts = append(parts, "exclude-wan-only")
+	}
+	if o.dedupe {
+		parts = append(parts, "dedupe")
+	}
+	if o.limitSet {
+		parts = append(parts, fmt.Sprintf("limit=%d", o.limit))
+	}
+	if len(parts) == 0 {
+		return "the supplied filters"
+	}
+	return strings.Join(parts, " ")
 }
 
-// normalizeSeverities parses a comma/space tolerant severity list into a set of
-// canonical colours. It accepts red/yellow/green and high/medium/low.
-func normalizeSeverities(v string) (map[string]bool, error) {
-	fields := strings.FieldsFunc(v, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\t'
-	})
-	out := make(map[string]bool)
-	for _, f := range fields {
-		c := colorForSeverity(f)
-		if c == "" {
-			return nil, fmt.Errorf("invalid severity %q (use red, yellow, green)", f)
-		}
-		out[c] = true
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("empty severity list")
-	}
-	return out, nil
+// reviewAllUsage returns a usage string prefixed with the parse error.
+func reviewAllUsage(err error) string {
+	return fmt.Sprintf("⚠️ %v\n\nUsage: `/scantrace review-all [--limit N] [--since 24h] "+
+		"[--severity red,yellow,green] [--exclude-wan-only] [--dedupe]`", err)
 }
 
-// parseFlexDuration parses a Go duration but additionally understands day (d)
-// and week (w) suffixes, e.g. "7d" or "2w", which time.ParseDuration rejects.
-func parseFlexDuration(s string) (time.Duration, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, fmt.Errorf("empty duration")
-	}
-	last := s[len(s)-1]
-	if last == 'd' || last == 'D' || last == 'w' || last == 'W' {
-		n, err := strconv.ParseFloat(s[:len(s)-1], 64)
-		if err != nil {
-			return 0, err
-		}
-		unit := 24 * time.Hour
-		if last == 'w' || last == 'W' {
-			unit = 7 * 24 * time.Hour
-		}
-		return time.Duration(n * float64(unit)), nil
-	}
-	return time.ParseDuration(s)
-}
-
-// parseBoolValue interprets an optional boolean flag value. A bare flag (no
-// value) is treated as true.
-func parseBoolValue(hasVal bool, val string) (bool, error) {
-	if !hasVal {
-		return true, nil
-	}
-	switch strings.ToLower(strings.TrimSpace(val)) {
-	case "true", "1", "yes", "y", "on":
-		return true, nil
-	case "false", "0", "no", "n", "off":
-		return false, nil
-	default:
-		return false, fmt.Errorf("invalid boolean %q", val)
-	}
-}
-
-// parseReviewAllFlags parses order-agnostic flags for /scantrace review-all.
-// It supports both --k=v and --k v forms. On error it returns a short message
-// that already includes the usage hint.
-func parseReviewAllFlags(args []string) (reviewAllFlags, error) {
-	f := reviewAllFlags{severities: map[string]bool{}}
+// parseReviewAllFlags parses order-agnostic flags. It accepts both `--k=v` and
+// `--k v` forms plus the boolean flags `--exclude-wan-only` and `--dedupe`.
+func parseReviewAllFlags(args []string) (reviewAllOpts, error) {
+	var o reviewAllOpts
 	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if !strings.HasPrefix(arg, "--") {
-			return f, fmt.Errorf("unexpected argument %q\n%s", arg, reviewAllUsage)
+		a := args[i]
+		if !strings.HasPrefix(a, "--") {
+			return o, fmt.Errorf("unexpected argument %q", a)
 		}
-		key := strings.TrimPrefix(arg, "--")
+		key := strings.TrimPrefix(a, "--")
 		val := ""
 		hasVal := false
 		if idx := strings.Index(key, "="); idx >= 0 {
@@ -122,301 +71,287 @@ func parseReviewAllFlags(args []string) (reviewAllFlags, error) {
 			key = key[:idx]
 			hasVal = true
 		}
-		takeVal := func() (string, error) {
-			if hasVal {
-				return val, nil
-			}
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
-				i++
-				return args[i], nil
-			}
-			return "", fmt.Errorf("flag --%s requires a value\n%s", key, reviewAllUsage)
+		key = strings.ToLower(key)
+
+		// Boolean flags (value is optional).
+		switch key {
+		case "exclude-wan-only":
+			o.excludeWANOnly = !hasVal || parseBoolFlag(val)
+			continue
+		case "dedupe":
+			o.dedupe = !hasVal || parseBoolFlag(val)
+			continue
 		}
+
+		// Value flags: consume the next token when not given as --k=v.
+		if !hasVal {
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("flag --%s requires a value", key)
+			}
+			i++
+			val = args[i]
+		}
+
 		switch key {
 		case "limit":
-			v, err := takeVal()
-			if err != nil {
-				return f, err
+			n, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || n < 1 || n > 200 {
+				return o, fmt.Errorf("invalid --limit %q (must be an integer 1..200)", val)
 			}
-			n, err := strconv.Atoi(strings.TrimSpace(v))
-			if err != nil || n <= 0 {
-				return f, fmt.Errorf("invalid --limit %q (must be a positive integer)\n%s", v, reviewAllUsage)
-			}
-			if n > 200 {
-				n = 200
-			}
-			f.limit, f.limitSet = n, true
+			o.limit = n
+			o.limitSet = true
 		case "since":
-			v, err := takeVal()
-			if err != nil {
-				return f, err
-			}
-			d, err := parseFlexDuration(v)
+			d, err := parseFlexDuration(val)
 			if err != nil || d <= 0 {
-				return f, fmt.Errorf("invalid --since %q (use e.g. 24h, 48h, 7d)\n%s", v, reviewAllUsage)
+				return o, fmt.Errorf("invalid --since %q (use a duration like 24h, 48h, 7d)", val)
 			}
-			f.since, f.sinceRaw, f.sinceSet = d, strings.TrimSpace(v), true
+			o.since = d
+			o.sinceSet = true
+			o.sinceRaw = val
 		case "severity":
-			v, err := takeVal()
+			sevs, err := normalizeSeverities(val)
 			if err != nil {
-				return f, err
+				return o, err
 			}
-			sevs, err := normalizeSeverities(v)
-			if err != nil {
-				return f, fmt.Errorf("%v\n%s", err, reviewAllUsage)
-			}
-			f.severities, f.severitySet = sevs, true
-		case "exclude-wan-only":
-			b, err := parseBoolValue(hasVal, val)
-			if err != nil {
-				return f, fmt.Errorf("invalid --exclude-wan-only %q\n%s", val, reviewAllUsage)
-			}
-			f.excludeWANOnly = b
-		case "dedupe":
-			b, err := parseBoolValue(hasVal, val)
-			if err != nil {
-				return f, fmt.Errorf("invalid --dedupe %q\n%s", val, reviewAllUsage)
-			}
-			f.dedupe = b
+			o.severities = sevs
+			o.severitySet = true
+			o.severityRaw = val
 		default:
-			return f, fmt.Errorf("unknown flag --%s\n%s", key, reviewAllUsage)
+			return o, fmt.Errorf("unknown flag --%s", key)
 		}
 	}
-	return f, nil
+	return o, nil
 }
 
-// caseFacts is the flattened, filter-ready view of a case derived from its
-// events. Building it once keeps the filter helpers pure and testable.
-type caseFacts struct {
-	c        *db.Case
-	srcIP    string
-	dstNorm  string // "WAN_EDGE" when the case is WAN-only, else the internal dst IP
-	dstPort  int
-	protocol string
-	label    string // signature/label (case title)
-	lastSeen time.Time
-	severity string // canonical colour
-	wanOnly  bool
+// parseBoolFlag interprets common truthy/falsey tokens. Anything that is not an
+// explicit falsey value is treated as true.
+func parseBoolFlag(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "false", "0", "no", "n", "off":
+		return false
+	default:
+		return true
+	}
 }
 
-// caseEvents loads the events referenced by a case, skipping any that fail to
-// load. Kept separate so the filter helpers can be exercised without a DB.
-func (h *Handler) caseEvents(c *db.Case) []*db.Event {
-	out := make([]*db.Event, 0, len(c.RelatedEventIDs))
+// parseFlexDuration parses a Go duration, additionally supporting a trailing
+// "d" (days) or "w" (weeks) suffix (e.g. 7d, 2w) which time.ParseDuration does
+// not understand.
+func parseFlexDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return d, nil
+	}
+	unit := s[len(s)-1]
+	switch unit {
+	case 'd', 'D', 'w', 'W':
+		numPart := strings.TrimSpace(s[:len(s)-1])
+		n, err := strconv.ParseFloat(numPart, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration %q", s)
+		}
+		hours := 24.0
+		if unit == 'w' || unit == 'W' {
+			hours = 24.0 * 7.0
+		}
+		return time.Duration(n * hours * float64(time.Hour)), nil
+	}
+	return 0, fmt.Errorf("invalid duration %q", s)
+}
+
+// normalizeSeverities parses a comma/space separated list of severities. Color
+// aliases red/yellow/green map to high/medium/low; the canonical names are also
+// accepted. The result is keyed on the canonical high/medium/low values.
+func normalizeSeverities(raw string) (map[string]bool, error) {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("invalid --severity %q (expected e.g. red,yellow,green)", raw)
+	}
+	out := make(map[string]bool)
+	for _, f := range fields {
+		switch strings.ToLower(strings.TrimSpace(f)) {
+		case "red", "high":
+			out["high"] = true
+		case "yellow", "amber", "medium", "med":
+			out["medium"] = true
+		case "green", "low":
+			out["low"] = true
+		default:
+			return nil, fmt.Errorf("invalid severity %q (use red/yellow/green or high/medium/low)", f)
+		}
+	}
+	return out, nil
+}
+
+// caseLatestEventTime returns the most recent event timestamp for a case. The
+// boolean is false when no event carries a usable timestamp.
+func (h *Handler) caseLatestEventTime(c *db.Case) (time.Time, bool) {
+	var latest time.Time
+	found := false
 	for _, id := range c.RelatedEventIDs {
 		evt, err := h.store.GetEvent(id)
 		if err != nil || evt == nil {
 			continue
 		}
-		out = append(out, evt)
-	}
-	return out
-}
-
-// eventTime returns the most recent timestamp recorded on an event, preferring
-// LastSeen and falling back to Timestamp.
-func eventTime(e *db.Event) time.Time {
-	t := e.LastSeen
-	if e.Timestamp.After(t) {
-		t = e.Timestamp
-	}
-	return t
-}
-
-// caseLastSeen returns the latest observed time across a case's events. It
-// returns the zero time when no event carries a usable timestamp.
-func caseLastSeen(events []*db.Event) time.Time {
-	var latest time.Time
-	for _, e := range events {
-		if t := eventTime(e); t.After(latest) {
-			latest = t
+		t := evt.Timestamp
+		if t.IsZero() {
+			t = evt.LastSeen
 		}
-	}
-	return latest
-}
-
-// isWANOnlyEvents reports whether every event in a case targets the WAN edge
-// (no internal target). It reuses the existing classifyDst logic.
-func (h *Handler) isWANOnlyEvents(events []*db.Event) bool {
-	if len(events) == 0 {
-		return false
-	}
-	for _, e := range events {
-		if _, edge := h.classifyDst(e.DstIP, e.EventType); !edge {
-			return false
-		}
-	}
-	return true
-}
-
-// isWANOnly reports whether a case only involves WAN-edge probes.
-func (h *Handler) isWANOnly(c *db.Case) bool {
-	return h.isWANOnlyEvents(h.caseEvents(c))
-}
-
-// caseFactsFromEvents flattens a case + its events into a caseFacts value.
-func (h *Handler) caseFactsFromEvents(c *db.Case, events []*db.Event) caseFacts {
-	f := caseFacts{
-		c:        c,
-		label:    c.Title,
-		severity: colorForSeverity(c.Severity),
-		lastSeen: caseLastSeen(events),
-		wanOnly:  h.isWANOnlyEvents(events),
-	}
-	for _, e := range events {
-		if f.srcIP == "" && e.SrcIP != "" {
-			f.srcIP = e.SrcIP
-		}
-		if f.dstPort == 0 && e.DstPort > 0 {
-			f.dstPort = e.DstPort
-		}
-		if f.protocol == "" && e.Protocol != "" {
-			f.protocol = e.Protocol
-		}
-	}
-	if f.srcIP == "" && c.SrcIP != "" {
-		f.srcIP = c.SrcIP
-	}
-	if f.wanOnly {
-		f.dstNorm = "WAN_EDGE"
-	} else {
-		for _, e := range events {
-			if e.DstIP != "" && e.DstIP != h.wanIP {
-				f.dstNorm = e.DstIP
-				break
-			}
-		}
-	}
-	return f
-}
-
-// dedupeKey builds the de-duplication key from src_ip, normalized destination,
-// dst_port, protocol, and signature/label.
-func (f caseFacts) dedupeKey() string {
-	return strings.Join([]string{
-		f.srcIP,
-		f.dstNorm,
-		strconv.Itoa(f.dstPort),
-		strings.ToLower(f.protocol),
-		strings.ToLower(f.label),
-	}, "|")
-}
-
-// filterBySeverity keeps only cases whose colour is in allowed. An empty set
-// means "no filter".
-func filterBySeverity(facts []caseFacts, allowed map[string]bool) []caseFacts {
-	if len(allowed) == 0 {
-		return facts
-	}
-	out := make([]caseFacts, 0, len(facts))
-	for _, f := range facts {
-		if allowed[f.severity] {
-			out = append(out, f)
-		}
-	}
-	return out
-}
-
-// filterBySince keeps cases whose last-seen time is at or after cutoff. Cases
-// with no timestamp are retained (filter skipped).
-func filterBySince(facts []caseFacts, cutoff time.Time) []caseFacts {
-	out := make([]caseFacts, 0, len(facts))
-	for _, f := range facts {
-		if f.lastSeen.IsZero() || !f.lastSeen.Before(cutoff) {
-			out = append(out, f)
-		}
-	}
-	return out
-}
-
-// filterExcludeWANOnly drops cases that only involve WAN-edge probes.
-func filterExcludeWANOnly(facts []caseFacts) []caseFacts {
-	out := make([]caseFacts, 0, len(facts))
-	for _, f := range facts {
-		if !f.wanOnly {
-			out = append(out, f)
-		}
-	}
-	return out
-}
-
-// dedupeCases collapses similar cases by dedupeKey, keeping the most recent by
-// last-seen timestamp. Original ordering of surviving entries is preserved.
-func dedupeCases(facts []caseFacts) []caseFacts {
-	seen := make(map[string]int)
-	out := make([]caseFacts, 0, len(facts))
-	for _, f := range facts {
-		k := f.dedupeKey()
-		if idx, ok := seen[k]; ok {
-			if f.lastSeen.After(out[idx].lastSeen) {
-				out[idx] = f
-			}
+		if t.IsZero() {
 			continue
 		}
-		seen[k] = len(out)
-		out = append(out, f)
+		if !found || t.After(latest) {
+			latest = t
+			found = true
+		}
 	}
-	return out
+	return latest, found
 }
 
-// applyReviewFilters applies the configured filters in a deterministic order:
-// severity, since, exclude-wan-only, dedupe, then the limit.
-func applyReviewFilters(facts []caseFacts, f reviewAllFlags, now time.Time) []caseFacts {
-	out := facts
-	if f.severitySet {
-		out = filterBySeverity(out, f.severities)
+// caseRecency returns a best-effort recency timestamp for ordering, falling
+// back to the case update/create time when events lack timestamps.
+func (h *Handler) caseRecency(c *db.Case) time.Time {
+	if t, ok := h.caseLatestEventTime(c); ok {
+		return t
 	}
-	if f.sinceSet {
-		out = filterBySince(out, now.Add(-f.since))
+	if !c.UpdatedAt.IsZero() {
+		return c.UpdatedAt
 	}
-	if f.excludeWANOnly {
-		out = filterExcludeWANOnly(out)
+	return c.CreatedAt
+}
+
+// caseIsWANOnly reports whether every event in the case only involves the WAN
+// edge (reusing classifyDst). A case with no resolvable events is not WAN-only.
+func (h *Handler) caseIsWANOnly(c *db.Case) bool {
+	n := 0
+	for _, id := range c.RelatedEventIDs {
+		evt, err := h.store.GetEvent(id)
+		if err != nil || evt == nil {
+			continue
+		}
+		if _, isEdge := h.classifyDst(evt.DstIP, evt.EventType); !isEdge {
+			return false
+		}
+		n++
 	}
-	if f.dedupe {
-		out = dedupeCases(out)
+	return n > 0
+}
+
+// caseDedupeKey builds a de-duplication key from a case: src_ip, normalized
+// destination (WAN_EDGE for WAN-only cases), dst_port, and protocol when
+// available.
+func (h *Handler) caseDedupeKey(c *db.Case) string {
+	wanOnly := h.caseIsWANOnly(c)
+	src := c.SrcIP
+	var dst, proto string
+	var port int
+	for _, id := range c.RelatedEventIDs {
+		evt, err := h.store.GetEvent(id)
+		if err != nil || evt == nil {
+			continue
+		}
+		if src == "" {
+			src = evt.SrcIP
+		}
+		if dst == "" && evt.DstIP != "" {
+			dst = evt.DstIP
+		}
+		if port == 0 && evt.DstPort > 0 {
+			port = evt.DstPort
+		}
+		if proto == "" {
+			proto = evt.Protocol
+		}
 	}
+	normDst := dst
+	if wanOnly {
+		normDst = "WAN_EDGE"
+	}
+	return fmt.Sprintf("%s|%s|%d|%s",
+		strings.ToLower(src), strings.ToLower(normDst), port, strings.ToLower(proto))
+}
+
+// filterReviewCases applies severity, since, exclude-wan-only and dedupe
+// filters, then enforces the limit (defaulting to 50 when none was supplied).
+func (h *Handler) filterReviewCases(cases []*db.Case, o reviewAllOpts) []*db.Case {
+	out := cases
+
+	if o.severitySet {
+		var kept []*db.Case
+		for _, c := range out {
+			if o.severities[strings.ToLower(c.Severity)] {
+				kept = append(kept, c)
+			}
+		}
+		out = kept
+	}
+
+	if o.sinceSet {
+		cutoff := time.Now().Add(-o.since)
+		var kept []*db.Case
+		for _, c := range out {
+			t, ok := h.caseLatestEventTime(c)
+			// Skip the time filter when timestamps are missing.
+			if !ok || !t.Before(cutoff) {
+				kept = append(kept, c)
+			}
+		}
+		out = kept
+	}
+
+	if o.excludeWANOnly {
+		var kept []*db.Case
+		for _, c := range out {
+			if !h.caseIsWANOnly(c) {
+				kept = append(kept, c)
+			}
+		}
+		out = kept
+	}
+
+	if o.dedupe {
+		out = h.dedupeCases(out)
+	}
+
 	limit := 50
-	if f.limitSet {
-		limit = f.limit
+	if o.limitSet {
+		limit = o.limit
 	}
-	if len(out) > limit {
+	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
 	return out
 }
 
-// severityListForDisplay returns the selected colours in canonical order.
-func severityListForDisplay(set map[string]bool) []string {
-	var out []string
-	for _, c := range severityColors {
-		if set[c] {
+// dedupeCases collapses cases sharing a dedupe key, keeping the most recent one
+// per key while preserving the original ordering of the surviving cases.
+func (h *Handler) dedupeCases(cases []*db.Case) []*db.Case {
+	type rec struct {
+		idx int
+		t   time.Time
+	}
+	best := make(map[string]rec)
+	for i, c := range cases {
+		k := h.caseDedupeKey(c)
+		t := h.caseRecency(c)
+		if b, ok := best[k]; !ok || t.After(b.t) {
+			best[k] = rec{idx: i, t: t}
+		}
+	}
+	winners := make(map[int]bool, len(best))
+	for _, b := range best {
+		winners[b.idx] = true
+	}
+	var out []*db.Case
+	for i, c := range cases {
+		if winners[i] {
 			out = append(out, c)
 		}
 	}
 	return out
-}
-
-// reviewFilterReason produces a concise description of the active filters for
-// the "no cases match" reply.
-func reviewFilterReason(f reviewAllFlags) string {
-	var parts []string
-	if f.severitySet {
-		parts = append(parts, "severity="+strings.Join(severityListForDisplay(f.severities), ","))
-	}
-	if f.sinceSet {
-		parts = append(parts, "since="+f.sinceRaw)
-	}
-	if f.excludeWANOnly {
-		parts = append(parts, "exclude-wan-only")
-	}
-	if f.dedupe {
-		parts = append(parts, "dedupe")
-	}
-	if f.limitSet {
-		parts = append(parts, fmt.Sprintf("limit=%d", f.limit))
-	}
-	if len(parts) == 0 {
-		return "No cases match the given filters."
-	}
-	return "No cases match " + strings.Join(parts, " ")
 }
