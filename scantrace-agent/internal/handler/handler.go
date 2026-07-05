@@ -5,12 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Risen24x7/scantrace/internal/casebuilder"
 	"github.com/Risen24x7/scantrace/internal/db"
@@ -19,7 +17,6 @@ import (
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/portintel"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/threat"
-	"github.com/google/uuid"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -323,18 +320,6 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 		h.cmdPostLatestAlert(cmd.ChannelID)
 	case "devices":
 		h.cmdDevices(cmd.ChannelID, cmd.UserID)
-	case "adddevice":
-		h.cmdAddDevice(cmd.ChannelID, cmd.UserID, parts[1:])
-	case "removedevice":
-		if len(parts) < 2 {
-			h.postEphemeral(cmd.ChannelID, cmd.UserID, "Usage: `/scantrace removedevice <ip>`")
-			return
-		}
-		h.cmdRemoveDevice(cmd.ChannelID, cmd.UserID, parts[1])
-	case "review-all":
-		h.cmdReviewAll(cmd.ChannelID, cmd.UserID)
-	case "next":
-		h.cmdNext(cmd.ChannelID, cmd.UserID)
 	case "port-trends":
 		h.cmdPortTrends(cmd.ChannelID, cmd.UserID, parts[1:])
 	case "mcp":
@@ -823,9 +808,13 @@ func (h *Handler) findPriorObservation(c *db.Case) (link, shortID string, count 
 		}
 		if matched {
 			count++
-			ts := h.caseThreads[pc.CaseID]
-			if ts != "" && link == "" {
-				if pl, err := h.api.GetPermalink(&slack.PermalinkParameters{Channel: h.alertChannel, Ts: ts}); err == nil {
+			// Read the thread timestamp under the mutex to avoid a data race
+			// with concurrent PostCaseAlert writers touching h.caseThreads.
+			h.mu.Lock()
+			threadTS := h.caseThreads[pc.CaseID]
+			h.mu.Unlock()
+			if threadTS != "" && link == "" {
+				if pl, err := h.api.GetPermalink(&slack.PermalinkParameters{Channel: h.alertChannel, Ts: threadTS}); err == nil {
 					link = pl
 					shortID = pc.CaseID[:8]
 				}
@@ -914,11 +903,7 @@ func helpText() string {
 /scantrace close <id>         — Mark a case closed
 /scantrace reopen <id>        — Reopen a closed case
 /scantrace alert              — Re-post the latest high/open case alert
-/scantrace next               — LLM briefing for the next highest-priority case
-/scantrace review-all         — Queue all open cases for LLM review
 /scantrace devices            — List the known device registry
-/scantrace adddevice <ip> [label="..."] [trust=trusted|unknown|suspicious] [suppress=true]
-/scantrace removedevice <ip>  — Remove a device from the registry
 /scantrace port-trends [days] — Perimeter port intelligence report (default: 7 days)
 /scantrace mcp                — Show MCP server info
 /scantrace status             — Show agent liveness and configuration summary
