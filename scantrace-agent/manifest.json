@@ -14,7 +14,7 @@
       {
         "command": "/scantrace",
         "description": "Query ScanTrace cases, devices, and perimeter intelligence",
-        "usage_hint": "[cases|report <id>|close <id>|reopen <id>|devices|port-trends|alert|status|mcp|help]",
+        "usage_hint": "[cases|report <id>|close <id>|reopen <id>|devices|adddevice|removedevice|port-trends|next|review-all|alert|status|mcp|help]",
         "should_escape": false
       }
     ]
