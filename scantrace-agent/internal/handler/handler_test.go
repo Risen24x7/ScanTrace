@@ -13,7 +13,7 @@ func TestSplitArgs(t *testing.T) {
 		{"", nil},
 		{"adddevice 192.168.1.2", []string{"adddevice", "192.168.1.2"}},
 		{"adddevice   192.168.1.2", []string{"adddevice", "192.168.1.2"}},
-		{"adddevice 192.168.1.2 label=\"Plex Server\" trust=suspicious", []string{"adddevice", "192.168.1.2", "label=\"Plex Server\"", "trust=suspicious"}},
+		{"adddevice 192.168.1.2 label=\"Plex Server\" trust=suspicious", []string{"adddevice", "192.168.1.2", "label=Plex Server", "trust=suspicious"}},
 	}
 	for _, c := range cases {
 		got := splitArgs(c.in)
@@ -39,7 +39,11 @@ func TestClassifyDst(t *testing.T) {
 	}
 	label, edge = h.classifyDst("10.0.0.5", "wan_forward")
 	if edge || label != "" {
-		t.Fatalf("expected non-edge for dst!=wanIP")
+		t.Fatalf("expected non-edge for wan_forward with dst!=wanIP")
+	}
+	label, edge = h.classifyDst("10.0.0.5", "other")
+	if edge || label != "" {
+		t.Fatalf("expected non-edge for default with dst!=wanIP")
 	}
 	label, edge = h.classifyDst("10.0.0.5", "wan_new_connection")
 	if !edge || label == "" {
