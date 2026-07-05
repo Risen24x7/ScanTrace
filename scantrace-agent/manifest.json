@@ -14,7 +14,7 @@
       {
         "command": "/scantrace",
         "description": "Query ScanTrace cases, devices, and perimeter intelligence",
-        "usage_hint": "[cases|report <id>|close <id>|reopen <id>|devices|adddevice|removedevice|port-trends|next|review-all|alert|mcp|help]",
+        "usage_hint": "[cases|report <id>|close <id>|reopen <id>|devices|adddevice|removedevice|port-trends|next|review-all|export-blocklist|alert|status|mcp|help] · review-all [--limit N] [--since 24h] [--severity red,yellow] [--exclude-wan-only] [--dedupe] · export-blocklist [--limit N] [--since 7d] [--severity red,yellow] [--wan-only] [--group-cidr] [--format txt|csv|ipset]",
         "should_escape": false
       }
     ]
