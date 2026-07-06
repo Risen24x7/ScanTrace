@@ -1,0 +1,38 @@
+name: Go CI
+
+on:
+  push:
+    branches: [ main, hackathon-final-20260713, feature/**, fix/** ]
+    paths:
+      - 'scantrace-agent/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/go-ci.yml'
+  pull_request:
+    branches: [ main, hackathon-final-20260713 ]
+    paths:
+      - 'scantrace-agent/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/go-ci.yml'
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build scantrace-agent
+        working-directory: scantrace-agent
+        run: go build -o scantrace-agent ./cmd/bot
+
+      - name: Run tests
+        working-directory: scantrace-agent
+        run: go test ./... -v
