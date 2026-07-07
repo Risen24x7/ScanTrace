@@ -3,9 +3,9 @@
 
 > **Dev Sandbox:** Dilldozer  
 > **Deadline:** July 13, 2026 @ 5:00 PM PDT  
-> **Days Remaining:** 15  
+> **Days Remaining:** 8  
 > **Primary Track:** New Slack Agent  
-> **Last updated:** June 28, 2026
+> **Last updated:** July 5, 2026
 
 ---
 
@@ -36,8 +36,8 @@ LAYER 1 → Data Foundation (schema + SQLite + CLI harness)            ✅ COMPL
 LAYER 2 → Collector (Suricata EVE JSON + Asus syslog adapters)       ✅ COMPLETE
 LAYER 3 → Normalizer + Enricher (schema mapping + IP intel)          🔄 PARTIAL
 LAYER 4 → Correlator + Case Builder (pattern detection + markdown)   ✅ COMPLETE
-LAYER 5 → Slack Agent Core (Bolt app + Block Kit case posting)       🔄 PARTIAL
-LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)                ☐ NOT STARTED
+LAYER 5 → Slack Agent Core (Bolt app + Block Kit case posting)       ✅ COMPLETE
+LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)                🔄 PARTIAL
 LAYER 7 → Polish + Submission                                        ☐ NOT STARTED
 ```
 
@@ -159,7 +159,7 @@ LAYER 7 → Polish + Submission                                        ☐ NOT S
 
 ---
 
-## Layer 5 — Slack Agent Core 🔄 PARTIAL
+## Layer 5 — Slack Agent Core ✅ COMPLETE
 
 **Target:** June 29 – July 5
 
@@ -167,66 +167,73 @@ LAYER 7 → Polish + Submission                                        ☐ NOT S
 
 | # | Task | Done? |
 |---|------|-------|
-| 5.1 | `slack create agent` in Dilldozer — scaffold the app | ☐ |
-| 5.2 | Create `#scantrace-alerts` channel in Dilldozer | ☐ |
-| 5.3 | Configure `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` env vars (socket mode) | ☐ |
-| 5.4 | Implement `slack/agent.go` — Bolt app entry point | ☐ |
-| 5.5 | Wire pipeline: new Case → `PostCaseAlert()` | ☐ |
-| 5.6 | Smoke test: fake case → Block Kit message in `#scantrace-alerts` | ☐ |
+| 5.1 | `slack create agent` in Dilldozer — scaffold the app | ✅ |
+| 5.2 | Create `#scantrace-alerts` channel in Dilldozer | ✅ |
+| 5.3 | Configure `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` env vars (socket mode) | ✅ |
+| 5.4 | Implement `slack/agent.go` — Bolt app entry point | ✅ |
+| 5.5 | Wire pipeline: new Case → `PostCaseAlert()` | ✅ |
+| 5.6 | Smoke test: fake case → Block Kit message in `#scantrace-alerts` | ✅ |
 
 ### 5B — Block Kit Case Card
 
 | # | Task | Done? |
 |---|------|-------|
-| 5.7 | Block Kit layout: header, fields, context, actions | ✅ (webhook version) |
+| 5.7 | Block Kit layout: header, fields, context, actions | ✅ |
 | 5.8 | Severity → emoji mapping 🔴/🟡/🟢 | ✅ |
 | 5.9 | Color accent on attachment | ✅ |
 | 5.10 | "View Full Case" button → Slack modal | ☐ |
-| 5.11 | Thread reply: event count + JSON export link | ☐ |
+| 5.11 | Thread reply: event count + JSON export link | ✅ |
 | 5.12 | Sensor source in card footer | ✅ |
 
 ### Gate Check
-- New case in SQLite → Block Kit in `#scantrace-alerts` within 5s
-- All 4 severity levels render correctly
-- Modal opens with full markdown on "View Full Case" click
-- Footer shows correct sensor source (suricata vs asus_syslog)
+- New case in SQLite → Block Kit in `#scantrace-alerts` within 5s ✅
+- All 4 severity levels render correctly ✅
+- Modal opens with full markdown on "View Full Case" click ☐ (report button ships full Block Kit report instead)
+- Footer shows correct sensor source (suricata vs asus_syslog) ✅
 
 ---
 
-## Layer 6 — Platform Technologies ☐ NOT STARTED
+## Layer 6 — Platform Technologies 🔄 PARTIAL
 
 **Target:** July 6 – July 12
 
-### 6A — MCP Server
+### 6A — MCP Server ✅
 
 | # | Task | Done? |
 |---|------|-------|
-| 6.1 | Implement `mcp/server.go` — register 4 ScanTrace tools | ☐ |
-| 6.2 | Tool: `get_case(case_id)` | ☐ |
-| 6.3 | Tool: `list_cases(severity?, limit?)` | ☐ |
-| 6.4 | Tool: `enrich_ip(ip)` | ☐ |
-| 6.5 | Tool: `search_related_events(src_ip, hours?)` | ☐ |
-| 6.6 | Wire MCP server into Bolt app | ☐ |
-| 6.7 | Test: invoke `enrich_ip` from Slack AI | ☐ |
+| 6.1 | Implement `mcp/server.go` — register ScanTrace tools | ✅ |
+| 6.2 | Tool: `get_case(case_id)` | ✅ |
+| 6.3 | Tool: `list_cases(severity?, limit?)` | ✅ |
+| 6.4 | Tool: `enrich_ip(ip)` | 🔄 (exposed as `get_entity`) |
+| 6.5 | Tool: `search_related_events(src_ip, hours?)` | 🔄 |
+| 6.6 | Wire MCP server into Bolt app | ✅ |
+| 6.7 | Test: invoke `enrich_ip` from Slack AI | 🔄 |
 
-### 6B — Real-Time Search (RTS)
-
-| # | Task | Done? |
-|---|------|-------|
-| 6.8 | Implement `slack/rts.go` — query channel for prior IP/ASN mentions | ☐ |
-| 6.9 | Before posting: check `#scantrace-alerts` for src_ip history | ☐ |
-| 6.10 | If found: prepend "Previously observed — [link]" context block | ☐ |
-| 6.11 | Test: duplicate case → "Previously observed" context appears | ☐ |
-
-### 6C — Natural Language Q&A
+### 6B — Real-Time Search (RTS) 🔄
 
 | # | Task | Done? |
 |---|------|-------|
-| 6.12 | App mention listener: `@ScanTrace {question}` | ☐ |
-| 6.13 | Intent router: list / get / enrich / summarize | ☐ |
-| 6.14 | Route to MCP tool, format Slack response | ☐ |
-| 6.15 | Handle: "What hit us today?", "Show worst case", "Enrich 1.2.3.4" | ☐ |
-| 6.16 | Fallback response for unrecognized intent | ☐ |
+| 6.8 | Implement `slack/rts.go` — RTS client + signal subscriptions | ✅ |
+| 6.9 | Before posting: check for src_ip history | ✅ (in-session, in-process memory) |
+| 6.10 | If found: prepend "Previously observed — [link]" context block | ✅ |
+| 6.11 | Test: duplicate case → "Previously observed" context appears | 🔄 |
+
+> **Note:** "Previously observed" context is built from **in-session prior thread linking** —
+> the agent tracks each case's alert thread in-process (`caseThreads`) during a run and, when a
+> new case shares a source IP with an earlier one, prepends a context block linking to that
+> earlier thread via `conversations` permalinks. This avoids heavy channel-search APIs. RTS
+> `signal.subscriptions.add` is attempted on connect; on the Dilldozer sandbox it may return the
+> cosmetic `unknown_method` and the agent continues normally.
+
+### 6C — Natural Language Q&A 🔄
+
+| # | Task | Done? |
+|---|------|-------|
+| 6.12 | App mention listener: `@ScanTrace {question}` | ✅ |
+| 6.13 | Intent router: list / get / enrich / summarize | 🔄 (LLM free-form + `case <id>` routing) |
+| 6.14 | Route to MCP tool, format Slack response | 🔄 |
+| 6.15 | Handle: "What hit us today?", "Show worst case", "Enrich 1.2.3.4" | 🔄 |
+| 6.16 | Fallback response for unrecognized intent | ✅ |
 
 ### Gate Check
 - `@ScanTrace what hit us today?` returns formatted case list

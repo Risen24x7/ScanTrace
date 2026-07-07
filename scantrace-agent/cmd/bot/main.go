@@ -50,8 +50,8 @@ func main() {
 	}
 	defer store.Close()
 
-	rtsURL := os.Getenv("RTS_BASE_URL")
-	rtsClient := rts.New(rtsURL)
+	// RTS client uses the bot token for Authorization: Bearer <token>
+	rtsClient := rts.New(botToken)
 
 	// LLM configuration: expects an Ollama-compatible endpoint.
 	// For local development, defaults to localhost:11434.

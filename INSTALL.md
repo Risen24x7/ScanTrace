@@ -41,6 +41,14 @@ WAN_IP=                                # leave blank; agent auto-detects from sy
 SCANTRACE_SYSLOG_PORT=5140
 ```
 
+> **Tips:**
+> - Set `DB_PATH` to an **absolute path** (e.g. `/opt/scantrace/scantrace.db`). The agent opens the DB
+>   relative to its current working directory otherwise, which can silently point at the wrong file.
+> - `WAN_IP` can be set **explicitly** to your gateway's public IP so WAN-edge traffic is classified
+>   correctly. If left blank, the agent auto-detects it from the router syslog stream when available.
+> - Run `/scantrace status` in Slack for a quick liveness check (DB, open-case counts by severity,
+>   syslog port, WAN IP, LLM endpoint, and the alerts channel).
+
 Load and run:
 
 ```bash

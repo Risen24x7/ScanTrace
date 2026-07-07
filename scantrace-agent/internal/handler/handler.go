@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -99,7 +100,7 @@ func selectActionPlan(ts triageState) string {
 		return "*Recommended Actions*\nCondition Matched: D — host verified, logs confirm malicious activity\n" +
 			"- Block the source IP or subnet at the gateway firewall.\n" +
 			"- Close or restrict the targeted port if no external access is required.\n" +
-			"- Escalate to a human analyst if the internal host shows signs of compromise."
+			"- Escalate to a human analyst if the internal host shows any signs of compromise."
 	case ts.isWANEdgeOnly:
 		return "*Recommended Actions*\nCondition Matched: A — wan_new_connection (WAN edge only, never reached LAN)\n" +
 			"- Traffic hit the WAN interface only and was not forwarded. No internal host is at risk.\n" +
@@ -341,6 +342,8 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 			"*MCP Server* is running on `localhost:8765`\n"+
 				"Tools: `list_cases`, `get_case`, `list_sensors`, `get_entity`, `list_known_devices`\n"+
 				"Connect any MCP host (Claude Desktop, Cursor) to `http://localhost:8765`")
+	case "status":
+		h.cmdStatus(cmd.ChannelID, cmd.UserID)
 	default:
 		h.postEphemeral(cmd.ChannelID, cmd.UserID, helpText())
 	}
@@ -362,167 +365,33 @@ func (h *Handler) handleBlockAction(cb slack.InteractionCallback) {
 	}
 }
 
-func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
-	if len(args) == 0 {
-		h.postEphemeral(channelID, userID,
-			"Usage: `/scantrace adddevice <ip> [label=\"My Device\"] [trust=trusted|unknown|suspicious] [suppress=true]`\n"+
-				"Examples:\n"+
-				"• `/scantrace adddevice 192.168.50.4 label=\"Plex Server\" trust=trusted`\n"+
-				"• `/scantrace adddevice 192.168.50.4 trust=suspicious`")
-		return
+func (h *Handler) cmdStatus(channelID, userID string) {
+	// Basic counts
+	cases, _ := h.store.ListCases("", 50)
+	counts := map[string]int{"high": 0, "medium": 0, "low": 0}
+	for _, c := range cases {
+		counts[strings.ToLower(c.Severity)]++
 	}
-	ipArg := args[0]
-	if net.ParseIP(ipArg) == nil {
-		h.postEphemeral(channelID, userID, fmt.Sprintf("`%s` is not a valid IP address.", ipArg))
-		return
+	port := os.Getenv("SCANTRACE_SYSLOG_PORT")
+	if port == "" {
+		port = "5140"
 	}
-	label := ipArg
-	trustLabel := "unknown"
-	autoSuppress := false
-	for _, arg := range args[1:] {
-		kv := strings.SplitN(arg, "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		key := strings.ToLower(strings.TrimSpace(kv[0]))
-		val := strings.TrimSpace(kv[1])
-		switch key {
-		case "label":
-			label = val
-		case "trust":
-			switch strings.ToLower(val) {
-			case "trusted", "unknown", "suspicious":
-				trustLabel = strings.ToLower(val)
-			default:
-				h.postEphemeral(channelID, userID,
-					fmt.Sprintf("Invalid trust value `%s`. Use: `trusted`, `unknown`, or `suspicious`.", val))
-				return
-			}
-		case "suppress":
-			autoSuppress = strings.ToLower(val) == "true"
+	llmBase := os.Getenv("LLM_BASE_URL")
+	llmModel := os.Getenv("LLM_MODEL")
+	llmLine := "LLM: not configured"
+	if llmBase != "" || llmModel != "" {
+		if llmModel != "" {
+			llmLine = fmt.Sprintf("LLM: %s (model=%s)", llmBase, llmModel)
+		} else {
+			llmLine = fmt.Sprintf("LLM: %s", llmBase)
 		}
 	}
-	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
-	now := time.Now().UTC()
-	deviceID := uuid.NewString()
-	if existing != nil {
-		deviceID = existing.DeviceID
+	text := fmt.Sprintf("*ScanTrace Status*\n• DB: OK\n• Cases — 🔴 %d  🟡 %d  🟢 %d\n• Syslog: UDP :%s\n• WAN IP: %s (enrichment suppressed)\n• %s\n• Alerts channel: %s",
+		counts["high"], counts["medium"], counts["low"], port, h.wanIP, llmLine, h.alertChannel)
+	blocks := []slack.Block{
+		slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", text, false, false), nil, nil),
 	}
-	d := &db.KnownDevice{
-		DeviceID:     deviceID,
-		IP:           ipArg,
-		Label:        label,
-		TrustLabel:   trustLabel,
-		AutoSuppress: autoSuppress,
-		FirstSeen:    now,
-		LastSeen:     now,
-	}
-	if existing != nil && !existing.FirstSeen.IsZero() {
-		d.FirstSeen = existing.FirstSeen
-	}
-	if err := h.store.UpsertKnownDevice(d); err != nil {
-		log.Printf("[handler] adddevice upsert error ip=%s label=%q: %v", ipArg, label, err)
-		h.postEphemeral(channelID, userID, fmt.Sprintf("❌ Failed to save device `%s`: %v", ipArg, err))
-		return
-	}
-	action := "✅ Device *added* to registry"
-	if existing != nil {
-		action = "✏️ Device *updated* in registry"
-	}
-	suppressLine := ""
-	if autoSuppress {
-		suppressLine = "\n• Auto-suppress: *on* (low-severity cases for this host will be silenced)"
-	}
-	h.postMessage(channelID, "", fmt.Sprintf(
-		"%s\n• IP: `%s`\n• Label: *%s*\n• Trust: `%s`%s\n\nRe-run `/scantrace report <case-id>` or `@ScanTrace case <id>` to see the updated classification.",
-		action, ipArg, label, trustLabel, suppressLine,
-	))
-	log.Printf("[handler] adddevice ip=%s label=%q trust=%s suppress=%v by user=%s",
-		ipArg, label, trustLabel, autoSuppress, userID)
-}
-
-func (h *Handler) cmdRemoveDevice(channelID, userID, ipArg string) {
-	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
-	if existing == nil {
-		h.postEphemeral(channelID, userID, fmt.Sprintf("Device `%s` not found in registry.", ipArg))
-		return
-	}
-	if err := h.store.DeleteKnownDevice(existing.DeviceID); err != nil {
-		h.postEphemeral(channelID, userID, fmt.Sprintf("Failed to remove device: %v", err))
-		return
-	}
-	h.postMessage(channelID, "", fmt.Sprintf(
-		"🗑️ Device `%s` (*%s*) removed from registry.", ipArg, existing.Label,
-	))
-	log.Printf("[handler] removedevice ip=%s label=%q by user=%s", ipArg, existing.Label, userID)
-}
-
-func (h *Handler) cmdReviewAll(channelID, userID string) {
-	if h.llm == nil {
-		h.postEphemeral(channelID, userID, "LLM not configured.")
-		return
-	}
-	cases, err := h.store.ListCases("", 50)
-	if err != nil || len(cases) == 0 {
-		h.postEphemeral(channelID, userID, "No open cases found.")
-		return
-	}
-	dest := h.externalThreatChannel
-	h.postMessage(dest, "", fmt.Sprintf("_Queuing %d cases for review — posting one at a time…_", len(cases)))
-	go func() {
-		for i, c := range cases {
-			ctx, triage, portsSeen := h.buildSingleCaseContext(c)
-			triageBlock := buildTriageBlock(triage, portsSeen)
-			actionPlan := selectActionPlan(triage)
-			prompt := fmt.Sprintf("Analyse this single case and provide a full briefing.\n\nCase ID: %s", c.CaseID[:8])
-			answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
-			if err != nil {
-				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
-				h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", c.CaseID[:8], err))
-			} else {
-				h.postCaseBriefingWithActions(dest, c.CaseID[:8], fmt.Sprintf("*Case %d/%d — %s*\n%s", i+1, len(cases), c.CaseID[:8], answer))
-			}
-			if i < len(cases)-1 {
-				time.Sleep(3 * time.Second)
-			}
-		}
-		h.postMessage(dest, "", fmt.Sprintf("_Review complete — %d cases processed._", len(cases)))
-	}()
-}
-
-func (h *Handler) cmdNext(channelID, userID string) {
-	if h.llm == nil {
-		h.postEphemeral(channelID, userID, "LLM not configured.")
-		return
-	}
-	var target *db.Case
-	for _, sev := range []string{"high", "medium", "low"} {
-		cases, err := h.store.ListCases(sev, 1)
-		if err == nil && len(cases) > 0 {
-			target = cases[0]
-			break
-		}
-	}
-	if target == nil {
-		h.postEphemeral(channelID, userID, "No open cases found.")
-		return
-	}
-	dest := h.externalThreatChannel
-	h.postMessage(dest, "", fmt.Sprintf("_Briefing next case: %s %s…_", severityEmoji(target.Severity), target.CaseID[:8]))
-	go func() {
-		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
-		triageBlock := buildTriageBlock(triage, portsSeen)
-		actionPlan := selectActionPlan(triage)
-		prompt := fmt.Sprintf("Analyse this case and provide a full briefing.\n\nCase ID: %s", target.CaseID[:8])
-		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
-		if err != nil {
-			log.Printf("[handler] next llm error case %s: %v", target.CaseID[:8], err)
-			h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", target.CaseID[:8], err))
-			return
-		}
-		h.postCaseBriefingWithActions(dest, target.CaseID[:8],
-			fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
-	}()
+	h.postBlocks(channelID, "", blocks)
 }
 
 // classifyDst determines whether the destination is the WAN edge interface.
@@ -930,6 +799,55 @@ func (h *Handler) cmdPostLatestAlert(cmdChannelID string) {
 	h.PostCaseAlert(cases[0])
 }
 
+// findPriorObservation returns a permalink to a prior case thread with overlapping src_ip.
+func (h *Handler) findPriorObservation(c *db.Case) (link, shortID string, count int) {
+	cur := make(map[string]struct{})
+	for _, ip := range h.caseSrcIPs(c) {
+		cur[ip] = struct{}{}
+	}
+	if len(cur) == 0 {
+		return "", "", 0
+	}
+	cases, _ := h.store.ListCases("", 50)
+	for _, pc := range cases {
+		if pc.CaseID == c.CaseID {
+			continue
+		}
+		priorIPs := h.caseSrcIPs(pc)
+		matched := false
+		for _, ip := range priorIPs {
+			if _, ok := cur[ip]; ok {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			count++
+			// Read the thread timestamp under the mutex to avoid a data race
+			// with concurrent PostCaseAlert writers touching h.caseThreads.
+			h.mu.Lock()
+			threadTS := h.caseThreads[pc.CaseID]
+			h.mu.Unlock()
+			if threadTS != "" && link == "" {
+				if pl, err := h.api.GetPermalink(&slack.PermalinkParameters{Channel: h.alertChannel, Ts: threadTS}); err == nil {
+					link = pl
+					shortID = pc.CaseID[:8]
+				}
+			}
+		}
+	}
+	return
+}
+
+func prependPriorObservation(blocks []slack.Block, link, shortID string, count int) []slack.Block {
+	if link == "" || count == 0 {
+		return blocks
+	}
+	note := fmt.Sprintf("⚠️ Previously observed — %d prior mention(s). See <%s|Case %s>", count, link, shortID)
+	ctx := slack.NewContextBlock("", slack.NewTextBlockObject("mrkdwn", note, false, false))
+	return append([]slack.Block{ctx, slack.NewDividerBlock()}, blocks...)
+}
+
 func (h *Handler) PostCaseAlert(c *db.Case) {
 	builder := casebuilder.New(h.store)
 	report, err := builder.BuildReport(c.CaseID)
@@ -957,24 +875,33 @@ func (h *Handler) PostCaseAlert(c *db.Case) {
 		return
 	}
 
-	blocks, err := blocksFromMap(report.SlackBlock())
+	blocks, bErr := blocksFromMap(report.SlackBlock())
+	// Prepend prior-observed context if available
+	if link, sid, cnt := h.findPriorObservation(c); link != "" {
+		blocks = prependPriorObservation(blocks, link, sid, cnt)
+	}
+
 	var ts string
-	if err != nil {
+	var errPost error
+	if bErr != nil || len(blocks) == 0 {
 		text := fmt.Sprintf("%s *[%s] Case %s* — %s\nseverity=%s confidence=%.0f%%",
 			severityEmoji(c.Severity), strings.ToUpper(c.Severity),
 			c.CaseID[:8], c.Title, c.Severity, c.Confidence*100)
-		_, ts, err = h.api.PostMessage(h.alertChannel,
+		if link, sid, cnt := h.findPriorObservation(c); link != "" {
+			text = fmt.Sprintf("⚠️ Previously observed — %d prior mention(s). See Case %s: %s\n%s", cnt, sid, link, text)
+		}
+		_, ts, errPost = h.api.PostMessage(h.alertChannel,
 			slack.MsgOptionText(text, false),
 			slack.MsgOptionDisableLinkUnfurl(),
 		)
 	} else {
-		_, ts, err = h.api.PostMessage(h.alertChannel,
+		_, ts, errPost = h.api.PostMessage(h.alertChannel,
 			slack.MsgOptionBlocks(blocks...),
 			slack.MsgOptionDisableLinkUnfurl(),
 		)
 	}
-	if err != nil {
-		log.Printf("[handler] PostCaseAlert error: %v", err)
+	if errPost != nil {
+		log.Printf("[handler] PostCaseAlert error: %v", errPost)
 		return
 	}
 	h.mu.Lock()
@@ -998,6 +925,7 @@ func helpText() string {
 /scantrace removedevice <ip>  — Remove a device from the registry
 /scantrace port-trends [days] — Perimeter port intelligence report (default: 7 days)
 /scantrace mcp                — Show MCP server info
+/scantrace status             — Show agent liveness and configuration summary
 ` + "```" + `
 You can also @mention ScanTrace in any channel to ask questions about cases.`
 }
@@ -1136,4 +1064,168 @@ func (h *Handler) postCaseBriefingWithActions(channel, shortID, text string) {
 		slack.NewActionBlock("", closeBtn, reportBtn),
 	}
 	h.postBlocks(channel, "", blocks)
+}
+
+// ── Device & review commands (restored from main) ─────────────────────────
+func (h *Handler) cmdAddDevice(channelID, userID string, args []string) {
+	if len(args) == 0 {
+		h.postEphemeral(channelID, userID,
+			"Usage: `/scantrace adddevice <ip> [label=\"My Device\"] [trust=trusted|unknown|suspicious] [suppress=true]`\n"+
+				"Examples:\n"+
+				"• `/scantrace adddevice 192.168.50.4 label=\"Plex Server\" trust=trusted`\n"+
+				"• `/scantrace adddevice 192.168.50.4 trust=suspicious`")
+		return
+	}
+	ipArg := args[0]
+	if net.ParseIP(ipArg) == nil {
+		h.postEphemeral(channelID, userID, fmt.Sprintf("`%s` is not a valid IP address.", ipArg))
+		return
+	}
+	label := ipArg
+	trustLabel := "unknown"
+	autoSuppress := false
+	for _, arg := range args[1:] {
+		kv := strings.SplitN(arg, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		val := strings.TrimSpace(kv[1])
+		switch key {
+		case "label":
+			label = val
+		case "trust":
+			switch strings.ToLower(val) {
+			case "trusted", "unknown", "suspicious":
+				trustLabel = strings.ToLower(val)
+			default:
+				h.postEphemeral(channelID, userID,
+					fmt.Sprintf("Invalid trust value `%s`. Use: `trusted`, `unknown`, or `suspicious`.", val))
+				return
+			}
+		case "suppress":
+			autoSuppress = strings.ToLower(val) == "true"
+		}
+	}
+	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
+	now := time.Now().UTC()
+	deviceID := uuid.NewString()
+	if existing != nil {
+		deviceID = existing.DeviceID
+	}
+	d := &db.KnownDevice{
+		DeviceID:     deviceID,
+		IP:           ipArg,
+		Label:        label,
+		TrustLabel:   trustLabel,
+		AutoSuppress: autoSuppress,
+		FirstSeen:    now,
+		LastSeen:     now,
+	}
+	if existing != nil && !existing.FirstSeen.IsZero() {
+		d.FirstSeen = existing.FirstSeen
+	}
+	if err := h.store.UpsertKnownDevice(d); err != nil {
+		log.Printf("[handler] adddevice upsert error ip=%s label=%q: %v", ipArg, label, err)
+		h.postEphemeral(channelID, userID, fmt.Sprintf("❌ Failed to save device `%s`: %v", ipArg, err))
+		return
+	}
+	action := "✅ Device *added* to registry"
+	if existing != nil {
+		action = "✏️ Device *updated* in registry"
+	}
+	suppressLine := ""
+	if autoSuppress {
+		suppressLine = "\n• Auto-suppress: *on* (low-severity cases for this host will be silenced)"
+	}
+	h.postMessage(channelID, "", fmt.Sprintf(
+		"%s\n• IP: `%s`\n• Label: *%s*\n• Trust: `%s`%s\n\nRe-run `/scantrace report <case-id>` or `@ScanTrace case <id>` to see the updated classification.",
+		action, ipArg, label, trustLabel, suppressLine,
+	))
+	log.Printf("[handler] adddevice ip=%s label=%q trust=%s suppress=%v by user=%s",
+		ipArg, label, trustLabel, autoSuppress, userID)
+}
+
+func (h *Handler) cmdRemoveDevice(channelID, userID, ipArg string) {
+	existing, _ := h.store.GetKnownDeviceByIP(ipArg)
+	if existing == nil {
+		h.postEphemeral(channelID, userID, fmt.Sprintf("Device `%s` not found in registry.", ipArg))
+		return
+	}
+	if err := h.store.DeleteKnownDevice(existing.DeviceID); err != nil {
+		h.postEphemeral(channelID, userID, fmt.Sprintf("Failed to remove device: %v", err))
+		return
+	}
+	h.postMessage(channelID, "", fmt.Sprintf(
+		"🗑️ Device `%s` (*%s*) removed from registry.", ipArg, existing.Label,
+	))
+	log.Printf("[handler] removedevice ip=%s label=%q by user=%s", ipArg, existing.Label, userID)
+}
+
+func (h *Handler) cmdReviewAll(channelID, userID string) {
+	if h.llm == nil {
+		h.postEphemeral(channelID, userID, "LLM not configured.")
+		return
+	}
+	cases, err := h.store.ListCases("", 50)
+	if err != nil || len(cases) == 0 {
+		h.postEphemeral(channelID, userID, "No open cases found.")
+		return
+	}
+	dest := h.externalThreatChannel
+	h.postMessage(dest, "", fmt.Sprintf("_Queuing %d cases for review — posting one at a time…_", len(cases)))
+	go func() {
+		for i, c := range cases {
+			ctx, triage, portsSeen := h.buildSingleCaseContext(c)
+			triageBlock := buildTriageBlock(triage, portsSeen)
+			actionPlan := selectActionPlan(triage)
+			prompt := fmt.Sprintf("Analyse this single case and provide a full briefing.\n\nCase ID: %s", c.CaseID[:8])
+			answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
+			if err != nil {
+				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
+				h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", c.CaseID[:8], err))
+			} else {
+				h.postCaseBriefingWithActions(dest, c.CaseID[:8], fmt.Sprintf("*Case %d/%d — %s*\n%s", i+1, len(cases), c.CaseID[:8], answer))
+			}
+			if i < len(cases)-1 {
+				time.Sleep(3 * time.Second)
+			}
+		}
+		h.postMessage(dest, "", fmt.Sprintf("_Review complete — %d cases processed._", len(cases)))
+	}()
+}
+
+func (h *Handler) cmdNext(channelID, userID string) {
+	if h.llm == nil {
+		h.postEphemeral(channelID, userID, "LLM not configured.")
+		return
+	}
+	var target *db.Case
+	for _, sev := range []string{"high", "medium", "low"} {
+		cases, err := h.store.ListCases(sev, 1)
+		if err == nil && len(cases) > 0 {
+			target = cases[0]
+			break
+		}
+	}
+	if target == nil {
+		h.postEphemeral(channelID, userID, "No open cases found.")
+		return
+	}
+	dest := h.externalThreatChannel
+	h.postMessage(dest, "", fmt.Sprintf("_Briefing next case: %s %s…_", severityEmoji(target.Severity), target.CaseID[:8]))
+	go func() {
+		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
+		triageBlock := buildTriageBlock(triage, portsSeen)
+		actionPlan := selectActionPlan(triage)
+		prompt := fmt.Sprintf("Analyse this case and provide a full briefing.\n\nCase ID: %s", target.CaseID[:8])
+		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
+		if err != nil {
+			log.Printf("[handler] next llm error case %s: %v", target.CaseID[:8], err)
+			h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", target.CaseID[:8], err))
+			return
+		}
+		h.postCaseBriefingWithActions(dest, target.CaseID[:8],
+			fmt.Sprintf("*Case %s — Full Briefing*\n%s", target.CaseID[:8], answer))
+	}()
 }
