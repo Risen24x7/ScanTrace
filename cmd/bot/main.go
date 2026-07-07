@@ -9,12 +9,12 @@
 //   scantrace flush     [--source testdata]
 //
 // Env:
-//   SCANTRACE_DB         SQLite path (default: <exe-dir>/scantrace.db)
-//   SCANTRACE_SENSOR_ID  sensor UUID (auto-created if unset)
-//   SCANTRACE_ASUS_STATE path to Asus sensor-id state file (default: <exe-dir>/.asus-sensor-id)
-//   SCANTRACE_SYSLOG_PORT UDP port to receive router syslog (default: 5140, use 514 as root)
-//   IPINFO_TOKEN         ipinfo.io token (optional)
-//   SLACK_WEBHOOK_URL    Slack Incoming Webhook URL (optional — enables alert posting)
+//   DB_PATH              SQLite path             (default: <exe-dir>/scantrace.db)
+//   SCANTRACE_SENSOR_ID  sensor UUID             (auto-created if unset)
+//   SCANTRACE_ASUS_STATE Asus sensor-id file     (default: <exe-dir>/.asus-sensor-id)
+//   SCANTRACE_SYSLOG_PORT UDP syslog listen port (default: 5140, use 514 as root)
+//   IPINFO_TOKEN         ipinfo.io token         (optional)
+//   SLACK_WEBHOOK_URL    Slack Incoming Webhook  (optional)
 package main
 
 import (
@@ -58,7 +58,7 @@ func main() {
 	}
 
 	base := exeDir()
-	dbPath := envOrDefault("SCANTRACE_DB", filepath.Join(base, "scantrace.db"))
+	dbPath := envOrDefault("DB_PATH", filepath.Join(base, "scantrace.db"))
 	sensorID := envOrDefault("SCANTRACE_SENSOR_ID", "")
 	ipinfoToken := envOrDefault("IPINFO_TOKEN", "")
 	slackWebhook := envOrDefault("SLACK_WEBHOOK_URL", "")
@@ -431,7 +431,7 @@ Commands:
   flush      [--source testdata]
 
 Env:
-  SCANTRACE_DB          SQLite path             (default: <exe-dir>/scantrace.db)
+  DB_PATH               SQLite path             (default: <exe-dir>/scantrace.db)
   SCANTRACE_SENSOR_ID   sensor UUID             (auto-created if unset)
   SCANTRACE_ASUS_STATE  Asus sensor-id file     (default: <exe-dir>/.asus-sensor-id)
   SCANTRACE_SYSLOG_PORT UDP syslog listen port  (default: 5140, use 514 as root)
