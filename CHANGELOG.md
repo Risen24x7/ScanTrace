@@ -4,6 +4,30 @@ All notable changes to ScanTrace – Dead Reckoning Edition will be documented i
 
 ---
 
+## v0.5.0 — 2026-07-06
+
+### Breaking
+- Remove SCANTRACE_DB; use DB_PATH=/var/lib/scantrace/scantrace.db
+
+### Features
+- Slack review filters; blocklist export (txt/csv/ipset) with CIDR grouping
+
+### Ops
+- systemd unit, install scripts, CAP_NET_BIND_SERVICE
+
+### Docs
+- INSTALL and .env.example updated; status/queries guidance
+
+### Fixes
+- Syslog ingest robustness; WAN enrichment toggle polish
+
+### Upgrade Notes
+- Set DB_PATH in .env
+- mkdir -p /var/lib/scantrace && mv existing DB if needed
+- systemctl daemon-reload && systemctl restart scantrace-agent
+
+---
+
 ## [2026-06-29] Port Intel + WAN-Edge Override
 
 ### New Features
