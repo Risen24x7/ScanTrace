@@ -1,0 +1,23 @@
+name: Cleanup Pre-Releases
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to delete (e.g., v0.5.1-rc)'
+        required: true
+permissions:
+  contents: write
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ github.event.inputs.tag }}" --yes || true
+      - name: Delete tag
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git push --delete origin "${{ github.event.inputs.tag }}" || true
