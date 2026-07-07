@@ -332,7 +332,11 @@ func (h *Handler) handleSlashCommand(cmd slack.SlashCommand) {
 		}
 		h.cmdRemoveDevice(cmd.ChannelID, cmd.UserID, parts[1])
 	case "review-all":
-		h.cmdReviewAll(cmd.ChannelID, cmd.UserID)
+		// Enhanced version with filters
+		h.cmdReviewAll(cmd.ChannelID, cmd.UserID, parts[1:])
+	case "export-blocklist":
+		// New command to export firewall blocklists
+		h.cmdExportBlocklist(cmd.ChannelID, cmd.UserID, parts[1:])
 	case "next":
 		h.cmdNext(cmd.ChannelID, cmd.UserID)
 	case "port-trends":
@@ -919,7 +923,10 @@ func helpText() string {
 /scantrace reopen <id>        — Reopen a closed case
 /scantrace alert              — Re-post the latest high/open case alert
 /scantrace next               — LLM briefing for the next highest-priority case
-/scantrace review-all         — Queue all open cases for LLM review
+/scantrace review-all [--limit N] [--since 24h] [--severity red,yellow] [--exclude-wan-only] [--dedupe]
+                              — Queue open cases for LLM review (filters optional)
+/scantrace export-blocklist [--limit N] [--since 7d] [--severity red,yellow] [--wan-only] [--group-cidr] [--format txt|csv|ipset]
+                              — Export a firewall blocklist from recent cases
 /scantrace devices            — List the known device registry
 /scantrace adddevice <ip> [label="..."] [trust=trusted|unknown|suspicious] [suppress=true]
 /scantrace removedevice <ip>  — Remove a device from the registry
@@ -1162,20 +1169,31 @@ func (h *Handler) cmdRemoveDevice(channelID, userID, ipArg string) {
 	log.Printf("[handler] removedevice ip=%s label=%q by user=%s", ipArg, existing.Label, userID)
 }
 
-func (h *Handler) cmdReviewAll(channelID, userID string) {
+// New: filtered review-all implementation
+func (h *Handler) cmdReviewAll(channelID, userID string, args []string) {
 	if h.llm == nil {
 		h.postEphemeral(channelID, userID, "LLM not configured.")
 		return
 	}
-	cases, err := h.store.ListCases("", 50)
+	opts, err := parseReviewAllFlags(args)
+	if err != nil {
+		h.postEphemeral(channelID, userID, reviewAllUsage(err))
+		return
+	}
+	cases, err := h.store.ListCases("", 200)
 	if err != nil || len(cases) == 0 {
 		h.postEphemeral(channelID, userID, "No open cases found.")
 		return
 	}
+	filtered := h.filterReviewCases(cases, opts)
+	if len(filtered) == 0 {
+		h.postEphemeral(channelID, userID, fmt.Sprintf("No cases match %s.", opts.filterSummary()))
+		return
+	}
 	dest := h.externalThreatChannel
-	h.postMessage(dest, "", fmt.Sprintf("_Queuing %d cases for review — posting one at a time…_", len(cases)))
+	h.postMessage(dest, "", fmt.Sprintf("_Queuing %d case(s) for review — %s_", len(filtered), opts.filterSummary()))
 	go func() {
-		for i, c := range cases {
+		for i, c := range filtered {
 			ctx, triage, portsSeen := h.buildSingleCaseContext(c)
 			triageBlock := buildTriageBlock(triage, portsSeen)
 			actionPlan := selectActionPlan(triage)
@@ -1185,13 +1203,13 @@ func (h *Handler) cmdReviewAll(channelID, userID string) {
 				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
 				h.postMessage(dest, "", fmt.Sprintf("⚠️ Case %s — inference error: %v", c.CaseID[:8], err))
 			} else {
-				h.postCaseBriefingWithActions(dest, c.CaseID[:8], fmt.Sprintf("*Case %d/%d — %s*\n%s", i+1, len(cases), c.CaseID[:8], answer))
+				h.postCaseBriefingWithActions(dest, c.CaseID[:8], fmt.Sprintf("*Case %d/%d — %s*\n%s", i+1, len(filtered), c.CaseID[:8], answer))
 			}
-			if i < len(cases)-1 {
+			if i < len(filtered)-1 {
 				time.Sleep(3 * time.Second)
 			}
 		}
-		h.postMessage(dest, "", fmt.Sprintf("_Review complete — %d cases processed._", len(cases)))
+		h.postMessage(dest, "", fmt.Sprintf("_Review complete — %d case(s) processed._", len(filtered)))
 	}()
 }
 
