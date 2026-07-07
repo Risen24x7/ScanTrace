@@ -33,14 +33,11 @@ func main() {
 
 	wanIP := strings.TrimSpace(os.Getenv("WAN_IP"))
 
-	// Accept SCANTRACE_DB (legacy) or DB_PATH. Absolute path strongly recommended.
+	// Use DB_PATH. Absolute path strongly recommended.
 	storeConn := os.Getenv("DB_PATH")
 	if storeConn == "" {
-		storeConn = os.Getenv("SCANTRACE_DB")
-	}
-	if storeConn == "" {
 		storeConn = "../scantrace.db"
-		log.Printf("[main] WARNING: neither DB_PATH nor SCANTRACE_DB set — using relative path %q (may open wrong file depending on cwd)", storeConn)
+		log.Printf("[main] WARNING: DB_PATH not set — using relative path %q (may open wrong file depending on cwd)", storeConn)
 	}
 	log.Printf("[main] database: %s", storeConn)
 
