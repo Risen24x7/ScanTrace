@@ -18,7 +18,7 @@ cd ScanTrace/scantrace-agent
 go build -o scantrace-agent ./cmd/bot/
 ```
 
-The binary is `./scantrace-agent`. The SQLite database (`scantrace.db`) is written next to the binary by default.
+The binary is `./scantrace-agent`. By default (manual runs), the SQLite database resolves from `DB_PATH` relative to the working directory if not absolute. Service deployments SHOULD use an absolute DB path under `/var/lib/scantrace`.
 
 ---
 
@@ -36,13 +36,13 @@ ALERT_CHANNEL=C0BBP1EP68P
 EXTERNAL_THREAT_CHANNEL=C0BCYSW3KNC   # channel for LLM Q&A replies (defaults to ALERT_CHANNEL)
 LLM_BASE_URL=http://192.168.50.250:11434
 LLM_MODEL=Qwen3-30B-A3B-UD-Q3_K_XL
-DB_PATH=../scantrace.db
+DB_PATH=/var/lib/scantrace/scantrace.db
 WAN_IP=
 SCANTRACE_SYSLOG_PORT=5140
 ```
 
 Tips:
-- Set `DB_PATH` to an absolute path (e.g. `/var/lib/scantrace/scantrace.db`). Otherwise it is resolved relative to the working directory.
+- Always set `DB_PATH` to an absolute path (recommended: `/var/lib/scantrace/scantrace.db`).
 - `WAN_IP` can be set explicitly to your gateway's public IP (auto-detected from syslog if omitted).
 - Run `/scantrace status` in Slack for a liveness check.
 
@@ -168,9 +168,19 @@ cd "$HOME/ScanTrace" \
 
 Notes:
 - `EnvironmentFile` points at the repo `.env`. Ensure lines are `KEY=VALUE` (no `export` prefix).
-- Use an absolute `DB_PATH` (e.g., `/var/lib/scantrace/scantrace.db`) in `.env` to avoid "readonly database" with `ProtectHome=read-only`.
+- Use an absolute `DB_PATH` under `/var/lib/scantrace` to avoid permission issues with `ProtectHome=read-only`.
 - Exports are written to `/opt/scantrace/exports` when writable; otherwise the current working directory.
 - If you prefer a global `/etc/scantrace/scantrace.env`, point `EnvironmentFile` there instead.
+
+Database migration (if you previously stored DB under $HOME):
+
+```bash
+sudo systemctl stop scantrace-agent@"$USER"
+sudo install -d -m0755 /var/lib/scantrace
+sudo cp -a ~/ScanTrace/scantrace.db /var/lib/scantrace/scantrace.db
+sudo chown "$USER":"$USER" /var/lib/scantrace/scantrace.db
+sudo systemctl start scantrace-agent@"$USER"
+```
 
 Lint the unit (optional):
 
