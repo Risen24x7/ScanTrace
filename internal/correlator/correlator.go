@@ -5,7 +5,6 @@ package correlator
 import (
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/Risen24x7/scantrace/internal/db"
@@ -311,7 +310,7 @@ func buildSummary(cl *IPCluster, match *RuleMatch) string {
 			ports = append(ports, fmt.Sprintf("%d", p))
 		}
 	}
-	portStr := strings.Join(ports, ", ")
+	portStr := joinStrings(ports, ", ")
 	if len(ports) == 0 {
 		portStr = "none (DHCP/Wi-Fi events)"
 	}
@@ -330,4 +329,15 @@ func buildSummary(cl *IPCluster, match *RuleMatch) string {
 		base += fmt.Sprintf(" | Rule: %s — %s", match.RuleName, match.Description)
 	}
 	return base
+}
+
+func joinStrings(ss []string, sep string) string {
+	if len(ss) == 0 {
+		return "(none)"
+	}
+	out := ss[0]
+	for _, s := range ss[1:] {
+		out += sep + s
+	}
+	return out
 }
