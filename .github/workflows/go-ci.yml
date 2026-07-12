@@ -68,15 +68,9 @@ jobs:
         working-directory: scantrace-agent
         run: CGO_ENABLED=1 go vet ./...
 
-      - name: Test scantrace-agent (race, coverage)
+      - name: Test scantrace-agent (race)
         working-directory: scantrace-agent
-        run: CGO_ENABLED=1 go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
-
-      - name: Upload coverage (agent)
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-agent
-          path: scantrace-agent/coverage.out
+        run: CGO_ENABLED=1 go test -v -race ./...
 
       - name: Govulncheck
         uses: golang/govulncheck-action@v1
