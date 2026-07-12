@@ -1,0 +1,20 @@
+[Unit]
+Description=llama.cpp HTTP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=scantrace
+Group=scantrace
+# Adjust path to your llama.cpp build and model
+WorkingDirectory=/opt/llamacpp
+ExecStart=/opt/llamacpp/server -m /models/phi-3-mini.q4_K_M.gguf -t %m -c 1024 -b 256 --port 11434
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
