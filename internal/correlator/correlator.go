@@ -5,7 +5,6 @@ package correlator
 import (
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/Risen24x7/scantrace/internal/db"
@@ -305,7 +304,7 @@ func (c *Correlator) openCase(cl *IPCluster, match *RuleMatch) (*db.Case, error)
 }
 
 func buildSummary(cl *IPCluster, match *RuleMatch) string {
-	ports := []string{}
+	ports := make([]string, 0, len(cl.Ports))
 	for p := range cl.Ports {
 		if p != 0 {
 			ports = append(ports, fmt.Sprintf("%d", p))

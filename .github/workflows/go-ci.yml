@@ -4,17 +4,18 @@ on:
   push:
     branches: [ main, hackathon-final-20260713, feature/**, fix/** ]
     paths:
+      - 'internal/**'
+      - 'cmd/**'
       - 'scantrace-agent/**'
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/go-ci.yml'
   pull_request:
     branches: [ main, hackathon-final-20260713 ]
-    paths:
-      - 'scantrace-agent/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/go-ci.yml'
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
 
 jobs:
   build-test:
@@ -29,10 +30,25 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install build deps (CGO + SQLite)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev pkg-config
+
+      - name: Go environment
+        run: |
+          go version
+          go env
+          go mod download
+
+      - name: Build core
+        run: CGO_ENABLED=1 go build -v ./internal/...
+
+      - name: Test core
+        run: CGO_ENABLED=1 go test -v ./internal/...
+
       - name: Build scantrace-agent
         working-directory: scantrace-agent
-        run: go build -o scantrace-agent ./cmd/bot
+        run: CGO_ENABLED=1 go build -v -o scantrace-agent ./cmd/bot
 
-      - name: Run tests
+      - name: Test scantrace-agent
         working-directory: scantrace-agent
-        run: go test ./... -v
+        run: CGO_ENABLED=1 go test -v ./...

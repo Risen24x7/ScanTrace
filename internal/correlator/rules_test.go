@@ -7,7 +7,8 @@ import (
 	"github.com/Risen24x7/scantrace/internal/db"
 )
 
-func makeEvent(eventType string, dstPort int) *db.Event {
+// ruleEvent is a local helper to avoid clashing with correlator_test's makeEvent.
+func ruleEvent(eventType string, dstPort int) *db.Event {
 	return &db.Event{
 		EventID:   "test-" + eventType,
 		EventType: eventType,
@@ -34,13 +35,15 @@ func makeCluster(events []*db.Event) *IPCluster {
 
 func TestPortScanRule(t *testing.T) {
 	events := []*db.Event{
-		makeEvent("netfilter_drop", 22),
-		makeEvent("netfilter_drop", 80),
-		makeEvent("netfilter_drop", 443),
-		makeEvent("netfilter_drop", 8080),
-		makeEvent("netfilter_drop", 3389),
+		ruleEvent("netfilter_drop", 22),
+		ruleEvent("netfilter_drop", 80),
+		ruleEvent("netfilter_drop", 443),
+		ruleEvent("netfilter_drop", 8080),
+		ruleEvent("netfilter_drop", 3389),
 	}
 	cl := makeCluster(events)
+	// PortScanRule only applies to internal IPs.
+	cl.SrcIP = "192.168.1.10"
 	rule := &PortScanRule{MinPorts: 5}
 	m := rule.Eval(cl)
 	if m == nil {
@@ -53,10 +56,12 @@ func TestPortScanRule(t *testing.T) {
 
 func TestPortScanRule_BelowThreshold(t *testing.T) {
 	events := []*db.Event{
-		makeEvent("netfilter_drop", 22),
-		makeEvent("netfilter_drop", 80),
+		ruleEvent("netfilter_drop", 22),
+		ruleEvent("netfilter_drop", 80),
 	}
 	cl := makeCluster(events)
+	// PortScanRule only applies to internal IPs.
+	cl.SrcIP = "192.168.1.10"
 	rule := &PortScanRule{MinPorts: 5}
 	if m := rule.Eval(cl); m != nil {
 		t.Errorf("expected nil, got match: %+v", m)
@@ -65,9 +70,9 @@ func TestPortScanRule_BelowThreshold(t *testing.T) {
 
 func TestRepeatedDropRule(t *testing.T) {
 	events := []*db.Event{
-		makeEvent("netfilter_drop", 22),
-		makeEvent("netfilter_drop", 22),
-		makeEvent("netfilter_drop", 22),
+		ruleEvent("netfilter_drop", 22),
+		ruleEvent("netfilter_drop", 22),
+		ruleEvent("netfilter_drop", 22),
 	}
 	cl := makeCluster(events)
 	rule := &RepeatedDropRule{MinDrops: 3}
