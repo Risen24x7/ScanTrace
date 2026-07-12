@@ -4,7 +4,7 @@ go 1.22
 
 require (
 	github.com/Risen24x7/scantrace v0.0.0
-	github.com/slack-go/slack v0.15.0
+	github.com/slack-go/slack v0.27.0
 )
 
 require (
