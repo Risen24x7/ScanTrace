@@ -10,7 +10,28 @@
 
 ---
 
-## 1. Clone & Build
+## Quick install (recommended)
+
+Installs a dedicated `scantrace` user, seeds env at `/etc/scantrace/scantrace.env`,
+installs the binary to `/opt/scantrace/bin/`, and enables the service.
+
+```bash
+git clone https://github.com/Risen24x7/ScanTrace.git
+cd ScanTrace
+./scripts/install-service.sh
+sudoedit /etc/scantrace/scantrace.env   # fill tokens/channel IDs, verify DB_PATH
+sudo systemctl restart scantrace-agent
+```
+
+Verify:
+```bash
+systemctl --no-pager status scantrace-agent
+ps -o user,group,cmd -C scantrace-agent
+```
+
+---
+
+## 1. Clone & Build (manual)
 
 ```bash
 git clone https://github.com/Risen24x7/ScanTrace.git
@@ -22,7 +43,7 @@ The binary is `./scantrace-agent`. By default (manual runs), the SQLite database
 
 ---
 
-## 2. Environment Variables
+## 2. Environment Variables (manual)
 
 Create `.env` in `ScanTrace/scantrace-agent/` (see `.env.example`):
 
@@ -98,7 +119,7 @@ export $(grep -v '^#' .env | xargs) && ./scantrace-agent
 
 ---
 
-## 7. Run as a systemd service (recommended)
+## 7. Run as a systemd service (manual alternative)
 
 This example keeps configuration in the repo `.env` by default.
 
@@ -126,9 +147,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=%i
-WorkingDirectory=%h/ScanTrace/scantrace-agent
-EnvironmentFile=%h/ScanTrace/scantrace-agent/.env
+User=scantrace
+Group=scantrace
+WorkingDirectory=/opt/scantrace
+EnvironmentFile=/etc/scantrace/scantrace.env
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -138,8 +160,7 @@ Restart=on-failure
 RestartSec=3s
 
 ProtectSystem=full
-ProtectHome=read-only
-ReadWritePaths=/var/lib/scantrace /opt/scantrace
+ReadWritePaths=/var/lib/scantrace /opt/scantrace/exports
 PrivateTmp=true
 
 [Install]
@@ -151,8 +172,8 @@ Enable and start:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now scantrace-agent@"$USER"
-systemctl --no-pager status scantrace-agent@"$USER"
+sudo systemctl enable --now scantrace-agent
+systemctl --no-pager status scantrace-agent
 ```
 
 Daily update workflow:
@@ -163,45 +184,10 @@ cd "$HOME/ScanTrace" \
 && cd scantrace-agent \
 && go build -o /tmp/scantrace-agent ./cmd/bot/ \
 && sudo install -m0755 /tmp/scantrace-agent /opt/scantrace/bin/scantrace-agent \
-&& sudo systemctl restart scantrace-agent@"$USER"
+&& sudo systemctl restart scantrace-agent
 ```
 
 Notes:
-- `EnvironmentFile` points at the repo `.env`. Ensure lines are `KEY=VALUE` (no `export` prefix).
-- Use an absolute `DB_PATH` under `/var/lib/scantrace` to avoid permission issues with `ProtectHome=read-only`.
+- Environment lives at `/etc/scantrace/scantrace.env`. Lines must be `KEY=VALUE` (no `export`).
+- Use an absolute `DB_PATH` under `/var/lib/scantrace` to avoid permission issues.
 - Exports are written to `/opt/scantrace/exports` when writable; otherwise the current working directory.
-- If you prefer a global `/etc/scantrace/scantrace.env`, point `EnvironmentFile` there instead.
-
-Database migration (if you previously stored DB under $HOME):
-
-```bash
-sudo systemctl stop scantrace-agent@"$USER"
-sudo install -d -m0755 /var/lib/scantrace
-sudo cp -a ~/ScanTrace/scantrace.db /var/lib/scantrace/scantrace.db
-sudo chown "$USER":"$USER" /var/lib/scantrace/scantrace.db
-sudo systemctl start scantrace-agent@"$USER"
-```
-
-Lint the unit (optional):
-
-```bash
-sudo systemd-analyze verify /etc/systemd/system/scantrace-agent.service
-```
-
----
-
-## 8. Slack commands
-
-- `/scantrace status` — liveness (DB, case counts, syslog port, WAN IP, LLM, alerts channel)
-- `/scantrace review-all [--limit N] [--since 7d|30d] [--severity red,yellow,green] [--exclude-wan-only] [--dedupe]`
-- `/scantrace export-blocklist [--limit N] [--since 7d] [--severity …] [--wan-only] [--group-cidr] [--format txt|csv|ipset]`
-
----
-
-## 9. Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `db.Open: migrations: attempt to write a readonly database` | DB under `$HOME` while `ProtectHome` restricts access | Set `DB_PATH=/var/lib/scantrace/scantrace.db` |
-| `Failed at step EXEC` | `ExecStart` points to a missing binary | Rebuild and install to `/opt/scantrace/bin/scantrace-agent` |
-| `subscribe skipped: unknown_method` | Slack RTS in sandbox | Cosmetic, safe to ignore |
