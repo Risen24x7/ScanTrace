@@ -40,6 +40,22 @@ curl -sS http://127.0.0.1:11434/v1/models | head -c 200 || true
 
 ---
 
+## Install latest tag (non-interactive)
+
+```bash
+git clone https://github.com/Risen24x7/ScanTrace.git && cd ScanTrace
+git fetch --tags --quiet
+LATEST_TAG=$(git tag --sort=-creatordate | head -n1)
+echo "Using tag: $LATEST_TAG"
+git checkout --quiet "$LATEST_TAG"
+make install-service-noninteractive LLM_BASE_URL=http://127.0.0.1:11434 LLM_MODEL=
+# Then configure tokens and start
+sudoedit /etc/scantrace/scantrace.env
+sudo systemctl enable --now scantrace-agent
+```
+
+---
+
 ## Manual build/run
 
 ```bash
