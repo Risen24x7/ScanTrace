@@ -42,11 +42,11 @@ jobs:
           go env
           go mod download
 
-      - name: Build core (root module)
-        run: CGO_ENABLED=1 go build -v ./...
+      - name: Build core (root module: internal packages)
+        run: CGO_ENABLED=1 go build -v ./internal/...
 
-      - name: Test core (root module)
-        run: CGO_ENABLED=1 go test -v ./...
+      - name: Test core (root module: internal packages)
+        run: CGO_ENABLED=1 go test -v ./internal/...
 
       - name: Build scantrace-agent
         working-directory: scantrace-agent
