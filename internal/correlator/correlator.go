@@ -305,13 +305,13 @@ func (c *Correlator) openCase(cl *IPCluster, match *RuleMatch) (*db.Case, error)
 }
 
 func buildSummary(cl *IPCluster, match *RuleMatch) string {
-	ports := []string{}
+	ports := make([]string, 0, len(cl.Ports))
 	for p := range cl.Ports {
 		if p != 0 {
 			ports = append(ports, fmt.Sprintf("%d", p))
 		}
 	}
-	portStr := joinStrings(ports, ", ")
+	portStr := strings.Join(ports, ", ")
 	if len(ports) == 0 {
 		portStr = "none (DHCP/Wi-Fi events)"
 	}
@@ -330,15 +330,4 @@ func buildSummary(cl *IPCluster, match *RuleMatch) string {
 		base += fmt.Sprintf(" | Rule: %s — %s", match.RuleName, match.Description)
 	}
 	return base
-}
-
-func joinStrings(ss []string, sep string) string {
-	if len(ss) == 0 {
-		return "(none)"
-	}
-	out := ss[0]
-	for _, s := range ss[1:] {
-		out += sep + s
-	}
-	return out
 }
