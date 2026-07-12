@@ -4,6 +4,8 @@ on:
   push:
     branches: [ main, hackathon-final-20260713, feature/**, fix/** ]
     paths:
+      - 'internal/**'
+      - 'cmd/**'
       - 'scantrace-agent/**'
       - 'go.mod'
       - 'go.sum'
@@ -11,6 +13,8 @@ on:
   pull_request:
     branches: [ main, hackathon-final-20260713 ]
     paths:
+      - 'internal/**'
+      - 'cmd/**'
       - 'scantrace-agent/**'
       - 'go.mod'
       - 'go.sum'
@@ -29,10 +33,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Build core (root module)
+        run: go build ./...
+
+      - name: Test core (root module)
+        run: go test ./... -v
+
       - name: Build scantrace-agent
         working-directory: scantrace-agent
         run: go build -o scantrace-agent ./cmd/bot
 
-      - name: Run tests
+      - name: Test scantrace-agent
         working-directory: scantrace-agent
         run: go test ./... -v

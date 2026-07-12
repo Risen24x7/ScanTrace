@@ -1,0 +1,15 @@
+# Go build artifacts
+bin/
+build/
+dist/
+
+# Committed binaries (exclude)
+scantrace-agent/scantrace-agent
+
+# OS/Editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Databases
+*.db
