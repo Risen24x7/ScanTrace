@@ -72,8 +72,15 @@ jobs:
         working-directory: scantrace-agent
         run: CGO_ENABLED=1 go test -v -race ./...
 
-      - name: Govulncheck
+      - name: Govulncheck (root)
         uses: golang/govulncheck-action@v1
         with:
           go-version-file: go.mod
+          check-latest: true
+
+      - name: Govulncheck (agent)
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: scantrace-agent/go.mod
+          working-directory: scantrace-agent
           check-latest: true
