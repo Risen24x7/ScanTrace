@@ -1,0 +1,32 @@
+name: Branch Cleanup
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 3 * * 0'
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update && sudo apt-get install -y gh jq
+      - name: Delete merged chore/* branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh pr list --state merged --search "head:chore/" --json headRefName --jq '.[].headRefName' | while read -r br; do
+            echo "Deleting $br";
+            git push --delete origin "$br" || true;
+          done
+      - name: Delete specific stale branches
+        run: |
+          for br in chore/repo-hygiene-ci-coverage chore/ci-hardening-and-installer chore/workflow-cleanup-and-release-prep; do
+            git push --delete origin "$br" || true;
+          done
