@@ -1,0 +1,43 @@
+name: Release (GoReleaser)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install build deps (CGO + cross)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev pkg-config gcc-aarch64-linux-gnu
+
+      - name: Go env
+        run: go env
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Cross-compile CC for arm64 when CGO is enabled
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CC_aarch64_linux_gnu: aarch64-linux-gnu-gcc
