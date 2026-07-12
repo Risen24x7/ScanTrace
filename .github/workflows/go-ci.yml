@@ -14,7 +14,7 @@ on:
     branches: [ main, hackathon-final-20260713 ]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
 
 jobs:
@@ -39,10 +39,10 @@ jobs:
           go env
           go mod download
 
-      - name: Build core (root module: internal packages)
+      - name: Build core
         run: CGO_ENABLED=1 go build -v ./internal/...
 
-      - name: Test core (root module: internal packages)
+      - name: Test core
         run: CGO_ENABLED=1 go test -v ./internal/...
 
       - name: Build scantrace-agent
