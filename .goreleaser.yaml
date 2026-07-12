@@ -34,11 +34,6 @@ archives:
 checksum:
   name_template: 'checksums.txt'
 
-sboms:
-  - id: agent-sbom
-    artifacts: archive
-    format: cyclonedx
-
 changelog:
   sort: asc
   filters:
