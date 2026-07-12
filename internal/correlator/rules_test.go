@@ -42,6 +42,8 @@ func TestPortScanRule(t *testing.T) {
 		ruleEvent("netfilter_drop", 3389),
 	}
 	cl := makeCluster(events)
+	// PortScanRule only applies to internal IPs.
+	cl.SrcIP = "192.168.1.10"
 	rule := &PortScanRule{MinPorts: 5}
 	m := rule.Eval(cl)
 	if m == nil {
@@ -58,6 +60,8 @@ func TestPortScanRule_BelowThreshold(t *testing.T) {
 		ruleEvent("netfilter_drop", 80),
 	}
 	cl := makeCluster(events)
+	// PortScanRule only applies to internal IPs.
+	cl.SrcIP = "192.168.1.10"
 	rule := &PortScanRule{MinPorts: 5}
 	if m := rule.Eval(cl); m != nil {
 		t.Errorf("expected nil, got match: %+v", m)
