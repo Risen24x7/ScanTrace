@@ -3,8 +3,7 @@ project_name: scantrace-agent
 
 before:
   hooks:
-    - go mod download
-    - bash -lc 'cd scantrace-agent && go mod download'
+    - bash -lc 'set -euo pipefail; go mod download; cd scantrace-agent; go mod tidy; go mod download'
 
 builds:
   - id: agent
