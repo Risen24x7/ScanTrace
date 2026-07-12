@@ -1,0 +1,50 @@
+project_name: scantrace-agent
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: agent
+    main: ./scantrace-agent/cmd/bot
+    binary: scantrace-agent
+    env:
+      - CGO_ENABLED=1
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -v
+    mod_timestamp: '{{ .CommitDate }}'
+
+archives:
+  - id: tarballs
+    format: tar.gz
+    files:
+      - LICENSE
+      - README.md
+    builds:
+      - agent
+
+checksum:
+  name_template: 'checksums.txt'
+
+sboms:
+  - id: agent-sbom
+    artifacts: archive
+    formats: [cyclonedx]
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs: '
+      - '^chore: '
+
+release:
+  prerelease: auto
+  draft: false
