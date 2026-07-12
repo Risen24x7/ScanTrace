@@ -6,6 +6,10 @@ All notable changes to ScanTrace – Dead Reckoning Edition will be documented i
 
 ## Unreleased
 
+---
+
+## v0.5.1 — 2026-07-12
+
 ### Changes
 - Default `LLM_BASE_URL` to `http://127.0.0.1:11434` (was a LAN IP)
 - LLM client strips a trailing `/v1` from `LLM_BASE_URL` to avoid `/v1/v1/...` 404s
