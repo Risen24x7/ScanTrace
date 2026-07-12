@@ -21,7 +21,6 @@ builds:
       - arm64
     flags:
       - -v
-    mod_timestamp: '{{ .CommitDate }}'
 
 archives:
   - id: tarballs
