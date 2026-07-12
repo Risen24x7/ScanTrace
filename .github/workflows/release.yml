@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g., v0.6.0-rc1)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,6 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -41,3 +48,5 @@ jobs:
           # Cross-compile CC for arm64 when CGO is enabled
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CC_aarch64_linux_gnu: aarch64-linux-gnu-gcc
+          # Set when running via manual dispatch
+          GORELEASER_CURRENT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
