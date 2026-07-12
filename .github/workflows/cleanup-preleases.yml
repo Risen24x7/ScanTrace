@@ -1,4 +1,4 @@
-name: Cleanup Pre-Releases
+name: Cleanup Pre-releases
 on:
   workflow_dispatch:
     inputs:
@@ -11,12 +11,17 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update && sudo apt-get install -y gh
       - name: Delete GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release delete "${{ github.event.inputs.tag }}" --yes || true
       - name: Delete tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
