@@ -16,9 +16,11 @@ STATE_DIR="/var/lib/scantrace"
 EXPORTS_DIR="/opt/scantrace/exports"
 WORK_DIR="/opt/scantrace"
 
-# Build out of tree
+# Build out of tree from module dir (avoids module path issues)
 BUILD_BIN="/tmp/scantrace-agent.$$"
-GOFLAGS= CGO_ENABLED=1 go build -o "${BUILD_BIN}" "${SRC_DIR}/cmd/bot/"
+pushd "${SRC_DIR}" >/dev/null
+GOFLAGS= CGO_ENABLED=1 go build -o "${BUILD_BIN}" ./cmd/bot/
+popd >/dev/null
 
 # Create dedicated system user/group if missing
 if ! id -u "${RUN_USER}" >/dev/null 2>&1; then
@@ -34,6 +36,7 @@ fi
 # Create directories with correct ownership
 sudo install -d -m0755 -o "${RUN_USER}" -g "${RUN_GROUP}" \
   "${STATE_DIR}" "${EXPORTS_DIR}" /opt/scantrace/bin
+sudo install -d -m0755 -o "${RUN_USER}" -g "${RUN_GROUP}" "${WORK_DIR}"
 
 # Install binary
 sudo install -m0755 "${BUILD_BIN}" "${BIN_INSTALL}"
@@ -54,10 +57,10 @@ echo "=== ScanTrace setup ==="
 echo "Choose mode:"
 echo "  1) LLM (local endpoint, default)"
 echo "  2) MCP-only (skip LLM for now)"
-read -r -p "Selection [1/2, default 1]: " _mode
+read -r -p "Selection [1/2, default 1]: " _mode || true
 _mode=${_mode:-1}
 if [[ "${_mode}" == "1" || -z "${_mode}" ]]; then
-  read -r -p "LLM base URL [http://127.0.0.1:11434]: " _llm_base
+  read -r -p "LLM base URL [http://127.0.0.1:11434]: " _llm_base || true
   _llm_base=${_llm_base:-http://127.0.0.1:11434}
   read -r -p "LLM model (e.g., tinyllama.gguf) [leave blank to set later]: " _llm_model || true
   # Apply LLM base
@@ -66,7 +69,6 @@ if [[ "${_mode}" == "1" || -z "${_mode}" ]]; then
   if [[ -n "${_llm_model:-}" ]]; then
     sudo sed -i "s|^#\?\s*LLM_MODEL=.*|LLM_MODEL=${_llm_model}|" "${ENV_FILE}"
   else
-    # Ensure a commented placeholder exists
     if grep -q '^LLM_MODEL=' "${ENV_FILE}"; then
       sudo sed -i 's|^LLM_MODEL=.*|# LLM_MODEL=|' "${ENV_FILE}"
     elif ! grep -q '^#\s*LLM_MODEL=' "${ENV_FILE}"; then
@@ -116,10 +118,9 @@ EOF
 sudo systemctl daemon-reload
 
 # Start only if Slack tokens/channel look configured (avoid hard fail on placeholders)
-if grep -q '^SLACK_BOT_TOKEN=xoxb-' "${ENV_FILE}" \
-   || grep -q '^SLACK_APP_TOKEN=xapp-' "${ENV_FILE}" \
-   || grep -q '^ALERT_CHANNEL=C0BBP1EP68P' "${ENV_FILE}"; then
-  echo
+if grep -q '^SLACK_BOT_TOKEN=xoxb-' "${ENV_FILE}" || \
+   grep -q '^SLACK_APP_TOKEN=xapp-' "${ENV_FILE}" || \
+   grep -q '^ALERT_CHANNEL=C0BBP1EP68P' "${ENV_FILE}"; then
   echo "Service installed but not started. Next steps:"
   echo "  1) sudoedit ${ENV_FILE}  # set SLACK_BOT_TOKEN, SLACK_APP_TOKEN, ALERT_CHANNEL"
   echo "  2) sudo systemctl enable --now scantrace-agent"
