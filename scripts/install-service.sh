@@ -45,8 +45,45 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   sudo cp "${SRC_DIR}/.env.example" "${ENV_FILE}"
   sudo chown root:root "${ENV_FILE}"
   sudo chmod 600 "${ENV_FILE}"
-  echo "Created ${ENV_FILE}. Edit tokens/channel IDs before starting." >&2
+  echo "Created ${ENV_FILE}." >&2
 fi
+
+# Interactive setup (optional, non-blocking)
+echo
+echo "=== ScanTrace setup ==="
+echo "Choose mode:"
+echo "  1) LLM (local endpoint, default)"
+echo "  2) MCP-only (skip LLM for now)"
+read -r -p "Selection [1/2, default 1]: " _mode
+_mode=${_mode:-1}
+if [[ "${_mode}" == "1" || -z "${_mode}" ]]; then
+  read -r -p "LLM base URL [http://127.0.0.1:11434]: " _llm_base
+  _llm_base=${_llm_base:-http://127.0.0.1:11434}
+  read -r -p "LLM model (e.g., tinyllama.gguf) [leave blank to set later]: " _llm_model || true
+  # Apply LLM base
+  sudo sed -i "s|^LLM_BASE_URL=.*|LLM_BASE_URL=${_llm_base}|" "${ENV_FILE}"
+  # Apply or comment model
+  if [[ -n "${_llm_model:-}" ]]; then
+    sudo sed -i "s|^#\?\s*LLM_MODEL=.*|LLM_MODEL=${_llm_model}|" "${ENV_FILE}"
+  else
+    # Ensure a commented placeholder exists
+    if grep -q '^LLM_MODEL=' "${ENV_FILE}"; then
+      sudo sed -i 's|^LLM_MODEL=.*|# LLM_MODEL=|' "${ENV_FILE}"
+    elif ! grep -q '^#\s*LLM_MODEL=' "${ENV_FILE}"; then
+      echo '# LLM_MODEL=' | sudo tee -a "${ENV_FILE}" >/dev/null
+    fi
+  fi
+else
+  # MCP-only: comment out LLM_MODEL, keep base default
+  if grep -q '^LLM_MODEL=' "${ENV_FILE}"; then
+    sudo sed -i 's|^LLM_MODEL=.*|# LLM_MODEL=|' "${ENV_FILE}"
+  elif ! grep -q '^#\s*LLM_MODEL=' "${ENV_FILE}"; then
+    echo '# LLM_MODEL=' | sudo tee -a "${ENV_FILE}" >/dev/null
+  fi
+fi
+
+echo
+echo "Environment saved to ${ENV_FILE}."
 
 # Write systemd unit
 sudo tee "${UNIT_FILE}" >/dev/null <<EOF
@@ -77,5 +114,17 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now scantrace-agent
-systemctl --no-pager status scantrace-agent || true
+
+# Start only if Slack tokens/channel look configured (avoid hard fail on placeholders)
+if grep -q '^SLACK_BOT_TOKEN=xoxb-' "${ENV_FILE}" \
+   || grep -q '^SLACK_APP_TOKEN=xapp-' "${ENV_FILE}" \
+   || grep -q '^ALERT_CHANNEL=C0BBP1EP68P' "${ENV_FILE}"; then
+  echo
+  echo "Service installed but not started. Next steps:"
+  echo "  1) sudoedit ${ENV_FILE}  # set SLACK_BOT_TOKEN, SLACK_APP_TOKEN, ALERT_CHANNEL"
+  echo "  2) sudo systemctl enable --now scantrace-agent"
+  echo "  3) journalctl -u scantrace-agent -n 80 --no-pager"
+else
+  sudo systemctl enable --now scantrace-agent || true
+  systemctl --no-pager status scantrace-agent || true
+fi
