@@ -34,18 +34,24 @@ jobs:
           cache: true
 
       - name: Install build deps (CGO + SQLite)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev pkg-config
+
+      - name: Go environment
+        run: |
+          go version
+          go env
+          go mod download
 
       - name: Build core (root module)
-        run: go build ./...
+        run: CGO_ENABLED=1 go build -v ./...
 
       - name: Test core (root module)
-        run: go test ./... -v
+        run: CGO_ENABLED=1 go test -v ./...
 
       - name: Build scantrace-agent
         working-directory: scantrace-agent
-        run: go build -o scantrace-agent ./cmd/bot
+        run: CGO_ENABLED=1 go build -v -o scantrace-agent ./cmd/bot
 
       - name: Test scantrace-agent
         working-directory: scantrace-agent
-        run: go test ./... -v
+        run: CGO_ENABLED=1 go test -v ./...
