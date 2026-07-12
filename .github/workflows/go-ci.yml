@@ -33,6 +33,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install build deps (CGO + SQLite)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsqlite3-dev
+
       - name: Build core (root module)
         run: go build ./...
 
