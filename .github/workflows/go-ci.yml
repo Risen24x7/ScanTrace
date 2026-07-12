@@ -54,6 +54,12 @@ jobs:
           name: coverage-root
           path: coverage.out
 
+      - name: Prepare agent modules
+        working-directory: scantrace-agent
+        run: |
+          go mod download
+          go mod tidy -e
+
       - name: Build scantrace-agent
         working-directory: scantrace-agent
         run: CGO_ENABLED=1 go build -v -o scantrace-agent ./cmd/bot
