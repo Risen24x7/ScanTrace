@@ -1,3 +1,4 @@
+version: 2
 project_name: scantrace-agent
 
 before:
@@ -26,8 +27,9 @@ archives:
     format: tar.gz
     files:
       - LICENSE
+    
       - README.md
-    builds:
+    ids:
       - agent
 
 checksum:
