@@ -76,7 +76,7 @@ The LLM receives a prompt where that section is already written. It cannot repla
 ### 3. Port Intelligence Store
 
 The `portintel` package maintains a SQLite-backed `Store` that records `HitRecord{SrcIP, DstPort, Proto, Count, FirstSeen, LastSeen}` for every event processed. This enables:
-- **`/scantrace port-trends`**: queries the store and returns a ranked Block Kit table of the most repeatedly hit ports across all cases.
+- **`/scantrace port-trends`**: queries the store and returns a ranked Block Kit table of the most repeatedly-hit ports across all cases.
 - **LLM advisory context**: when a port has been hit more than once historically, a `[PORT INTEL ADVISORY]` block is injected into the prompt so the model can reason about persistence and repeat targeting without needing DB access itself.
 
 ### 4. Dual Slack Channels
@@ -121,7 +121,7 @@ Case ID matching is prefix-based and case-insensitive — `abc123` matches `abc1
 
 ## LLM Configuration
 
-The agent defaults to `http://192.168.50.250:11434` (desktop `ik_llama.cpp`) when `LLM_BASE_URL` is not set. Model is selected by `LLM_MODEL` env var.
+The agent defaults to `http://127.0.0.1:11434` (local llama.cpp) when `LLM_BASE_URL` is not set. Model is selected by `LLM_MODEL` env var.
 
 The LLM is only called for:
 1. `@mention` Q&A queries (generic chat path — fallthrough after fast-path checks)

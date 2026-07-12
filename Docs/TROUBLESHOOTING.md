@@ -5,7 +5,7 @@
 ### `LLM not configured`
 
 **Cause:** `LLM_BASE_URL` not in environment.  
-**Fix:** The agent now defaults to `http://192.168.50.250:11434` — just restart and it will connect. If your `ik_llama.cpp` is on a different host, add `LLM_BASE_URL=http://<host>:11434` to `.env`.
+**Fix:** The agent now defaults to `http://127.0.0.1:11434` — just restart and it will connect. If your `ik_llama.cpp` is on a different host, add `LLM_BASE_URL=http://<host>:11434` to `.env`.
 
 ### `grep: scantrace-agent/.env: Not a directory`
 
@@ -67,10 +67,15 @@ And the Assessment block will correctly state no internal devices are at risk.
 ### Assessment or Summary blocks are missing
 
 **Cause:** `ik_llama.cpp` not running or unreachable.  
-**Fix:** Start the model server on the desktop and confirm:
+**Fix:** Start the model server on localhost and confirm:
 ```bash
-curl http://192.168.50.250:11434/v1/models
+curl http://127.0.0.1:11434/v1/models
 ```
+
+### `llm: status 404: {"error":{"message":"File Not Found"...}}`
+
+**Cause:** `LLM_BASE_URL` includes a trailing `/v1` (leading to `/v1/v1/...`) or points at a non-OpenAI route.  
+**Fix:** Set `LLM_BASE_URL` to `http://127.0.0.1:11434` (no `/v1`). The client automatically calls `/v1/chat/completions` and tolerates an accidental `/v1` suffix.
 
 ### LLM generates wrong action list
 
