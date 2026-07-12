@@ -4,10 +4,12 @@ project_name: scantrace-agent
 before:
   hooks:
     - go mod download
+    - bash -lc 'cd scantrace-agent && go mod download'
 
 builds:
   - id: agent
-    main: ./scantrace-agent/cmd/bot
+    dir: ./scantrace-agent
+    main: ./cmd/bot
     binary: scantrace-agent
     env:
       - CGO_ENABLED=1
