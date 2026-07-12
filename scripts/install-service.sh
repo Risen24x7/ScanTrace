@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Non-interactive overrides
+NONINT=${SCANTRACE_NONINTERACTIVE:-0}
+OVERRIDE_LLM_BASE=${LLM_BASE_URL:-}
+OVERRIDE_LLM_MODEL=${LLM_MODEL:-}
+
 # Resolve repo root (this script lives in repo/scripts/)
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -51,43 +56,63 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   echo "Created ${ENV_FILE}." >&2
 fi
 
-# Interactive setup (optional, non-blocking)
-echo
-echo "=== ScanTrace setup ==="
-echo "Choose mode:"
-echo "  1) LLM (local endpoint, default)"
-echo "  2) MCP-only (skip LLM for now)"
-read -r -p "Selection [1/2, default 1]: " _mode || true
-_mode=${_mode:-1}
-if [[ "${_mode}" == "1" || -z "${_mode}" ]]; then
-  read -r -p "LLM base URL [http://127.0.0.1:11434]: " _llm_base || true
-  _llm_base=${_llm_base:-http://127.0.0.1:11434}
-  read -r -p "LLM model (e.g., tinyllama.gguf) [leave blank to set later]: " _llm_model || true
-  # Apply LLM base
-  sudo sed -i "s|^LLM_BASE_URL=.*|LLM_BASE_URL=${_llm_base}|" "${ENV_FILE}"
-  # Apply or comment model
-  if [[ -n "${_llm_model:-}" ]]; then
-    sudo sed -i "s|^#\?\s*LLM_MODEL=.*|LLM_MODEL=${_llm_model}|" "${ENV_FILE}"
+apply_env() {
+  local key="$1"; shift
+  local val="$1"; shift || true
+  if grep -q "^${key}=" "${ENV_FILE}"; then
+    sudo sed -i "s|^${key}=.*|${key}=${val}|" "${ENV_FILE}"
+  elif grep -q "^#\s*${key}=" "${ENV_FILE}"; then
+    sudo sed -i "s|^#\s*${key}=.*|${key}=${val}|" "${ENV_FILE}"
   else
-    if grep -q '^LLM_MODEL=' "${ENV_FILE}"; then
-      sudo sed -i 's|^LLM_MODEL=.*|# LLM_MODEL=|' "${ENV_FILE}"
-    elif ! grep -q '^#\s*LLM_MODEL=' "${ENV_FILE}"; then
-      echo '# LLM_MODEL=' | sudo tee -a "${ENV_FILE}" >/dev/null
-    fi
+    echo "${key}=${val}" | sudo tee -a "${ENV_FILE}" >/dev/null
+  fi
+}
+
+comment_env() {
+  local key="$1"
+  if grep -q "^${key}=" "${ENV_FILE}"; then
+    sudo sed -i "s|^${key}=.*|# ${key}=|" "${ENV_FILE}"
+  elif ! grep -q "^#\s*${key}=" "${ENV_FILE}"; then
+    echo "# ${key}=" | sudo tee -a "${ENV_FILE}" >/dev/null
+  fi
+}
+
+if [[ "${NONINT}" == "1" ]]; then
+  # Non-interactive: honor overrides, otherwise defaults
+  apply_env LLM_BASE_URL "${OVERRIDE_LLM_BASE:-http://127.0.0.1:11434}"
+  if [[ -n "${OVERRIDE_LLM_MODEL:-}" ]]; then
+    apply_env LLM_MODEL "${OVERRIDE_LLM_MODEL}"
+  else
+    comment_env LLM_MODEL
   fi
 else
-  # MCP-only: comment out LLM_MODEL, keep base default
-  if grep -q '^LLM_MODEL=' "${ENV_FILE}"; then
-    sudo sed -i 's|^LLM_MODEL=.*|# LLM_MODEL=|' "${ENV_FILE}"
-  elif ! grep -q '^#\s*LLM_MODEL=' "${ENV_FILE}"; then
-    echo '# LLM_MODEL=' | sudo tee -a "${ENV_FILE}" >/dev/null
+  # Interactive setup (optional, non-blocking)
+  echo
+  echo "=== ScanTrace setup ==="
+  echo "Choose mode:"
+  echo "  1) LLM (local endpoint, default)"
+  echo "  2) MCP-only (skip LLM for now)"
+  read -r -p "Selection [1/2, default 1]: " _mode || true
+  _mode=${_mode:-1}
+  if [[ "${_mode}" == "1" || -z "${_mode}" ]]; then
+    read -r -p "LLM base URL [http://127.0.0.1:11434]: " _llm_base || true
+    _llm_base=${_llm_base:-http://127.0.0.1:11434}
+    read -r -p "LLM model (e.g., tinyllama.gguf) [leave blank to set later]: " _llm_model || true
+    apply_env LLM_BASE_URL "${_llm_base}"
+    if [[ -n "${_llm_model:-}" ]]; then
+      apply_env LLM_MODEL "${_llm_model}"
+    else
+      comment_env LLM_MODEL
+    fi
+  else
+    comment_env LLM_MODEL
   fi
 fi
 
 echo
 echo "Environment saved to ${ENV_FILE}."
 
-# Write systemd unit
+# Write systemd unit (hardened)
 sudo tee "${UNIT_FILE}" >/dev/null <<EOF
 [Unit]
 Description=ScanTrace Agent
@@ -102,14 +127,22 @@ EnvironmentFile=${ENV_FILE}
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${STATE_DIR} ${EXPORTS_DIR}
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallFilter=@system-service
+UMask=027
 
 ExecStart=${BIN_INSTALL}
 Restart=on-failure
 RestartSec=3s
-
-ProtectSystem=full
-ReadWritePaths=${STATE_DIR} ${EXPORTS_DIR}
-PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
