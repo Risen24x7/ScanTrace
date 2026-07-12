@@ -16,7 +16,6 @@ builds:
       - -s -w
     goos:
       - linux
-    goarch:
       - amd64
       - arm64
     flags:
@@ -25,9 +24,13 @@ builds:
 archives:
   - id: tarballs
     format: tar.gz
+    wrap_in_directory: true
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
     files:
-      - LICENSE
-      - README.md
+      - src: ./scantrace-agent/README.md
+        dst: README.md
+      - src: ./LICENSE
+        dst: LICENSE
     ids:
       - agent
 
