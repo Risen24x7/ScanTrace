@@ -42,13 +42,38 @@ jobs:
       - name: Build core
         run: CGO_ENABLED=1 go build -v ./internal/...
 
-      - name: Test core
-        run: CGO_ENABLED=1 go test -v ./internal/...
+      - name: Vet core
+        run: CGO_ENABLED=1 go vet ./...
+
+      - name: Test core (race, coverage)
+        run: CGO_ENABLED=1 go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-root
+          path: coverage.out
 
       - name: Build scantrace-agent
         working-directory: scantrace-agent
         run: CGO_ENABLED=1 go build -v -o scantrace-agent ./cmd/bot
 
-      - name: Test scantrace-agent
+      - name: Vet scantrace-agent
         working-directory: scantrace-agent
-        run: CGO_ENABLED=1 go test -v ./...
+        run: CGO_ENABLED=1 go vet ./...
+
+      - name: Test scantrace-agent (race, coverage)
+        working-directory: scantrace-agent
+        run: CGO_ENABLED=1 go test -v -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage (agent)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-agent
+          path: scantrace-agent/coverage.out
+
+      - name: Govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+          check-latest: true
