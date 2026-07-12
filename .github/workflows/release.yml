@@ -23,6 +23,12 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  
+      - name: Use GoReleaser config from main (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          git show origin/main:.goreleaser.yaml > .goreleaser.yaml
 
       - name: Set up Go
         uses: actions/setup-go@v5
