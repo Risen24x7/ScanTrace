@@ -12,13 +12,10 @@ on:
       - '.github/workflows/go-ci.yml'
   pull_request:
     branches: [ main, hackathon-final-20260713 ]
-    paths:
-      - 'internal/**'
-      - 'cmd/**'
-      - 'scantrace-agent/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/go-ci.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-test:
