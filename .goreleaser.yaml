@@ -27,7 +27,6 @@ archives:
     format: tar.gz
     files:
       - LICENSE
-    
       - README.md
     ids:
       - agent
@@ -38,7 +37,7 @@ checksum:
 sboms:
   - id: agent-sbom
     artifacts: archive
-    formats: [cyclonedx]
+    format: cyclonedx
 
 changelog:
   sort: asc
