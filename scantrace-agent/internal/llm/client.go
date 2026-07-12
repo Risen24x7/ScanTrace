@@ -51,8 +51,8 @@ services. Prefer closing the exposed port over blocking the source IP.
 Port context:
 - 22/TCP=SSH, 23/TCP=Telnet, 80/TCP=HTTP, 443/TCP=HTTPS, 3389/TCP=RDP,
   3306/TCP=MySQL, 5432/TCP=PostgreSQL, 6379/TCP=Redis, 8080/TCP=HTTP-alt,
-  9200/TCP=Elasticsearch, 2379/TCP=etcd, 1194/TCP=OpenVPN, 5555/TCP=ADB,
-  25565/TCP=Minecraft, 9646/TCP=Peercoin, 30303/TCP=Ethereum P2P
+  9200/TCP=Elasticsearch, 2379/TCP=etcd, 1194/TCP=OpenVPN, 5555=ADB,
+  25565=Minecraft, 30303=Ethereum P2P
 
 Response rules:
 - Slack formatting: bold (*text*) and bullets only, no markdown headers (###)
@@ -127,8 +127,12 @@ type Client struct {
 }
 
 func New(baseURL, model string) *Client {
+	b := strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(b, "/v1") {
+		b = strings.TrimSuffix(b, "/v1")
+	}
 	return &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
+		baseURL:    b,
 		model:      model,
 		httpClient: &http.Client{Timeout: defaultTimeout},
 	}

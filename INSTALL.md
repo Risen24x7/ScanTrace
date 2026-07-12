@@ -34,7 +34,7 @@ ALERT_CHANNEL=C0BBP1EP68P
 
 # Optional — defaults shown
 EXTERNAL_THREAT_CHANNEL=C0BCYSW3KNC   # channel for LLM Q&A replies (defaults to ALERT_CHANNEL)
-LLM_BASE_URL=http://192.168.50.250:11434
+LLM_BASE_URL=http://127.0.0.1:11434    # do NOT include /v1; the agent adds it
 LLM_MODEL=Qwen3-30B-A3B-UD-Q3_K_XL
 DB_PATH=/var/lib/scantrace/scantrace.db
 WAN_IP=
