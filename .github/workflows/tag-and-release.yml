@@ -1,33 +1,22 @@
-name: Tag and Release
+name: Tag
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to create (e.g., v0.5.0)'
+        description: 'Tag to create (e.g., v0.6.0-rc1)'
         required: true
 permissions:
   contents: write
 jobs:
-  tag_release:
+  tag:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install GitHub CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gh
       - name: Create tag
         run: |
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
           git tag -a "${{ github.event.inputs.tag }}" -m "ScanTrace ${{ github.event.inputs.tag }}"
           git push origin "${{ github.event.inputs.tag }}"
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.event.inputs.tag }}" \
-            --title "ScanTrace ${{ github.event.inputs.tag }}" \
-            --notes-file ".github/release-notes/${{ github.event.inputs.tag }}.md"
