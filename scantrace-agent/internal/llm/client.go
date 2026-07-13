@@ -232,7 +232,8 @@ func (c *Client) ask(prompt, question, context string) (string, error) {
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
 		Error *struct {
