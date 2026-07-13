@@ -133,8 +133,51 @@ CREATE INDEX IF NOT EXISTS idx_cases_rule_type  ON cases(rule_type);
 CREATE INDEX IF NOT EXISTS idx_cases_src_ip     ON cases(src_ip);
 CREATE INDEX IF NOT EXISTS idx_case_entities_case   ON case_entities(case_id);
 CREATE INDEX IF NOT EXISTS idx_case_entities_entity ON case_entities(entity_id);
+
+-- LLM telemetry: runs and review metadata (v4)
+CREATE TABLE IF NOT EXISTS llm_runs (
+    run_id           TEXT PRIMARY KEY,
+    created_at       TEXT NOT NULL,
+    call_type        TEXT NOT NULL DEFAULT '',
+    model            TEXT NOT NULL DEFAULT '',
+    max_tokens       INTEGER NOT NULL DEFAULT 0,
+    temperature      REAL NOT NULL DEFAULT 0,
+    top_p            REAL NOT NULL DEFAULT 0,
+    disable_thinking INTEGER NOT NULL DEFAULT 0,
+    stop_think       INTEGER NOT NULL DEFAULT 0,
+    prompt_bytes     INTEGER NOT NULL DEFAULT 0,
+    context_bytes    INTEGER NOT NULL DEFAULT 0,
+    triage_bytes     INTEGER NOT NULL DEFAULT 0,
+    actions_bytes    INTEGER NOT NULL DEFAULT 0,
+    trim_enabled     INTEGER NOT NULL DEFAULT 0,
+    trim_budget      INTEGER NOT NULL DEFAULT 0,
+    trim_kept        INTEGER NOT NULL DEFAULT 0,
+    trim_compressed  INTEGER NOT NULL DEFAULT 0,
+    trim_dropped     INTEGER NOT NULL DEFAULT 0,
+    duration_ms      INTEGER NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL DEFAULT 'ok',
+    error_message    TEXT NOT NULL DEFAULT '',
+    case_id          TEXT NOT NULL DEFAULT '',
+    channel_id       TEXT NOT NULL DEFAULT '',
+    user_id          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_runs_created_at ON llm_runs(created_at);
+CREATE INDEX IF NOT EXISTS idx_llm_runs_call_type  ON llm_runs(call_type);
+CREATE INDEX IF NOT EXISTS idx_llm_runs_case_id    ON llm_runs(case_id);
+
+CREATE TABLE IF NOT EXISTS llm_review_meta (
+    review_id             TEXT PRIMARY KEY,
+    run_id                TEXT NOT NULL REFERENCES llm_runs(run_id) ON DELETE CASCADE,
+    verdict               TEXT NOT NULL DEFAULT '',
+    summary_words         INTEGER NOT NULL DEFAULT 0,
+    details_bullets       INTEGER NOT NULL DEFAULT 0,
+    assessment_sentences  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_review_meta_run ON llm_review_meta(run_id);
 `
 
 // SchemaVersion is incremented whenever the DDL changes.
 // The migration runner checks this before applying statements.
-const SchemaVersion = 3
+const SchemaVersion = 4
