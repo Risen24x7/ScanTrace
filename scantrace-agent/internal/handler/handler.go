@@ -1200,7 +1200,7 @@ func (h *Handler) cmdReviewAll(channelID, userID string, args []string) {
 			actionPlan := selectActionPlan(triage)
 			ctx = trimTriage(ctx)
 			prompt := fmt.Sprintf("Analyse this single case and provide a full briefing.\n\nCase ID: %s", c.CaseID[:8])
-			log.Printf("prompt=%d context=%d triage=%d actions=%d", len(prompt), len(ctx), len(triageBlock), len(actionPlan))
+			log.Printf("[llm] prompt=%d context=%d triage=%d actions=%d", len(prompt), len(ctx), len(triageBlock), len(actionPlan))
 			answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 			if err != nil {
 				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
@@ -1241,7 +1241,7 @@ func (h *Handler) cmdNext(channelID, userID string) {
 		actionPlan := selectActionPlan(triage)
 		ctx = trimTriage(ctx)
 		prompt := fmt.Sprintf("Analyse this case and provide a full briefing.\n\nCase ID: %s", target.CaseID[:8])
-		log.Printf("prompt=%d context=%d triage=%d actions=%d", len(prompt), len(ctx), len(triageBlock), len(actionPlan))
+		log.Printf("[llm] prompt=%d context=%d triage=%d actions=%d", len(prompt), len(ctx), len(triageBlock), len(actionPlan))
 		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 		if err != nil {
 			log.Printf("[handler] next llm error case %s: %v", target.CaseID[:8], err)
