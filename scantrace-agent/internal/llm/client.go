@@ -12,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Risen24x7/scantrace/internal/db"
+	"github.com/google/uuid"
 )
 
 const (
@@ -51,8 +54,8 @@ services. Prefer closing the exposed port over blocking the source IP.
 
 Port context:
 - 22/TCP=SSH, 23/TCP=Telnet, 80/TCP=HTTP, 443/TCP=HTTPS, 3389/TCP=RDP,
-  3306/TCP=MySQL, 5432/TCP=PostgreSQL, 6379/TCP=Redis, 8080/TCP=HTTP-alt,
-  9200/TCP=Elasticsearch, 2379/TCP=etcd, 1194/TCP=OpenVPN, 5555=ADB,
+  3306/TCP=MySQL, 5432/TCP=PostgreSQL, 6379/TCP=Redis, 8080=HTTP-alt,
+  9200=Elasticsearch, 2379=etcd, 1194=OpenVPN, 5555=ADB,
   25565=Minecraft, 30303=Ethereum P2P
 
 Response rules:
@@ -112,6 +115,16 @@ PRE-FILLED RECOMMENDED ACTIONS (copy this block exactly as-is, do not rewrite or
 var thinkRE = regexp.MustCompile(`(?s)<think>.*?</think>`)
 var partialThinkRE = regexp.MustCompile(`(?s)<think>.*$`)
 
+// askMeta is internal metadata describing the context of the call.
+type askMeta struct {
+	callType     string // "ask" | "askcase"
+	triageBytes  int
+	actionsBytes int
+	caseID       string
+	channelID    string
+	userID       string
+}
+
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -121,6 +134,7 @@ type Client struct {
 	baseURL    string
 	model      string
 	httpClient *http.Client
+	store      *db.DB // optional, for run persistence
 }
 
 func New(baseURL, model string) *Client {
@@ -135,32 +149,38 @@ func New(baseURL, model string) *Client {
 	}
 }
 
+// SetStore enables persistence of llm_runs/llm_review_meta via the shared DB.
+func (c *Client) SetStore(store *db.DB) { c.store = store }
+
 func (c *Client) Ask(question, context string) (string, error) {
 	p := systemPrompt
 	if os.Getenv("LLM_ASK_PROMPT_MODE") == "lite" {
 		p = systemPromptLite
 	}
-	return c.ask(p, question, context)
+	return c.ask(p, question, context, &askMeta{callType: "ask"})
 }
 
 // AskCase renders the single-case prompt with the pre-resolved triage block
 // and pre-selected actionPlan both injected by the Go handler layer.
 func (c *Client) AskCase(question, context, triageBlock, actionPlan string) (string, error) {
 	prompt := fmt.Sprintf(singleCasePromptTemplate, triageBlock, actionPlan)
-	return c.ask(prompt, question, context)
+	return c.ask(prompt, question, context, &askMeta{callType: "askcase", triageBytes: len(triageBlock), actionsBytes: len(actionPlan)})
 }
 
-func (c *Client) ask(prompt, question, context string) (string, error) {
-	isAsk := (prompt == systemPrompt || prompt == systemPromptLite)
+func (c *Client) ask(prompt, question, context string, meta *askMeta) (string, error) {
+	isAsk := (meta != nil && meta.callType == "ask")
 
 	messages := []Message{
 		{Role: "system", Content: prompt},
 	}
+
+	trimStats := TrimStats{Enabled: false}
 	if context != "" {
-		context = maybeTrimContext(context, isAsk)
+		var trimmed string
+		trimmed, trimStats = maybeTrimContext(context, isAsk)
 		messages = append(messages, Message{
 			Role:    "system",
-			Content: "Current ScanTrace data:\n" + context,
+			Content: "Current ScanTrace data:\n" + trimmed,
 		})
 	}
 	messages = append(messages, Message{Role: "user", Content: question})
@@ -171,10 +191,12 @@ func (c *Client) ask(prompt, question, context string) (string, error) {
 	}
 
 	// Optional controls to help smaller models run efficiently
-	if os.Getenv("LLM_DISABLE_THINKING") == "true" {
+	disableThinking := (os.Getenv("LLM_DISABLE_THINKING") == "true")
+	stopThink := (os.Getenv("LLM_STOP_THINK") == "true")
+	if disableThinking {
 		body["chat_template_kwargs"] = map[string]interface{}{"enable_thinking": false}
 	}
-	if os.Getenv("LLM_STOP_THINK") == "true" {
+	if stopThink {
 		body["stop"] = []string{"<think>", "</think>"}
 	}
 
@@ -198,14 +220,18 @@ func (c *Client) ask(prompt, question, context string) (string, error) {
 	}
 	body["max_tokens"] = maxTokens
 
+	temp := 0.0
 	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			body["temperature"] = f
+			temp = f
 		}
 	}
+	topP := 0.0
 	if v := os.Getenv("LLM_TOP_P"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			body["top_p"] = f
+			topP = f
 		}
 	}
 
@@ -218,21 +244,27 @@ func (c *Client) ask(prompt, question, context string) (string, error) {
 		return "", fmt.Errorf("llm: marshal: %w", err)
 	}
 
+	runID := uuid.New().String()
+	start := time.Now()
 	resp, err := c.httpClient.Post(
 		c.baseURL+"/v1/chat/completions",
 		"application/json",
 		bytes.NewReader(payload),
 	)
+	latencyMs := time.Since(start).Milliseconds()
 	if err != nil {
+		c.persistRun(runID, meta, prompt, context, trimStats, maxTokens, temp, topP, latencyMs, "error", err.Error())
 		return "", fmt.Errorf("llm: request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
+		c.persistRun(runID, meta, prompt, context, trimStats, maxTokens, temp, topP, latencyMs, "error", "read body: "+err.Error())
 		return "", fmt.Errorf("llm: read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		c.persistRun(runID, meta, prompt, context, trimStats, maxTokens, temp, topP, latencyMs, "error", fmt.Sprintf("status %d: %s", resp.StatusCode, string(raw)))
 		return "", fmt.Errorf("llm: status %d: %s", resp.StatusCode, string(raw))
 	}
 
@@ -248,17 +280,122 @@ func (c *Client) ask(prompt, question, context string) (string, error) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
+		c.persistRun(runID, meta, prompt, context, trimStats, maxTokens, temp, topP, latencyMs, "error", "decode: "+err.Error())
 		return "", fmt.Errorf("llm: decode: %w", err)
 	}
 	if result.Error != nil {
+		c.persistRun(runID, meta, prompt, context, trimStats, maxTokens, temp, topP, latencyMs, "error", "api error: "+result.Error.Message)
 		return "", fmt.Errorf("llm: api error: %s", result.Error.Message)
 	}
 	if len(result.Choices) == 0 {
+		c.persistRun(runID, meta, prompt, context, trimStats, maxTokens, temp, topP, latencyMs, "error", "empty choices")
 		return "", fmt.Errorf("llm: empty choices")
 	}
 
 	text := result.Choices[0].Message.Content
 	text = thinkRE.ReplaceAllString(text, "")
 	text = partialThinkRE.ReplaceAllString(text, "")
-	return strings.TrimSpace(text), nil
+	text = strings.TrimSpace(text)
+
+	c.persistRun(runID, meta, prompt, context, trimStats, maxTokens, temp, topP, latencyMs, "ok", "")
+
+	// Parse review metadata for AskCase responses and link to runID.
+	if meta != nil && meta.callType == "askcase" {
+		c.persistReviewMeta(text, runID)
+	}
+
+	return text, nil
+}
+
+func (c *Client) persistRun(runID string, meta *askMeta, prompt, context string, trim TrimStats, maxTokens int, temp, topP float64, durationMs int64, status, errMsg string) {
+	if c.store == nil {
+		return
+	}
+	run := &db.LLMRun{
+		RunID:           runID,
+		CreatedAt:       time.Now().UTC(),
+		CallType:        "ask",
+		Model:           c.model,
+		MaxTokens:       maxTokens,
+		Temperature:     temp,
+		TopP:            topP,
+		DisableThinking: os.Getenv("LLM_DISABLE_THINKING") == "true",
+		StopThink:       os.Getenv("LLM_STOP_THINK") == "true",
+		PromptBytes:     len(prompt),
+		ContextBytes:    len(context),
+		TriageBytes:     0,
+		ActionsBytes:    0,
+		TrimEnabled:     trim.Enabled,
+		TrimBudget:      trim.Budget,
+		TrimKept:        trim.Kept,
+		TrimCompressed:  trim.Compressed,
+		TrimDropped:     trim.Dropped,
+		DurationMs:      durationMs,
+		Status:          status,
+		ErrorMessage:    errMsg,
+	}
+	if meta != nil {
+		run.CallType = meta.callType
+		run.TriageBytes = meta.triageBytes
+		run.ActionsBytes = meta.actionsBytes
+		run.CaseID = meta.caseID
+		run.ChannelID = meta.channelID
+		run.UserID = meta.userID
+	}
+	_ = c.store.InsertLLMRun(run)
+}
+
+var verdictRE = regexp.MustCompile(`\[VERDICT: ([^\]]+)\]`)
+
+func (c *Client) persistReviewMeta(text string, runID string) {
+	if c.store == nil || text == "" {
+		return
+	}
+	// naive parse by sections
+	sections := map[string]string{}
+	cur := ""
+	for _, ln := range strings.Split(text, "\n") {
+		l := strings.TrimSpace(ln)
+		if l == "*Summary*" || l == "*Details*" || l == "*Assessment*" {
+			cur = l
+			sections[cur] = ""
+			continue
+		}
+		if cur != "" {
+			sections[cur] += l + "\n"
+		}
+	}
+
+	verdict := ""
+	if s, ok := sections["*Summary*"]; ok {
+		m := verdictRE.FindStringSubmatch(s)
+		if len(m) >= 2 { verdict = strings.TrimSpace(m[1]) }
+	}
+	summaryWords := 0
+	if s, ok := sections["*Summary*"]; ok {
+		for _, w := range strings.Fields(s) { if w != "" { summaryWords++ } }
+	}
+	detailsBullets := 0
+	if s, ok := sections["*Details*"]; ok {
+		for _, ln := range strings.Split(s, "\n") {
+			l := strings.TrimSpace(ln)
+			if strings.HasPrefix(l, "- ") { detailsBullets++ }
+		}
+	}
+	assessmentSentences := 0
+	if s, ok := sections["*Assessment*"]; ok {
+		for _, tok := range strings.FieldsFunc(s, func(r rune) bool { return r=='.' || r=='!' || r=='?' }) {
+			if strings.TrimSpace(tok) != "" { assessmentSentences++ }
+		}
+	}
+
+	m := &db.LLMReviewMeta{
+		ReviewID:            uuid.New().String(),
+		RunID:               runID,
+		Verdict:             verdict,
+		SummaryWords:        summaryWords,
+		DetailsBullets:      detailsBullets,
+		AssessmentSentences: assessmentSentences,
+	}
+	_ = c.store.InsertLLMReviewMeta(m)
 }
