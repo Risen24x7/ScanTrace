@@ -9,16 +9,25 @@ import (
 	"strings"
 )
 
-func maybeTrimContext(ctx string, isAsk bool) string {
+type TrimStats struct {
+	Enabled    bool
+	Budget     int
+	Kept       int
+	Compressed int
+	Dropped    int
+}
+
+func maybeTrimContext(ctx string, isAsk bool) (string, TrimStats) {
 	if ctx == "" {
-		return ctx
+		return ctx, TrimStats{Enabled: false}
 	}
+
 	enabled := envBoolDefault("LLM_CONTEXT_TRIM", false)
 	if v, ok := os.LookupEnv(map[bool]string{true: "LLM_ASK_TRIM", false: "LLM_ASKCASE_TRIM"}[isAsk]); ok {
 		enabled = parseBool(v)
 	}
 	if !enabled {
-		return ctx
+		return ctx, TrimStats{Enabled: false}
 	}
 
 	budget := envInt("LLM_CONTEXT_MAX_BYTES", 4000)
@@ -27,7 +36,7 @@ func maybeTrimContext(ctx string, isAsk bool) string {
 
 	lines := splitNonEmpty(ctx)
 	if len(lines) == 0 {
-		return ctx
+		return ctx, TrimStats{Enabled: false}
 	}
 
 	type row struct {
@@ -107,7 +116,7 @@ func maybeTrimContext(ctx string, isAsk bool) string {
 
 	trimmed := strings.Join(out, "\n")
 	if trimmed == ctx {
-		return ctx
+		return ctx, TrimStats{Enabled: false}
 	}
 	tag := fmt.Sprintf("...[context trimmed: kept=%d, compressed=%d, dropped=%d]", added, compressed, dropped)
 	if !fits(len(trimmed), tag, budget) {
@@ -121,7 +130,7 @@ func maybeTrimContext(ctx string, isAsk bool) string {
 		trimmed += "\n" + tag
 	}
 	log.Printf("[llm-trim] enabled=%v budget=%dB kept=%d compressed=%d dropped=%d size=%dB", true, budget, added, compressed, dropped, len(trimmed))
-	return trimmed
+	return trimmed, TrimStats{Enabled: true, Budget: budget, Kept: added, Compressed: compressed, Dropped: dropped}
 }
 
 func compactLine(id, sev, subnet24, port string) string {
