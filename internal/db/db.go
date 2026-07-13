@@ -25,7 +25,7 @@ type DB struct {
 // Open opens (or creates) the SQLite database at path, enables WAL mode,
 // sets pragmas for safe concurrent access, and runs migrations.
 func Open(path string) (*DB, error) {
-// Ensure the directory exists
+    // Ensure the directory exists
     dir := filepath.Dir(path)
     if err := os.MkdirAll(dir, 0755); err != nil {
         return nil, fmt.Errorf("failed to create db directory: %w", err)
@@ -755,3 +755,39 @@ func scanCase(r caseScanner) (*Case, error) {
 	c.ReportExports = unmarshalStringSlice(repExp)
 	return &c, nil
 }
+
+// ===========================================================================
+// LLM telemetry persistence
+// ===========================================================================
+
+// InsertLLMRun writes one LLMRun row.
+func (db *DB) InsertLLMRun(r *LLMRun) error {
+	_, err := db.conn.Exec(`
+		INSERT INTO llm_runs (
+		  run_id, created_at, call_type, model, max_tokens,
+		  temperature, top_p, disable_thinking, stop_think,
+		  prompt_bytes, context_bytes, triage_bytes, actions_bytes,
+		  trim_enabled, trim_budget, trim_kept, trim_compressed, trim_dropped,
+		  duration_ms, status, error_message, case_id, channel_id, user_id
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.RunID, formatTime(r.CreatedAt), r.CallType, r.Model, r.MaxTokens,
+		r.Temperature, r.TopP, boolToInt(r.DisableThinking), boolToInt(r.StopThink),
+		r.PromptBytes, r.ContextBytes, r.TriageBytes, r.ActionsBytes,
+		boolToInt(r.TrimEnabled), r.TrimBudget, r.TrimKept, r.TrimCompressed, r.TrimDropped,
+		r.DurationMs, r.Status, r.ErrorMessage, r.CaseID, r.ChannelID, r.UserID,
+	)
+	return err
+}
+
+// InsertLLMReviewMeta writes one LLMReviewMeta row.
+func (db *DB) InsertLLMReviewMeta(m *LLMReviewMeta) error {
+	_, err := db.conn.Exec(`
+		INSERT INTO llm_review_meta (
+		  review_id, run_id, verdict, summary_words, details_bullets, assessment_sentences
+		) VALUES (?,?,?,?,?,?)`,
+		m.ReviewID, m.RunID, m.Verdict, m.SummaryWords, m.DetailsBullets, m.AssessmentSentences,
+	)
+	return err
+}
+
+func boolToInt(b bool) int { if b { return 1 }; return 0 }
