@@ -32,6 +32,13 @@ func mentionRE(text string) string {
 	return mentionPattern.ReplaceAllString(text, "")
 }
 
+// triageBlockRE matches the Triage bullet block injected in buildSingleCaseContext.
+var triageBlockRE = regexp.MustCompile(`(?ms)\nTriage:\n(?:- .*\n)+`)
+
+func trimTriage(s string) string {
+	return triageBlockRE.ReplaceAllString(s, "\n")
+}
+
 type Handler struct {
 	api                   *slack.Client
 	store                 *db.DB
@@ -249,7 +256,7 @@ func (h *Handler) handleMention(channel, ts, threadTS, text string) {
 		caseCtx = strings.Join(ctxLines, "\n")
 	}
 
-	answer, err := h.llm.AskCase(text, caseCtx, "", "")
+	answer, err := h.llm.Ask(text, caseCtx)
 	if err != nil {
 		log.Printf("[handler] mention llm error: %v", err)
 		h.postMessage(channel, replyThread, fmt.Sprintf("⚠️ Inference error: %v", err))
@@ -428,20 +435,10 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 
 	devices, _ := h.store.ListKnownDevices("", 30)
 	deviceMap := make(map[string]*db.KnownDevice)
-	if len(devices) > 0 {
-		sb.WriteString("Known devices:\n")
-		for i, d := range devices {
-			identifier := d.IP
-			if identifier == "" {
-				identifier = d.MAC
-			}
-			if d.IP != "" {
-				deviceMap[d.IP] = devices[i]
-			}
-			sb.WriteString(fmt.Sprintf("  %s trust=%s label=%q suppress=%v\n",
-				identifier, d.TrustLabel, d.Label, d.AutoSuppress))
+	for i, d := range devices {
+		if d.IP != "" {
+			deviceMap[d.IP] = devices[i]
 		}
-		sb.WriteString("\n")
 	}
 
 	sb.WriteString(fmt.Sprintf("Case: id=%s title=%q sev=%s conf=%.0f%% status=%s events=%d\n",
@@ -1197,7 +1194,9 @@ func (h *Handler) cmdReviewAll(channelID, userID string, args []string) {
 			ctx, triage, portsSeen := h.buildSingleCaseContext(c)
 			triageBlock := buildTriageBlock(triage, portsSeen)
 			actionPlan := selectActionPlan(triage)
+			ctx = trimTriage(ctx)
 			prompt := fmt.Sprintf("Analyse this single case and provide a full briefing.\n\nCase ID: %s", c.CaseID[:8])
+			log.Printf("prompt=%d context=%d triage=%d actions=%d", len(prompt), len(ctx), len(triageBlock), len(actionPlan))
 			answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 			if err != nil {
 				log.Printf("[handler] review-all llm error case %s: %v", c.CaseID[:8], err)
@@ -1236,7 +1235,9 @@ func (h *Handler) cmdNext(channelID, userID string) {
 		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
 		triageBlock := buildTriageBlock(triage, portsSeen)
 		actionPlan := selectActionPlan(triage)
+		ctx = trimTriage(ctx)
 		prompt := fmt.Sprintf("Analyse this case and provide a full briefing.\n\nCase ID: %s", target.CaseID[:8])
+		log.Printf("prompt=%d context=%d triage=%d actions=%d", len(prompt), len(ctx), len(triageBlock), len(actionPlan))
 		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
 		if err != nil {
 			log.Printf("[handler] next llm error case %s: %v", target.CaseID[:8], err)
