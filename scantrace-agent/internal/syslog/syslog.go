@@ -60,6 +60,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Risen24x7/scantrace/internal/db"
@@ -69,6 +70,35 @@ import (
 // Alerter is the subset of handler.Handler that the syslog package needs.
 type Alerter interface {
 	PostCaseAlert(c *db.Case)
+}
+
+// ---------------------------------------------------------------------------
+// Ingestion metrics (demo)
+// ---------------------------------------------------------------------------
+
+// Package-level atomic counters describing the UDP ingest path. They are
+// incremented from the Listen read loop and read via Snapshot(). All access is
+// through sync/atomic so reads/writes are safe across goroutines.
+var (
+	metricLinesReceived uint64
+	metricLinesParsed   uint64
+	metricLinesSkipped  uint64
+)
+
+// MetricsSnapshot is an immutable point-in-time copy of the ingest counters.
+type MetricsSnapshot struct {
+	LinesReceived uint64
+	LinesParsed   uint64
+	LinesSkipped  uint64
+}
+
+// Snapshot atomically loads the current ingest counters.
+func Snapshot() MetricsSnapshot {
+	return MetricsSnapshot{
+		LinesReceived: atomic.LoadUint64(&metricLinesReceived),
+		LinesParsed:   atomic.LoadUint64(&metricLinesParsed),
+		LinesSkipped:  atomic.LoadUint64(&metricLinesSkipped),
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -314,18 +344,23 @@ func Listen(addr string, store *db.DB, alerter Alerter) error {
 			log.Printf("[syslog] read error: %v", err)
 			continue
 		}
+		// Count every received datagram as an ingest line.
+		atomic.AddUint64(&metricLinesReceived, 1)
 		// Warn if packet is close to buffer size (possible truncation)
 		if n > 65520 {
 			log.Printf("[syslog] WARNING: packet size %d bytes near buffer limit, possible truncation", n)
 		}
 		line := strings.TrimSpace(string(pkt[:n]))
 		if line == "" || !strings.Contains(line, "DROP") {
+			atomic.AddUint64(&metricLinesSkipped, 1)
 			continue
 		}
 		p, ok := parse(line)
 		if !ok {
+			atomic.AddUint64(&metricLinesSkipped, 1)
 			continue
 		}
+		atomic.AddUint64(&metricLinesParsed, 1)
 
 		if err := ingest(p, store, alerter, caseIndex, buf); err != nil {
 			log.Printf("[syslog] ingest error: %v", err)

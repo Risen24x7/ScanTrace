@@ -104,6 +104,23 @@ SLACK_WEBHOOK_URL='<your-webhook>' CGO_ENABLED=1 go run ./cmd/bot/ serve --inter
 
 `serve` runs correlate on the given interval and posts new cases to Slack automatically.
 
+### 3.6 Demo: live ingestion status in Slack
+
+To let judges watch ingest flow, run the agent with periodic "Ingestion Status"
+posts. These go to a hardcoded demo channel (`C0BHW7NSR7S`) and are independent
+of case alerts / `ALERT_CHANNEL`.
+
+```bash
+SLACK_BOT_TOKEN=xoxb-... SLACK_APP_TOKEN=xapp-... ALERT_CHANNEL=C... \
+  ./bin/scantrace-agent --ingest-metrics --ingest-metrics-interval=30s
+```
+
+- First status posts within ~5s of startup, then every interval (default `30s`).
+- Each post shows totals and since-last deltas for LinesReceived / LinesParsed /
+  LinesSkipped plus the skip rate (%).
+- If `SLACK_BOT_TOKEN` or the channel is missing, the poster logs a warning and
+  disables itself (no panic); the rest of the agent runs normally.
+
 ## 4. Database maintenance
 
 ```bash

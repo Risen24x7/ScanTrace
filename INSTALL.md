@@ -72,3 +72,13 @@ export $(grep -v '^#' .env | xargs) && ./scantrace-agent
 Notes:
 - Use an absolute `DB_PATH` under `/var/lib/scantrace`.
 - LLM_BASE_URL defaults to `http://127.0.0.1:11434`. Leave `LLM_MODEL` blank to disable LLM.
+
+### Demo flags
+
+- `--ingest-metrics` — post periodic "Ingestion Status" summaries to Slack (demo only; hardcoded channel `C0BHW7NSR7S`, ignores `ALERT_CHANNEL`).
+- `--ingest-metrics-interval=<duration>` — posting interval (Go duration, default `30s`). Example:
+
+```bash
+SLACK_BOT_TOKEN=... SLACK_APP_TOKEN=... ./bin/scantrace-agent \
+  --ingest-metrics --ingest-metrics-interval=30s
+```

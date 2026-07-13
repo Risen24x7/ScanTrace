@@ -1,12 +1,15 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Risen24x7/scantrace/internal/db"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/handler"
+	"github.com/Risen24x7/scantrace/scantrace-agent/internal/ingestmetrics"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/llm"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/rts"
 	"github.com/Risen24x7/scantrace/scantrace-agent/internal/syslog"
@@ -16,6 +19,15 @@ import (
 )
 
 func main() {
+	// ── Runtime flags (demo-only) ───────────────────────────────────────────
+	// When enabled the agent posts periodic "Ingestion Status" summaries to a
+	// hardcoded Slack channel. This does NOT affect case alerting.
+	ingestMetrics := flag.Bool("ingest-metrics", false,
+		"Post periodic ingestion status summaries to Slack (demo only)")
+	ingestMetricsInterval := flag.Duration("ingest-metrics-interval", 30*time.Second,
+		"Interval between ingestion status posts (used with --ingest-metrics)")
+	flag.Parse()
+
 	// Load .env silently only if present (avoid noisy service logs)
 	if _, err := os.Stat(".env"); err == nil {
 		if err := godotenv.Load(); err != nil {
@@ -78,6 +90,17 @@ func main() {
 	}()
 	log.Printf("[main] syslog ingest started on UDP :%s", syslogPort)
 
+	// ── Demo ingestion status posting (hardcoded channel) ──────────────────
+	var metricsMgr *ingestmetrics.Manager
+	if *ingestMetrics {
+		const ingestStatusChannel = "C0BHW7NSR7S" // demo-only
+		metricsMgr = ingestmetrics.NewManager(api, ingestStatusChannel, *ingestMetricsInterval, syslogMetricsProvider{})
+		metricsMgr.Start()
+		defer metricsMgr.Stop()
+	} else {
+		log.Printf("[main] ingestion status posting disabled (pass --ingest-metrics to enable)")
+	}
+
 	// ── Slack Socket Mode ──────────────────────────────────────────────────
 	go func() {
 		for evt := range client.Events {
@@ -88,6 +111,20 @@ func main() {
 	log.Println("[main] ScanTrace agent starting…")
 	if err := client.Run(); err != nil {
 		log.Fatalf("[main] socketmode: %v", err)
+	}
+}
+
+// syslogMetricsProvider adapts the syslog package's ingest counters to the
+// ingestmetrics.SyslogMetricsProvider interface, keeping the two packages
+// decoupled (syslog does not import ingestmetrics).
+type syslogMetricsProvider struct{}
+
+func (syslogMetricsProvider) Snapshot() ingestmetrics.SyslogSnapshot {
+	s := syslog.Snapshot()
+	return ingestmetrics.SyslogSnapshot{
+		LinesReceived: s.LinesReceived,
+		LinesParsed:   s.LinesParsed,
+		LinesSkipped:  s.LinesSkipped,
 	}
 }
 
