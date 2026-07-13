@@ -32,12 +32,13 @@ func mentionRE(text string) string {
 	return mentionPattern.ReplaceAllString(text, "")
 }
 
-// triageBlockRE matches the Triage bullet block injected in buildSingleCaseContext.
-var triageBlockRE = regexp.MustCompile(`(?ms)\nTriage:\n(?:- .*\n)+`)
+// triageBlockRE matches the duplicated Triage bullet block (the "Triage:"
+// header and its leading "- ..." lines) that buildSingleCaseContext writes into
+// ctx. It is used to strip that block when the triage is already passed to
+// AskCase separately via triageBlock/actionPlan.
+var triageBlockRE = regexp.MustCompile(`(?m)\nTriage:\n(?:- .*\n)+`)
 
-func trimTriage(s string) string {
-	return triageBlockRE.ReplaceAllString(s, "\n")
-}
+func trimTriage(s string) string { return triageBlockRE.ReplaceAllString(s, "\n") }
 
 type Handler struct {
 	api                   *slack.Client
@@ -433,6 +434,9 @@ func (h *Handler) buildSingleCaseContext(c *db.Case) (string, triageState, []str
 	var portsSeen []string
 	portSet := make(map[int]struct{})
 
+	// Build the IP->device map used for destination classification below.
+	// The registry is intentionally NOT serialized into ctx anymore: it added
+	// prompt bloat without improving briefing quality for smaller models.
 	devices, _ := h.store.ListKnownDevices("", 30)
 	deviceMap := make(map[string]*db.KnownDevice)
 	for i, d := range devices {
