@@ -32,13 +32,31 @@ func mentionRE(text string) string {
 	return mentionPattern.ReplaceAllString(text, "")
 }
 
-// triageBlockRE matches the duplicated Triage bullet block (the "Triage:"
-// header and its leading "- ..." lines) that buildSingleCaseContext writes into
-// ctx. It is used to strip that block when the triage is already passed to
-// AskCase separately via triageBlock/actionPlan.
-var triageBlockRE = regexp.MustCompile(`(?m)\nTriage:\n(?:- .*\n)+`)
-
-func trimTriage(s string) string { return triageBlockRE.ReplaceAllString(s, "\n") }
+// trimTriage removes the duplicated Triage header and its immediate bullet lines
+// (lines starting with "- ") from ctx. It preserves all later context such as
+// event rows, threat feeds, and advisories. Implementation avoids regex to be
+// robust against minor formatting changes.
+func trimTriage(s string) string {
+	marker := "\nTriage:\n"
+	idx := strings.Index(s, marker)
+	if idx == -1 {
+		return s
+	}
+	start := idx + len(marker)
+	remainder := s[start:]
+	lines := strings.SplitAfter(remainder, "\n")
+	i := 0
+	for i < len(lines) {
+		line := lines[i]
+		if strings.HasPrefix(line, "- ") {
+			i++
+			continue
+		}
+		break
+	}
+	// Keep prefix, add a single newline separator, then the rest.
+	return s[:idx] + "\n" + strings.Join(lines[i:], "")
+}
 
 type Handler struct {
 	api                   *slack.Client
@@ -1198,7 +1216,13 @@ func (h *Handler) cmdReviewAll(channelID, userID string, args []string) {
 			ctx, triage, portsSeen := h.buildSingleCaseContext(c)
 			triageBlock := buildTriageBlock(triage, portsSeen)
 			actionPlan := selectActionPlan(triage)
+			before := ctx
 			ctx = trimTriage(ctx)
+			if before != ctx {
+				if strings.Contains(before, "\nTriage:\n") && !strings.Contains(ctx, "\nTriage:\n") && strings.Contains(ctx, "evt type=") {
+					log.Printf("[llm] trimTriage: removed triage bullets, preserved event rows")
+				}
+			}
 			prompt := fmt.Sprintf("Analyse this single case and provide a full briefing.\n\nCase ID: %s", c.CaseID[:8])
 			log.Printf("[llm] prompt=%d context=%d triage=%d actions=%d", len(prompt), len(ctx), len(triageBlock), len(actionPlan))
 			answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
@@ -1239,7 +1263,13 @@ func (h *Handler) cmdNext(channelID, userID string) {
 		ctx, triage, portsSeen := h.buildSingleCaseContext(target)
 		triageBlock := buildTriageBlock(triage, portsSeen)
 		actionPlan := selectActionPlan(triage)
+		before := ctx
 		ctx = trimTriage(ctx)
+		if before != ctx {
+			if strings.Contains(before, "\nTriage:\n") && !strings.Contains(ctx, "\nTriage:\n") && strings.Contains(ctx, "evt type=") {
+				log.Printf("[llm] trimTriage: removed triage bullets, preserved event rows")
+			}
+		}
 		prompt := fmt.Sprintf("Analyse this case and provide a full briefing.\n\nCase ID: %s", target.CaseID[:8])
 		log.Printf("[llm] prompt=%d context=%d triage=%d actions=%d", len(prompt), len(ctx), len(triageBlock), len(actionPlan))
 		answer, err := h.llm.AskCase(prompt, ctx, triageBlock, actionPlan)
