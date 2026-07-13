@@ -168,38 +168,42 @@ func (c *Client) ask(prompt, question, context string) (string, error) {
 		"stream":   false,
 	}
 
-	askCase := prompt != systemPrompt
-	if askCase {
-		maxTok := 450
-		if v := os.Getenv("LLM_ASKCASE_MAX_TOKENS"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				maxTok = n
-			}
-		}
-		body["max_tokens"] = maxTok
-	} else {
-		body["max_tokens"] = 900
-	}
-
-	if c.model != "" {
-		body["model"] = c.model
-	}
-
+	// Optional controls to help smaller models run efficiently. These only
+	// take effect when the corresponding env vars are set, so default
+	// behaviour is unchanged.
 	if os.Getenv("LLM_DISABLE_THINKING") == "true" {
 		body["chat_template_kwargs"] = map[string]interface{}{"enable_thinking": false}
 	}
 	if os.Getenv("LLM_STOP_THINK") == "true" {
 		body["stop"] = []string{"<think>", "</think>"}
 	}
-	if s := os.Getenv("LLM_TEMPERATURE"); s != "" {
-		if f, err := strconv.ParseFloat(s, 64); err == nil {
+
+	if prompt == systemPrompt {
+		body["max_tokens"] = 900
+	} else {
+		// AskCase path: bound the output length. Default 450, overridable.
+		maxTokens := 450
+		if v := os.Getenv("LLM_ASKCASE_MAX_TOKENS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				maxTokens = n
+			}
+		}
+		body["max_tokens"] = maxTokens
+	}
+
+	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			body["temperature"] = f
 		}
 	}
-	if s := os.Getenv("LLM_TOP_P"); s != "" {
-		if f, err := strconv.ParseFloat(s, 64); err == nil {
+	if v := os.Getenv("LLM_TOP_P"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			body["top_p"] = f
 		}
+	}
+
+	if c.model != "" {
+		body["model"] = c.model
 	}
 
 	payload, err := json.Marshal(body)
