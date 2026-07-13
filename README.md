@@ -19,6 +19,7 @@ Every internet-facing system is continuously scanned by automated tooling—botn
 Security teams typically face two poor choices:
 
 • Ignore the noise and risk missing meaningful reconnaissance activity.
+or
 • Drown in raw telemetry by exporting logs into SIEMs, writing detection rules, and maintaining dashboards outside their normal workflow.
 
 Neither approach creates evidence-quality investigations that can be escalated, shared, or reported.
