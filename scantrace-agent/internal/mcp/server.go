@@ -94,6 +94,11 @@ func tools() []ToolSchema {
   }
 }`),
 		},
+		{
+			Name:        "status",
+			Description: "Get a telemetry/status summary: case counts (by status and severity) and sensor count.",
+			InputSchema: json.RawMessage(`{"type": "object", "properties": {}}`),
+		},
 	}
 }
 
@@ -125,6 +130,8 @@ func (s *Server) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		s.toolListSensors(w)
 	case "get_entity":
 		s.toolGetEntity(w, req.Input)
+	case "status":
+		s.toolStatus(w)
 	default:
 		writeError(w, fmt.Sprintf("unknown tool: %s", req.Name))
 	}
@@ -192,6 +199,30 @@ func (s *Server) toolGetEntity(w http.ResponseWriter, input json.RawMessage) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"entity": entity})
+}
+
+func (s *Server) toolStatus(w http.ResponseWriter) {
+	// Compute simple telemetry over recent data.
+	cases, _ := s.store.ListCases("", 100)
+	statusCounts := map[string]int{"open": 0, "closed": 0}
+	sevCounts := map[string]int{"high": 0, "medium": 0, "low": 0, "info": 0}
+	for _, c := range cases {
+		status := strings.ToLower(c.Status)
+		if status == "open" || status == "closed" {
+			statusCounts[status]++
+		}
+		sev := strings.ToLower(c.Severity)
+		sevCounts[sev] = sevCounts[sev] + 1
+	}
+	sensors, _ := s.store.ListSensors()
+	resp := map[string]interface{}{
+		"cases_total":        len(cases),
+		"cases_by_status":    statusCounts,
+		"cases_by_severity":  sevCounts,
+		"sensors_total":      len(sensors),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func writeError(w http.ResponseWriter, msg string) {

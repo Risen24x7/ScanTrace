@@ -149,3 +149,45 @@ type Case struct {
 	RuleType         string      `json:"rule_type"          db:"rule_type"`
 	SrcIP            string      `json:"src_ip"             db:"src_ip"`
 }
+
+// ---------------------------------------------------------------------------
+// LLM telemetry
+// ---------------------------------------------------------------------------
+
+// LLMRun captures one call to the LLM backend.
+type LLMRun struct {
+	RunID           string    `json:"run_id"`
+	CreatedAt       time.Time `json:"created_at"`
+	CallType        string    `json:"call_type"`
+	Model           string    `json:"model"`
+	MaxTokens       int       `json:"max_tokens"`
+	Temperature     float64   `json:"temperature"`
+	TopP            float64   `json:"top_p"`
+	DisableThinking bool      `json:"disable_thinking"`
+	StopThink       bool      `json:"stop_think"`
+	PromptBytes     int       `json:"prompt_bytes"`
+	ContextBytes    int       `json:"context_bytes"`
+	TriageBytes     int       `json:"triage_bytes"`
+	ActionsBytes    int       `json:"actions_bytes"`
+	TrimEnabled     bool      `json:"trim_enabled"`
+	TrimBudget      int       `json:"trim_budget"`
+	TrimKept        int       `json:"trim_kept"`
+	TrimCompressed  int       `json:"trim_compressed"`
+	TrimDropped     int       `json:"trim_dropped"`
+	DurationMs      int64     `json:"duration_ms"`
+	Status          string    `json:"status"`        // ok | error
+	ErrorMessage    string    `json:"error_message"`
+	CaseID          string    `json:"case_id"`
+	ChannelID       string    `json:"channel_id"`
+	UserID          string    `json:"user_id"`
+}
+
+// LLMReviewMeta stores structured facts parsed from an AskCase response.
+type LLMReviewMeta struct {
+	ReviewID            string `json:"review_id"`
+	RunID               string `json:"run_id"`
+	Verdict             string `json:"verdict"`
+	SummaryWords        int    `json:"summary_words"`
+	DetailsBullets      int    `json:"details_bullets"`
+	AssessmentSentences int    `json:"assessment_sentences"`
+}
