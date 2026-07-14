@@ -28,6 +28,8 @@ Neither approach creates evidence-quality investigations that can be escalated, 
 
 ScanTrace bridges the gap between raw scan telemetry and actionable threat intelligence by transforming scanning activity into evidence-backed investigations directly inside Slack. Instead of reviewing thousands of disconnected log entries, analysts receive aggregated events, enriched context, and case-ready evidence within the platform where they already collaborate.
 
+If attackers can aggregate millions of internet-connected devices to gather intelligence, why can't we aggregate their activity to detect, track, and close the gaps they rely on?
+
 ...
 
 ## Quickstart (llama.cpp-only) (WIP)
