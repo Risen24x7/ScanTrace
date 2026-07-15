@@ -37,8 +37,8 @@ LAYER 2 → Collector (Suricata EVE JSON + Asus syslog adapters)       ✅ COMPL
 LAYER 3 → Normalizer + Enricher (schema mapping + IP intel)          🔄 PARTIAL
 LAYER 4 → Correlator + Case Builder (pattern detection + markdown)   ✅ COMPLETE
 LAYER 5 → Slack Agent Core (Bolt app + Block Kit case posting)       ✅ COMPLETE
-LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)                🔄 PARTIAL
-LAYER 7 → Polish + Submission                                        ☐ NOT STARTED
+LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)                 ✅ COMPLETE
+LAYER 7 → Polish + Submission                                        ✅ COMPLETE
 ```
 
 ---
