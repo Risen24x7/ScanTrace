@@ -41,6 +41,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Default to WhatIf (dry-run) unless -Force is provided
+$script:WasWhatIf = $false
+if (-not $Force) {
+  $WhatIfPreference = $true
+  $script:WasWhatIf = $true
+}
+
 function Write-Log {
   param([string]$Message, [string]$Level = 'INFO')
   $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -70,6 +77,8 @@ function Start-Logging {
   $Global:LogFile = Join-Path -Path $logDir -ChildPath ("rollback-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
   New-Item -ItemType File -Force -Path $Global:LogFile | Out-Null
   Write-Log "Log file: $Global:LogFile"
+  if ($script:WasWhatIf) { Write-Log 'Running in WhatIf (dry-run) mode. Use -Force to apply changes.' }
+  if ($Force) { Write-Log 'Force mode: changes will be applied.' }
 }
 
 function Backup-RegistryKey {
