@@ -20,6 +20,8 @@ git clone https://github.com/Risen24x7/ScanTrace.git
 cd ScanTrace
 ```
 
+## I'm sure there is supposed to be a step here for using make to build the agent, working on interactive installer, non-interactive installer, and probably a docker.
+
 ## 2. Testdata demo (Suricata EVE JSON)
 
 ```bash
@@ -46,7 +48,7 @@ CGO_ENABLED=1 go run ./cmd/bot/ report --case <CASE_ID>
 - **Administration → System Log → General Log**
 - Enable **Remote Log Server**
 - Set the IP to your ScanTrace host's LAN IP
-- Port: `514` (UDP)
+- Port: `5140` (UDP)
 - Apply and save
 
 ### 3.2 Configure rsyslog on the ScanTrace host
@@ -104,9 +106,9 @@ SLACK_WEBHOOK_URL='<your-webhook>' CGO_ENABLED=1 go run ./cmd/bot/ serve --inter
 
 `serve` runs correlate on the given interval and posts new cases to Slack automatically.
 
-### 3.6 Demo: live ingestion status in Slack
+### 3.6 Demo: live ingestion status in Slack (This would have been running if I wasn't a try hard and wanted to add more)
 
-To let judges watch ingest flow, run the agent with periodic "Ingestion Status"
+To let judges watch ingest flow, I ran the agent with periodic "Ingestion Status"
 posts. These go to a hardcoded demo channel (`C0BHW7NSR7S`) and are independent
 of case alerts / `ALERT_CHANNEL`.
 
