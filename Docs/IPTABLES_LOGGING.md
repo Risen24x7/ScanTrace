@@ -83,12 +83,6 @@ iptables -I FORWARD 1 -i eth0 -m state --state NEW -j LOG --log-prefix "WAN_FWD 
 
 ## Open Issues
 
-### FUPNP chain is unreferenced
-The `FUPNP` chain contains Sunshine/Moonlight streaming port forwards to `192.168.50.202`
-but has 0 references — nothing calls it. These port forwards are currently inactive from WAN.
-Needs investigation: either wire it in with `iptables -I INPUT -j FUPNP` or confirm
-UPnP handles this dynamically at runtime.
-
 ### SECURITY chain is unreferenced
 The `SECURITY` chain (SYN/RST flood rate limiting) also has 0 references. It is defined
 but never called. Should be wired into INPUT for WAN protection.
@@ -106,9 +100,3 @@ The asus_syslog parser (`internal/ingest/asus_syslog.go`) must be updated to mat
 prefixes in addition to existing DHCP/WiFi event parsing.
 
 ---
-
-## Infrastructure Note
-
-Router syslog target is the **VM** (`192.168.50.x`), not the desktop. This was configured
-prior to this document and must not be changed. The VM runs the ScanTrace ingest daemon
-which receives log lines via UDP syslog.
