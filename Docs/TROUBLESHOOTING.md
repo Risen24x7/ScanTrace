@@ -5,9 +5,9 @@
 ### `LLM not configured`
 
 **Cause:** `LLM_BASE_URL` not in environment.  
-**Fix:** The agent now defaults to `http://127.0.0.1:11434` — just restart and it will connect. If your `ik_llama.cpp` is on a different host, add `LLM_BASE_URL=http://<host>:11434` to `.env`.
+**Fix:** The agent now defaults to `http://127.0.0.1:11434` — just restart and it will connect. If your `ik_llama.cpp` (what I run on my desktop, my orchestrator stack actively uses my GPU) is on a different host, add `LLM_BASE_URL=http://<host>:11434` to `.env`.
 
-### `grep: scantrace-agent/.env: Not a directory`
+### `grep: scantrace-agent/.env: Not a directory` (moved to /opt/scantrace/scantrace.env in branch I am working on for local VM hosted LLM)
 
 **Cause:** Running the `export $(grep ...)` command from the parent `ScanTrace/` directory.  
 **Fix:**
@@ -44,24 +44,6 @@ sqlite3 scantrace.db "SELECT count(*) FROM events;"
 
 ---
 
-## WAN Traffic Shows as Internal Threat
-
-**Cause:** Running an older binary that lacked Go-layer WAN IP pre-classification.  
-**Fix:** Rebuild from current `main`:
-```bash
-cd ~/ScanTrace/scantrace-agent
-go build -o scantrace-agent ./cmd/bot/
-sudo setcap cap_net_bind_service=+ep ./scantrace-agent
-```
-
-After the fix, triage output will read:
-```
-Dst host in registry? [WAN EDGE — gateway interface only]
-```
-And the Assessment block will correctly state no internal devices are at risk.
-
----
-
 ## LLM Responses
 
 ### Assessment or Summary blocks are missing
@@ -76,10 +58,6 @@ curl http://127.0.0.1:11434/v1/models
 
 **Cause:** `LLM_BASE_URL` includes a trailing `/v1` (leading to `/v1/v1/...`) or points at a non-OpenAI route.  
 **Fix:** Set `LLM_BASE_URL` to `http://127.0.0.1:11434` (no `/v1`). The client automatically calls `/v1/chat/completions` and tolerates an accidental `/v1` suffix.
-
-### LLM generates wrong action list
-
-This should no longer happen. The Recommended Actions section is now a `fmt.Sprintf` skeleton populated entirely in Go — the LLM only fills the Assessment and Summary blocks. If you see hallucinated actions, you are running an old binary.
 
 ---
 
