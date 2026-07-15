@@ -6,7 +6,7 @@
 
 This is ScanTrace, a project a created for the Slack Hackathon challenge 2026, Agent for Good entry. 
 
-Please forgive the messiness as I decided to try and learn Go on the fly and then try and use GitHub for more than just a place to store random things. This is a solo sprint where I had to come up with the idea after I so the documentation was quite shotty and the code was functional but rough. Since I don't know any Go coders I had to resort to Google and AI to try and get my documentation and pretty up the code. The installation sequence is a work in progress while I implement new ideas and stumble upon my own goofs.
+Please forgive the messiness as I decided to try and learn Go on the fly and then try and use GitHub for more than just a place to store random things. This is a solo sprint where I had to come up with the idea after I decided to enter. So the documentation was quite shotty and the code was functional but rough. Since I don't know any Go coders I had to resort to Google and AI to try and get my documentation and pretty up the code. The installation sequence is a work in progress while I implement new ideas and stumble upon my own goofs.
 
 I hop you like the idea and are interested in taking an upfront approach when it come to the security of your network.
 
