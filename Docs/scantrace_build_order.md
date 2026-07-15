@@ -4,8 +4,8 @@
 > **Dev Sandbox:** Dilldozer  
 > **Deadline:** July 13, 2026 @ 5:00 PM PDT  
 > **Days Remaining:** 8  
-> **Primary Track:** New Slack Agent  
-> **Last updated:** July 5, 2026
+> **Primary Track:** Agent for Good  
+> **Last updated:** July 14, 2026
 
 ---
 
@@ -35,6 +35,7 @@ This is a **23-day hackathon sprint**, not a product roadmap. Every build decisi
 LAYER 1 → Data Foundation (schema + SQLite + CLI harness)            ✅ COMPLETE
 LAYER 2 → Collector (Suricata EVE JSON + Asus syslog adapters)       ✅ COMPLETE
 LAYER 3 → Normalizer + Enricher (schema mapping + IP intel)          🔄 PARTIAL
+(Currently only have my Asus log schema)
 LAYER 4 → Correlator + Case Builder (pattern detection + markdown)   ✅ COMPLETE
 LAYER 5 → Slack Agent Core (Bolt app + Block Kit case posting)       ✅ COMPLETE
 LAYER 6 → Platform Technologies (MCP + RTS + NL Q&A)                 ✅ COMPLETE
@@ -110,26 +111,26 @@ LAYER 7 → Polish + Submission                                        ✅ COMPL
 | 3.3 | Standardize `direction` field | ☐ |
 | 3.4 | Attach `sensor_id` from registered sensor | ✅ |
 | 3.5 | Set `confidence` default to 0.7 | ✅ |
-| 3.6 | Extract into standalone `normalizer/normalizer.go` | ☐ |
-| 3.7 | Unit tests per event_type | ☐ |
+| 3.6 | Extract into standalone `normalizer/normalizer.go` | ✅ |
+| 3.7 | Unit tests per event_type | ✅ |
 
 ### 3B — Enricher
 
 | # | Task | Done? |
 |---|------|-------|
-| 3.8 | Implement `enricher/enricher.go` | ☐ |
-| 3.9 | ASN lookup via `ipinfo.io` | ☐ |
-| 3.10 | Reverse DNS via stdlib `net.LookupAddr()` | ☐ |
-| 3.11 | Abuse contact via RDAP (`rdap.org/ip/{ip}`) | ☐ |
-| 3.12 | Known-scanner allowlist (Shodan, Censys CIDRs) | ☐ |
-| 3.13 | Cache enrichment in `entities` table with 24h TTL | ☐ |
-| 3.14 | Skip RFC-1918 IPs — tag as `internal` | ☐ |
-| 3.15 | Known-device allowlist for LAN MACs (stop DHCP chatter re-firing) | ☐ |
+| 3.8 | Implement `enricher/enricher.go` | ✅ |
+| 3.9 | ASN lookup via `ipinfo.io` | ✅ |
+| 3.10 | Reverse DNS via stdlib `net.LookupAddr()` | ✅ |
+| 3.11 | Abuse contact via RDAP (`rdap.org/ip/{ip}`) | ✅ |
+| 3.12 | Known-scanner allowlist (Shodan, Censys CIDRs) | ✅ |
+| 3.13 | Cache enrichment in `entities` table with 24h TTL | ✅ |
+| 3.14 | Skip RFC-1918 IPs — tag as `internal` | ✅ |
+| 3.15 | Known-device allowlist for LAN MACs (stop DHCP chatter re-firing) | ✅ |
 
 ### Gate Check
-- `scantrace enrich --ip 45.33.32.156` returns ASN, rDNS, `reputation_labels: ["known_scanner"]`
-- Cache works — second call returns from DB, no API hit
-- Private IPs tagged `internal`, not sent to external APIs
+- `scantrace enrich --ip 45.33.32.156` returns ASN, rDNS, `reputation_labels: ["known_scanner"]` | ✅ |
+- Cache works — second call returns from DB, no API hit | ✅ |
+- Private IPs tagged `internal`, not sent to external APIs | ✅ |
 
 ---
 
@@ -204,12 +205,12 @@ LAYER 7 → Polish + Submission                                        ✅ COMPL
 | 6.1 | Implement `mcp/server.go` — register ScanTrace tools | ✅ |
 | 6.2 | Tool: `get_case(case_id)` | ✅ |
 | 6.3 | Tool: `list_cases(severity?, limit?)` | ✅ |
-| 6.4 | Tool: `enrich_ip(ip)` | 🔄 (exposed as `get_entity`) |
-| 6.5 | Tool: `search_related_events(src_ip, hours?)` | 🔄 |
+| 6.4 | Tool: `enrich_ip(ip)` (exposed as `get_entity`) | ✅ |
+| 6.5 | Tool: `search_related_events(src_ip, hours?)` | ✅ |
 | 6.6 | Wire MCP server into Bolt app | ✅ |
-| 6.7 | Test: invoke `enrich_ip` from Slack AI | 🔄 |
+| 6.7 | Test: invoke `enrich_ip` from Slack AI | ✅ |
 
-### 6B — Real-Time Search (RTS) 🔄
+### 6B — Real-Time Search (RTS) ✅
 
 | # | Task | Done? |
 |---|------|-------|
@@ -231,34 +232,34 @@ LAYER 7 → Polish + Submission                                        ✅ COMPL
 |---|------|-------|
 | 6.12 | App mention listener: `@ScanTrace {question}` | ✅ |
 | 6.13 | Intent router: list / get / enrich / summarize | 🔄 (LLM free-form + `case <id>` routing) |
-| 6.14 | Route to MCP tool, format Slack response | 🔄 |
-| 6.15 | Handle: "What hit us today?", "Show worst case", "Enrich 1.2.3.4" | 🔄 |
+| 6.14 | Route to MCP tool, format Slack response | ✅ |
+| 6.15 | Handle: "What hit us today?", "Show worst case", "Enrich 1.2.3.4" | ✅ |
 | 6.16 | Fallback response for unrecognized intent | ✅ |
 
-### Gate Check
-- `@ScanTrace what hit us today?` returns formatted case list
-- `enrich_ip` MCP tool returns valid Entity JSON
-- RTS query on known IP surfaces prior thread link
-- All three technologies (MCP, RTS, Slack AI) visibly active in demo
+### Gate Check ✅
+- `@ScanTrace what hit us today?` returns formatted case list | ✅ |
+- `enrich_ip` MCP tool returns valid Entity JSON | ✅ |
+- RTS query on known IP surfaces prior thread link ✅ |
+- All three technologies (MCP, RTS, Slack AI) visibly active in demo | ✅ |
 
 ---
 
-## Layer 7 — Polish + Submission ☐ NOT STARTED
+## Layer 7 — Polish + Submission ✅ COMPLETE
 
 **Target:** July 10 – July 13
 
 | # | Task | Done? |
 |---|------|-------|
-| 7.1 | Architecture diagram (Mermaid or draw.io) | ☐ |
-| 7.2 | Tag `hackathon-stable-YYYYMMDD` | ☐ |
-| 7.3 | Record 3-minute demo video | ☐ |
-| 7.4 | Invite `slackhack@salesforce.com` + `testing@devpost.com` to Dilldozer | ☐ |
-| 7.5 | Confirm agent responsive in Dilldozer | ☐ |
-| 7.6 | Note Slack App ID | ☐ |
-| 7.7 | Complete Devpost submission form | ☐ |
-| 7.8 | Submit before July 13 @ 5:00 PM PDT | ☐ |
+| 7.1 | Architecture diagram (Mermaid or draw.io) | ✅ |
+| 7.2 | Tag `hackathon-stable-YYYYMMDD` | ✅ |
+| 7.3 | Record 3-minute demo video | ✅ |
+| 7.4 | Invite `slackhack@salesforce.com` + `testing@devpost.com` to Dilldozer | ✅ |
+| 7.5 | Confirm agent responsive in Dilldozer | ✅ |
+| 7.6 | Note Slack App ID | ✅ |
+| 7.7 | Complete Devpost submission form | ✅ |
+| 7.8 | Submit before July 13 @ 5:00 PM PDT | ✅ |
 
-### Demo Video Script (3 minutes)
+### Demo Video Script (3 minutes) (free styled because I decided to hit stretch goals instead of making a video... and sleeping)
 
 ```
 0:00–0:20  The problem — scanners hit your perimeter constantly; teams
@@ -336,11 +337,11 @@ Write a Go correlator package that:
 6. Tags: "repeated_source" >3 events, "port_sweep" >3 distinct dst_ports
 ```
 
-### Slack Bolt App
+### Slack Bot App
 
 **Best agent:** ChatGPT-4o or Claude Sonnet
 
-**Bolt app scaffold:**
+**Bot app scaffold:**
 ```
 Write a Go Slack bot using slack-go/slack (Bolt pattern) that:
 1. Uses socket mode (SLACK_APP_TOKEN)
@@ -377,8 +378,6 @@ Use mark3labs/mcp-go SDK. stdio transport (standard MCP pattern).
 ### RTS Integration
 
 ```
-[Paste Slack RTS API docs before this prompt]
-
 Write SearchPriorMentions(client, channelID, query) that:
 1. Uses Slack RTS API to search a specific channel
 2. Returns matching messages for a src_ip or ASN query
